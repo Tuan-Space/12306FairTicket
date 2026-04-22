@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+.runtime/login_qr.png
+.runtime/session.cookies
