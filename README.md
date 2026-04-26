@@ -2,7 +2,7 @@
 
 这是一个面向 12306 开售瞬间的命令行抢票项目。它会在开售前完成登录、站点解析、乘车人准备和时间校准，并在目标时间前进入热身查询窗口，尽量让有效请求更早发出。项目的核心价值不在于夸大成功率，而在于把真正影响开售命中率的几个关键环节提前优化好：时间更准确、请求更及时、提交更直接。
 
-**五一高峰实测视频**：https://www.douyin.com/video/7630795576086679909
+**五一高峰实测视频**：[点击观看](https://m.bilibili.com/video/BV1i3ooBhEqn?buvid=XU38C873DE79A44D1842474F49BCB5F393FB3&from_spmid=main.space.0.0&is_story_h5=false&mid=erSk%2Fdcdn%2Fxv1k8awquvIg%3D%3D&p=1&plat_id=114&share_from=ugc&share_medium=android&share_plat=android&share_session_id=990cb775-daf9-4131-8c50-e1d2d4be8787&share_source=COPY&share_tag=s_i&spmid=united.player-video-detail.0.0&timestamp=1777170833&unique_k=R5jczv6&up_id=496056909)
 
 ## ✨ 项目最核心的优势
 
