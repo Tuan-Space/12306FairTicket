@@ -7,6 +7,7 @@ from typing import Dict
 import requests
 
 from .configuration import AppConfig, AppError, STATION_URL
+from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
 
 
 class StationStore:
@@ -15,24 +16,37 @@ class StationStore:
         self.cfg = cfg
         self.stations: Dict[str, str] = {}
 
-    def load(self) -> None:
+    def load(
+        self,
+        cancel_token: CancellationToken | None = None,
+        event_sink: EventSink = None,
+    ) -> None:
+        if cancel_token is not None:
+            cancel_token.checkpoint()
         cached = self._read_cache(ignore_age=False)
         if cached:
             self.stations = cached
             logging.info("已加载站点缓存，共 %s 个站点", len(self.stations))
+            emit_event(event_sink, "stations", "已加载站点缓存", count=len(self.stations), cached=True)
             return
         try:
             logging.info("正在从 12306 获取站点编码...")
             response = self.session.get(STATION_URL, timeout=self.cfg.request_timeout_seconds)
             response.raise_for_status()
+            if cancel_token is not None:
+                cancel_token.checkpoint()
             self.stations = self._parse_station_js(response.text)
             self._write_cache(self.stations)
             logging.info("站点编码更新完成，共 %s 个站点", len(self.stations))
+            emit_event(event_sink, "stations", "站点编码更新完成", count=len(self.stations), cached=False)
+        except RunCancelled:
+            raise
         except Exception as exc:
             stale = self._read_cache(ignore_age=True)
             if stale:
                 self.stations = stale
                 logging.warning("站点编码更新失败，使用过期缓存: %s", exc)
+                emit_event(event_sink, "stations", "站点更新失败，使用过期缓存", count=len(self.stations), cached=True)
                 return
             raise AppError(f"无法获取站点编码: {exc}") from exc
 

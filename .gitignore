@@ -1,4 +1,11 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.venv/
+.tmp-pip/
+.tmp-build/
+build/
+dist/
+artifacts/
 .runtime/login_qr.png
 .runtime/session.cookies

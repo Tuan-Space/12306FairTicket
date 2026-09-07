@@ -1,0 +1,156 @@
+/* Light palette overrides; structural styling comes from app.qss. */
+* { color: #26344d; }
+
+QMainWindow, QWidget#appRoot, QScrollArea, QScrollArea > QWidget > QWidget {
+    background: #f3f6fb;
+}
+
+QLabel#appTitle { color: #17223a; }
+QLabel#muted { color: #687792; }
+
+QLabel#privacyBadge, QLabel#phaseBadge {
+    border-color: #bad7fa;
+    background: #eaf4ff;
+    color: #1769c2;
+}
+
+QFrame#profileBar, QFrame#card {
+    background: #ffffff;
+    border-color: #dce4f0;
+}
+
+QLabel#cardTitle { color: #17223a; }
+QLabel#fieldLabel { color: #34435d; }
+QLabel#saleCountdown { color: #17223a; }
+QLabel#qrCountdown { color: #177a55; }
+
+QLabel#qrImage {
+    background: #ffffff;
+    color: #687792;
+    border-color: #ccd7e7;
+}
+
+QLabel#windowMarker {
+    color: #1769c2;
+    background: #eaf4ff;
+}
+
+QLabel#aisle {
+    color: #8a96aa;
+    border-color: #ced7e5;
+}
+
+QFrame#metric {
+    background: #f7f9fd;
+    border-color: #dbe3ef;
+}
+
+QLabel#metricName { color: #70809a; }
+QLabel#metricValue { color: #263a5c; }
+
+QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox {
+    color: #26344d;
+    background: #f9fbfe;
+    border-color: #cbd6e6;
+}
+
+QLineEdit:hover, QComboBox:hover, QDateEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: #91a5c1;
+}
+
+QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: #3b82df;
+    background: #ffffff;
+}
+
+QComboBox QAbstractItemView {
+    color: #26344d;
+    background: #ffffff;
+    border-color: #cad5e5;
+    selection-background-color: #d9eaff;
+    selection-color: #184f8f;
+}
+
+QPushButton, QToolButton {
+    color: #35445e;
+    background: #f4f7fb;
+    border-color: #cdd8e7;
+}
+
+QPushButton:hover, QToolButton:hover {
+    color: #1b3151;
+    background: #eaf1fb;
+    border-color: #9cadc5;
+}
+
+QPushButton:pressed, QToolButton:pressed { background: #dfe8f5; }
+
+QPushButton:disabled, QToolButton:disabled {
+    color: #a1abb9;
+    background: #f4f6f9;
+    border-color: #e2e6ed;
+}
+
+QPushButton#primaryButton {
+    color: #ffffff;
+    background: #2d78dc;
+    border-color: #2d78dc;
+}
+
+QPushButton#primaryButton:hover { background: #3d86e5; }
+
+QPushButton#dangerButton {
+    color: #b43d50;
+    background: #fff0f2;
+    border-color: #f1bdc5;
+}
+
+QToolButton#seatButton {
+    color: #34435d;
+    background: #f7f9fc;
+    border-color: #cbd6e5;
+}
+
+QToolButton#seatButton:checked {
+    color: #ffffff;
+    background: #2875ce;
+    border-color: #1765bd;
+}
+
+QCheckBox { color: #34435d; }
+QCheckBox::indicator { background: #ffffff; border-color: #9aaac0; }
+QCheckBox::indicator:checked { background: #2f7fdf; border-color: #2f7fdf; }
+QCheckBox:disabled { color: #94a0b2; }
+
+QTabBar::tab { color: #687792; }
+QTabBar::tab:selected { color: #1d3352; border-bottom-color: #317fdc; }
+QTabBar::tab:hover:!selected { color: #344a67; }
+
+QListWidget#priorityList, QListWidget#timeline {
+    color: #34435d;
+    background: #f8fafd;
+    border-color: #d4deea;
+}
+
+QListWidget#priorityList::item:selected {
+    color: #194f8e;
+    background: #dcecff;
+}
+
+QListWidget#timeline::item { border-left-color: #d6dfeb; }
+
+QTextEdit#logView {
+    color: #273852;
+    background: #f8fafd;
+    border-color: #d4deea;
+    selection-background-color: #bcd8f8;
+}
+
+QScrollBar::handle:vertical { background: #b8c4d4; }
+QScrollBar::handle:vertical:hover { background: #98a8bd; }
+
+QToolTip {
+    color: #26344d;
+    background: #ffffff;
+    border-color: #bcc9da;
+}

@@ -7,6 +7,7 @@ from typing import Dict, List
 import requests
 
 from .configuration import AppConfig, AppError, BASE_URL
+from .runtime import CancellationToken, EventSink, emit_event
 
 
 class ServerClock:
@@ -18,10 +19,16 @@ class ServerClock:
         self._base_server_timestamp = time.time()
         self._base_perf_counter = time.perf_counter()
 
-    def sync(self) -> None:
+    def sync(
+        self,
+        cancel_token: CancellationToken | None = None,
+        event_sink: EventSink = None,
+    ) -> None:
         samples: List[Dict[str, float]] = []
         errors: List[str] = []
         for index in range(self.cfg.time_sync_samples):
+            if cancel_token is not None:
+                cancel_token.checkpoint()
             try:
                 started_wall = time.time()
                 started_perf = time.perf_counter()
@@ -48,13 +55,25 @@ class ServerClock:
             except Exception as exc:
                 errors.append(str(exc))
             if index < self.cfg.time_sync_samples - 1:
-                time.sleep(0.05)
+                if cancel_token is None:
+                    time.sleep(0.05)
+                else:
+                    cancel_token.wait(0.05)
 
         if not samples:
             self.offset_seconds = 0.0
             self._base_server_timestamp = time.time()
             self._base_perf_counter = time.perf_counter()
             logging.warning("同步 12306 服务器时间失败，改用本地时间: %s", "; ".join(errors))
+            emit_event(
+                event_sink,
+                "clock_sync",
+                "服务器校时失败，使用本地时间",
+                offset_seconds=0.0,
+                rtt_ms=None,
+                server_timestamp=self._base_server_timestamp,
+                monotonic_timestamp=self._base_perf_counter,
+            )
             return
 
         eligible = [sample for sample in samples if sample["rtt"] <= self.cfg.time_sync_max_rtt_seconds]
@@ -84,6 +103,15 @@ class ServerClock:
             )
         if ignored:
             logging.debug("时间同步忽略 %s 个 RTT 超过阈值的样本", ignored)
+        emit_event(
+            event_sink,
+            "clock_sync",
+            "服务器时间同步完成",
+            offset_seconds=self.offset_seconds,
+            rtt_ms=best["rtt"] * 1000,
+            server_timestamp=self._base_server_timestamp,
+            monotonic_timestamp=self._base_perf_counter,
+        )
 
     def now(self) -> datetime:
         return datetime.fromtimestamp(self.now_timestamp())
@@ -91,15 +119,19 @@ class ServerClock:
     def now_timestamp(self) -> float:
         return self._base_server_timestamp + (time.perf_counter() - self._base_perf_counter)
 
-    def sleep_until(self, target: datetime) -> None:
+    def sleep_until(self, target: datetime, cancel_token: CancellationToken | None = None) -> None:
         target_timestamp = target.timestamp()
         while True:
             remaining = target_timestamp - self.now_timestamp()
             if remaining <= 0:
                 return
             if remaining > 1:
-                time.sleep(min(remaining - 0.5, 1.0))
+                duration = min(remaining - 0.5, 1.0)
             elif remaining > 0.1:
-                time.sleep(0.02)
+                duration = 0.02
             else:
-                time.sleep(0.003)
+                duration = 0.003
+            if cancel_token is None:
+                time.sleep(duration)
+            else:
+                cancel_token.wait(duration)

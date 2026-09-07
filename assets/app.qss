@@ -1,0 +1,321 @@
+/* 12306 Fair Ticket desktop theme */
+* {
+    font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+    font-size: 13px;
+    color: #dbe5f7;
+}
+
+QMainWindow, QWidget#appRoot, QScrollArea, QScrollArea > QWidget > QWidget {
+    background: #0b1020;
+}
+
+QFrame#header {
+    background: transparent;
+}
+
+QLabel#logoMark {
+    min-width: 52px;
+    min-height: 52px;
+    border-radius: 16px;
+    color: #ffffff;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3b8cff, stop:1 #6e5dff);
+    font-size: 27px;
+    font-weight: 700;
+    qproperty-alignment: AlignCenter;
+    margin-right: 5px;
+}
+
+QLabel#appTitle {
+    font-size: 24px;
+    font-weight: 700;
+    color: #f7f9ff;
+}
+
+QLabel#muted {
+    color: #8f9bb3;
+    font-size: 12px;
+}
+
+QLabel#privacyBadge, QLabel#phaseBadge {
+    border: 1px solid #26456c;
+    border-radius: 12px;
+    background: #12243d;
+    color: #7fbdff;
+    padding: 6px 11px;
+    font-weight: 600;
+}
+
+QFrame#profileBar, QFrame#card {
+    background: #11182a;
+    border: 1px solid #202b43;
+    border-radius: 14px;
+}
+
+QLabel#cardTitle {
+    color: #f4f7ff;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+QLabel#fieldLabel {
+    color: #c8d3e8;
+    font-weight: 600;
+}
+
+QLabel#saleCountdown {
+    color: #f8fbff;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 39px;
+    font-weight: 700;
+    padding: 8px 0;
+}
+
+QLabel#qrCountdown {
+    color: #79d7b0;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+QLabel#qrImage {
+    background: #f7f9ff;
+    color: #536079;
+    border: 1px solid #33415c;
+    border-radius: 13px;
+    padding: 6px;
+}
+
+QLabel#windowMarker {
+    color: #79aef8;
+    background: #102747;
+    border-radius: 8px;
+    padding: 8px 4px;
+}
+
+QLabel#aisle {
+    color: #69758e;
+    border-left: 1px dashed #39445d;
+    border-right: 1px dashed #39445d;
+    min-width: 48px;
+}
+
+QFrame#metric {
+    background: #0d1425;
+    border: 1px solid #202c45;
+    border-radius: 10px;
+}
+
+QLabel#metricName {
+    color: #7786a4;
+    font-size: 11px;
+}
+
+QLabel#metricValue {
+    color: #d8e6ff;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+QLineEdit, QComboBox, QDateEdit, QSpinBox, QDoubleSpinBox {
+    min-height: 34px;
+    background: #0c1425;
+    border: 1px solid #2a3751;
+    border-radius: 8px;
+    padding: 2px 9px;
+    selection-background-color: #337ee8;
+}
+
+QLineEdit:hover, QComboBox:hover, QDateEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: #43577b;
+}
+
+QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border: 1px solid #438cf5;
+    background: #0e192d;
+}
+
+QComboBox::drop-down, QDateEdit::drop-down {
+    border: 0;
+    width: 24px;
+}
+
+QComboBox QAbstractItemView {
+    background: #151e31;
+    border: 1px solid #2d3a55;
+    selection-background-color: #285faa;
+    outline: 0;
+}
+
+QPushButton, QToolButton {
+    min-height: 32px;
+    background: #182238;
+    border: 1px solid #2a3854;
+    border-radius: 8px;
+    padding: 1px 11px;
+    color: #dbe5f8;
+    font-weight: 600;
+}
+
+QPushButton:hover, QToolButton:hover {
+    background: #202d47;
+    border-color: #405374;
+}
+
+QPushButton:pressed, QToolButton:pressed {
+    background: #111a2c;
+}
+
+QPushButton:disabled, QToolButton:disabled {
+    color: #59657b;
+    background: #11182a;
+    border-color: #1e283b;
+}
+
+QPushButton#primaryButton {
+    background: #347ff0;
+    border-color: #4d91f5;
+    color: #ffffff;
+    padding-left: 18px;
+    padding-right: 18px;
+}
+
+QPushButton#primaryButton:hover {
+    background: #438df8;
+}
+
+QPushButton#dangerButton {
+    color: #ff9ba5;
+    background: #2c1925;
+    border-color: #5a2c3b;
+}
+
+QToolButton#seatButton {
+    min-width: 49px;
+    max-width: 58px;
+    min-height: 52px;
+    padding: 3px;
+    background: #101a2c;
+    border-color: #2d3b57;
+    font-size: 11px;
+}
+
+QToolButton#seatButton:checked {
+    color: #ffffff;
+    background: #256fc7;
+    border: 2px solid #70b5ff;
+}
+
+QCheckBox {
+    spacing: 8px;
+    color: #c8d4e9;
+}
+
+QCheckBox::indicator {
+    width: 17px;
+    height: 17px;
+    border: 1px solid #41506d;
+    border-radius: 5px;
+    background: #0d1526;
+}
+
+QCheckBox::indicator:checked {
+    background: #3986f3;
+    border-color: #65a3fb;
+}
+
+QCheckBox:disabled {
+    color: #6e7a91;
+}
+
+QTabWidget::pane {
+    border: 0;
+    background: transparent;
+}
+
+QTabBar::tab {
+    color: #8794ac;
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    padding: 10px 18px;
+    font-weight: 600;
+}
+
+QTabBar::tab:selected {
+    color: #eaf2ff;
+    border-bottom-color: #438cf5;
+}
+
+QTabBar::tab:hover:!selected {
+    color: #b9c6dc;
+}
+
+QListWidget#priorityList, QListWidget#timeline {
+    background: #0c1424;
+    border: 1px solid #253149;
+    border-radius: 9px;
+    outline: 0;
+    padding: 4px;
+}
+
+QListWidget#priorityList::item, QListWidget#timeline::item {
+    min-height: 27px;
+    border-radius: 6px;
+    padding: 3px 7px;
+}
+
+QListWidget#priorityList::item:selected {
+    background: #233b62;
+}
+
+QListWidget#timeline::item {
+    border-left: 1px solid #28354e;
+    margin-left: 8px;
+}
+
+QTextEdit#logView {
+    color: #cbd7eb;
+    background: #080d18;
+    border: 1px solid #1e2a40;
+    border-radius: 9px;
+    padding: 8px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 12px;
+    selection-background-color: #2c68af;
+}
+
+QSplitter::handle {
+    background: transparent;
+    width: 6px;
+    height: 6px;
+}
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: #34415a;
+    border-radius: 4px;
+    min-height: 30px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #4a5a77;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: transparent;
+    height: 0;
+}
+
+QToolTip {
+    color: #f0f4fc;
+    background: #1b263c;
+    border: 1px solid #3b4a67;
+    padding: 5px;
+}

@@ -4,8 +4,7 @@ import re
 import time
 import urllib.parse
 from http.cookiejar import MozillaCookieJar
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -18,12 +17,26 @@ from .helpers import (
     _message_from_payload,
     _parse_js_object,
 )
+from .preferences import (
+    OrderCapabilities,
+    OrderCheckResult,
+    OrderPreferencePayload,
+)
+from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
 
 
 class RailwayClient:
-    def __init__(self, cfg: AppConfig) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        event_sink: EventSink = None,
+        cancel_token: Optional[CancellationToken] = None,
+        session: Optional[requests.Session] = None,
+    ) -> None:
         self.cfg = cfg
-        self.session = requests.Session()
+        self.event_sink = event_sink
+        self.cancel_token = cancel_token or CancellationToken()
+        self.session = session or requests.Session()
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -39,6 +52,8 @@ class RailwayClient:
         self.load_cookies()
 
     def load_cookies(self) -> None:
+        if not self.cfg.persist_session:
+            return
         path = self.cfg.session_file
         if not path.exists():
             return
@@ -51,6 +66,8 @@ class RailwayClient:
             logging.warning("读取登录会话缓存失败，将重新登录: %s", exc)
 
     def save_cookies(self) -> None:
+        if not self.cfg.persist_session:
+            return
         path = self.cfg.session_file
         path.parent.mkdir(parents=True, exist_ok=True)
         jar = MozillaCookieJar(str(path))
@@ -72,37 +89,82 @@ class RailwayClient:
             return False
 
     def ensure_login(self) -> None:
+        self.cancel_token.checkpoint()
         if self.check_session():
             logging.info("当前登录会话仍然有效")
             return
         logging.info("需要扫码登录 12306")
         self._prefetch_login_cookies()
-        image_path, uuid = self._create_qr_code()
-        logging.info("二维码已保存到: %s", image_path)
+        image_bytes, uuid = self._create_qr_code()
+        if self.cfg.persist_session:
+            self.cfg.qr_code_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cfg.qr_code_file.write_bytes(image_bytes)
+            logging.info("二维码已保存到: %s", self.cfg.qr_code_file)
         logging.info("请使用 12306 APP 扫码并确认登录")
         deadline = time.time() + self.cfg.login_qr_timeout_seconds
+        emit_event(
+            self.event_sink,
+            "qr_ready",
+            "请使用 12306 APP 扫码并确认登录",
+            image_bytes=image_bytes,
+            uuid=uuid,
+            expires_at=deadline,
+        )
+        emit_event(self.event_sink, "qr_status", "等待扫码", status="waiting", uuid=uuid)
         scanned = False
         while time.time() < deadline:
+            self.cancel_token.checkpoint()
             code, message = self._check_qr_status(uuid)
             if code == "0":
                 pass
             elif code == "1":
                 if not scanned:
                     logging.info("已扫码，等待手机端确认...")
+                    emit_event(
+                        self.event_sink,
+                        "qr_status",
+                        "已扫码，等待手机端确认",
+                        status="scanned",
+                        uuid=uuid,
+                    )
                     scanned = True
             elif code == "2":
                 ok, login_message = self._complete_login()
                 if not ok:
                     raise AppError(f"扫码成功但登录校验失败: {login_message}")
                 self.save_cookies()
-                logging.info("登录成功，会话已保存")
+                if self.cfg.persist_session:
+                    logging.info("登录成功，会话已保存")
+                else:
+                    logging.info("登录成功（会话仅驻留内存）")
+                emit_event(
+                    self.event_sink,
+                    "qr_status",
+                    "登录成功",
+                    status="confirmed",
+                    uuid=uuid,
+                )
                 return
             elif code == "3":
-                raise AppError("二维码已过期，请重新运行 main.py")
+                emit_event(
+                    self.event_sink,
+                    "qr_status",
+                    "二维码已过期",
+                    status="expired",
+                    uuid=uuid,
+                )
+                raise AppError("二维码已过期，请刷新二维码后重试")
             else:
                 logging.warning("二维码状态异常: %s %s", code, message)
-            time.sleep(self.cfg.login_qr_poll_seconds)
-        raise AppError("等待扫码登录超时，请重新运行 main.py")
+            self.cancel_token.wait(self.cfg.login_qr_poll_seconds)
+        emit_event(
+            self.event_sink,
+            "qr_status",
+            "二维码已过期",
+            status="expired",
+            uuid=uuid,
+        )
+        raise AppError("等待扫码登录超时，请刷新二维码后重试")
 
     def _prefetch_login_cookies(self) -> None:
         for url in (
@@ -110,12 +172,14 @@ class RailwayClient:
             f"{BASE_URL}/otn/index12306/getLoginBanner",
             f"{BASE_URL}/passport/web/auth/uamtk-static",
         ):
+            self.cancel_token.checkpoint()
             try:
                 self.session.get(url, timeout=self.cfg.request_timeout_seconds)
             except Exception:
                 pass
+            self.cancel_token.checkpoint()
 
-    def _create_qr_code(self) -> Tuple[Path, str]:
+    def _create_qr_code(self) -> Tuple[bytes, str]:
         response = self.session.post(
             f"{BASE_URL}/passport/web/create-qr64",
             data={"appid": "otn"},
@@ -128,9 +192,11 @@ class RailwayClient:
         uuid = payload.get("uuid")
         if not image or not uuid:
             raise AppError("12306 未返回二维码图片或 UUID")
-        self.cfg.qr_code_file.parent.mkdir(parents=True, exist_ok=True)
-        self.cfg.qr_code_file.write_bytes(base64.b64decode(image))
-        return self.cfg.qr_code_file, str(uuid)
+        try:
+            image_bytes = base64.b64decode(image, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise AppError("12306 返回的二维码图片格式无效") from exc
+        return image_bytes, str(uuid)
 
     def _check_qr_status(self, uuid: str) -> Tuple[str, str]:
         response = self.session.post(
@@ -142,6 +208,7 @@ class RailwayClient:
         return str(payload.get("result_code", "")), str(payload.get("result_message", ""))
 
     def _complete_login(self) -> Tuple[bool, str]:
+        self.cancel_token.checkpoint()
         response = self.session.post(
             f"{BASE_URL}/passport/web/auth/uamtk",
             data={"appid": "otn"},
@@ -153,6 +220,7 @@ class RailwayClient:
         token = payload.get("newapptk")
         if not token:
             return False, "未获取到 newapptk"
+        self.cancel_token.checkpoint()
         response = self.session.post(
             f"{BASE_URL}/otn/uamauthclient",
             data={"tk": token},
@@ -172,6 +240,7 @@ class RailwayClient:
         }
         last_error = ""
         for endpoint in ("query", "queryA", "queryZ"):
+            self.cancel_token.checkpoint()
             try:
                 request_start = time.perf_counter()
                 response = self.session.get(
@@ -179,6 +248,7 @@ class RailwayClient:
                     params=params,
                     timeout=self.cfg.request_timeout_seconds,
                 )
+                self.cancel_token.checkpoint()
                 request_ms = _elapsed_ms(request_start)
                 payload = response.json()
                 if not payload.get("status"):
@@ -198,6 +268,8 @@ class RailwayClient:
                     len(tickets),
                 )
                 return tickets
+            except RunCancelled:
+                raise
             except Exception as exc:
                 last_error = str(exc)
                 logging.debug("余票查询接口 %s 失败: %s", endpoint, exc)
@@ -299,9 +371,18 @@ class RailwayClient:
         ticket_info_text = _extract_js_object(html, "ticketInfoForPassengerForm")
         if not ticket_info_text:
             raise AppError("确认订单页没有返回 ticketInfoForPassengerForm")
-        return token_match.group(1), _parse_js_object(ticket_info_text)
+        ticket_info = _parse_js_object(ticket_info_text)
+        order_request = ticket_info.get("orderRequestDTO")
+        if isinstance(order_request, dict):
+            dw_flag = order_request.get("dw_flag")
+            if isinstance(dw_flag, str):
+                # The current official seat UI reads this exact nested field.
+                # Copying it to the normalized context keeps protocol code out
+                # of the GUI/runner while retaining the unmodified DTO.
+                ticket_info["dw_flag"] = dw_flag
+        return token_match.group(1), ticket_info
 
-    def check_order_info(self, passengers: PreparedPassengerSet, token: str) -> Tuple[bool, str]:
+    def check_order_info(self, passengers: PreparedPassengerSet, token: str) -> OrderCheckResult:
         data = {
             "cancel_flag": "2",
             "bed_level_order_num": "000000000000000000000000000000",
@@ -322,9 +403,12 @@ class RailwayClient:
             timeout=self.cfg.request_timeout_seconds,
         )
         payload = response.json()
-        if payload.get("status") and payload.get("data", {}).get("submitStatus"):
-            return True, "OK"
-        return False, _message_from_payload(payload)
+        response_data = payload.get("data")
+        response_data = response_data if isinstance(response_data, dict) else {}
+        capabilities = OrderCapabilities.from_mapping(response_data)
+        success = payload.get("status") is True and response_data.get("submitStatus") is True
+        message = "OK" if success else _message_from_payload(payload)
+        return OrderCheckResult(success, message, capabilities)
 
     def get_queue_count(self, ticket: Dict[str, Any], ticket_info: Dict[str, Any], seat_type: str, token: str) -> Tuple[bool, Any]:
         query_dto = ticket_info.get("queryLeftTicketRequestDTO") or {}
@@ -351,7 +435,18 @@ class RailwayClient:
             return True, payload.get("data", {})
         return False, _message_from_payload(payload)
 
-    def confirm_single_for_queue(self, passengers: PreparedPassengerSet, ticket_info: Dict[str, Any], left_ticket: str, token: str) -> Tuple[bool, str]:
+    def confirm_single_for_queue(
+        self,
+        passengers: PreparedPassengerSet,
+        ticket_info: Dict[str, Any],
+        left_ticket: str,
+        token: str,
+        preference_payload: Optional[OrderPreferencePayload] = None,
+    ) -> Tuple[bool, str]:
+        if preference_payload is None:
+            # Never send an unverified legacy string without the capabilities
+            # returned by checkOrderInfo. The runner passes an explicit payload.
+            preference_payload = OrderPreferencePayload()
         data = {
             "passengerTicketStr": passengers.passenger_ticket_str,
             "oldPassengerStr": passengers.old_passenger_str,
@@ -360,8 +455,8 @@ class RailwayClient:
             "key_check_isChange": ticket_info.get("key_check_isChange", ""),
             "leftTicketStr": left_ticket,
             "train_location": ticket_info.get("train_location", ""),
-            "choose_seats": self.cfg.choose_seats,
-            "seatDetailType": "000",
+            "choose_seats": preference_payload.choose_seats,
+            "seatDetailType": preference_payload.seat_detail_type,
             "whatsSelect": "1",
             "roomType": "00",
             "dwAll": "N",

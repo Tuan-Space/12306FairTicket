@@ -1,0 +1,8 @@
+-r requirements-gui.txt
+
+# Windows onedir packaging, pinned for reproducible CI output.
+PyInstaller==6.22.2
+
+# Unit and Qt widget test stack.
+pytest==9.1.1
+pytest-qt==4.5.0

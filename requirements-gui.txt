@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Qt 6 desktop interface. PySide6 wheels include the matching Qt runtime.
+PySide6==6.8.3

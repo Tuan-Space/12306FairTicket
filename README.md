@@ -2,6 +2,19 @@
 
 这是一个面向 12306 开售瞬间的命令行抢票项目。它会在开售前完成登录、站点解析、乘车人准备和时间校准，并在目标时间前进入热身查询窗口，尽量让有效请求更早发出。项目的核心价值不在于夸大成功率，而在于把真正影响开售命中率的几个关键环节提前优化好：时间更准确、请求更及时、提交更直接。
 
+## 🖥️ Windows 图形界面
+
+项目现已提供 PySide6 桌面界面，同时完整保留原有命令行入口和 `config.py`：
+
+```powershell
+python -m pip install -r requirements-gui.txt
+python gui.py
+```
+
+GUI 支持二维码直接显示及有效期倒计时、服务器校时后的开售倒计时、基础/高级参数、车次与席别优先级、整组座位关系和上/中/下铺软偏好、协作停止、任务时间线、脱敏日志和本地配置档案。GUI 每次启动均重新扫码，Cookie 与二维码不会写入磁盘。
+
+完整使用、隐私边界和 Windows `onedir` 便携版构建方法请见 [README_GUI.md](README_GUI.md)。位置偏好只提交一次；能力不支持时会在提交前清空偏好，能力支持但目标位置无余量时由 12306 随机分配，不会自动取消或重复下单。
+
 **五一高峰实测视频**：[点击观看](https://m.bilibili.com/video/BV1i3ooBhEqn?buvid=XU38C873DE79A44D1842474F49BCB5F393FB3&from_spmid=main.space.0.0&is_story_h5=false&mid=erSk%2Fdcdn%2Fxv1k8awquvIg%3D%3D&p=1&plat_id=114&share_from=ugc&share_medium=android&share_plat=android&share_session_id=990cb775-daf9-4131-8c50-e1d2d4be8787&share_source=COPY&share_tag=s_i&spmid=united.player-video-detail.0.0&timestamp=1777170833&unique_k=R5jczv6&up_id=496056909)
 
 ## ✨ 项目最核心的优势
@@ -121,7 +134,10 @@ python main.py --validate-config
 | `HOT_QUERY_INTERVAL_SECONDS` | 热身窗口内的查票间隔 | 默认 `0.25` |
 | `HOT_WINDOW_SECONDS` | `START_AT` 后继续保持热身频率的秒数 | 默认 `5.0` |
 | `AUTO_SUBMIT` | 发现候选票后是否自动提交订单 | `True` 为自动抢；`False` 只查票不下单 |
-| `CHOOSE_SEATS` | 选座字符串，不需要时留空 | 例如 `"1A"`；大多数场景留空更稳 |
+| `SEAT_POSITION_PREFERENCES` | 整组相对座位格子，数量须等于乘车人数 | `[]`、`["1A", "1F"]`；不是具体车厢排号 |
+| `BERTH_PREFERENCE` | 下/中/上铺数量软偏好，总数须等于乘车人数 | `{"lower": 1, "middle": 0, "upper": 1}` |
+| `CHOOSE_SEATS` | 旧版选座字符串，仅在未定义结构化选座项时兼容读取 | 例如 `"1A"`；新配置建议留空 |
+| `PERSIST_SESSION` | CLI 是否读取/保存二维码与 Cookie；GUI 始终关闭 | `True` 保留旧 CLI 行为，`False` 仅内存会话 |
 
 ### 请求与时间参数
 

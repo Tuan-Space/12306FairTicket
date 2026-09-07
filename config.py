@@ -48,7 +48,19 @@ HOT_WINDOW_SECONDS = 5.0
 AUTO_SUBMIT = True
 
 
-# 选座，例如 "1A"。不需要指定时留空。
+# 座位位置偏好（不是具体排号）。每个乘车人选择一个关系格子，例如两人同排靠窗
+# 可填写 ["1A", "1F"]；可用字母会在下单时按席别和实际车型能力校验。
+# 12306 无法满足时会自动分配其他位置。留空表示不指定。
+SEAT_POSITION_PREFERENCES = []
+
+
+# 铺位数量偏好，顺序含义为下/中/上。三项之和应等于乘车人数；全 0 表示不指定。
+# 部分卧铺车型没有中铺，程序会依据 12306 实时返回的能力自动回退为系统分配。
+BERTH_PREFERENCE = {"lower": 0, "middle": 0, "upper": 0}
+
+
+# 旧版兼容项。新配置请使用 SEAT_POSITION_PREFERENCES；只有上面的新项不存在时
+# 才会读取 CHOOSE_SEATS，例如 "1A" 或 "1A1F"。
 CHOOSE_SEATS = ""
 
 
@@ -70,3 +82,6 @@ PERF_LOG = True
 QR_CODE_FILE = ".runtime/login_qr.png"
 SESSION_FILE = ".runtime/session.cookies"
 STATION_CACHE_FILE = ".runtime/stations.json"
+
+# False 时本次运行既不读取也不写入登录 Cookie。
+PERSIST_SESSION = True

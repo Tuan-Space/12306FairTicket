@@ -2,17 +2,25 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 from ticket_app.configuration import AppError, DEFAULT_CONFIG_FILE, load_config
+from ticket_app.logging_utils import RedactingFormatter
 from ticket_app.runner import TicketRunner
 
 
-def configure_logging(level: str) -> None:
+def configure_logging(level: str, sensitive_terms: Iterable[str] = ()) -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        RedactingFormatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S",
+            sensitive_terms=sensitive_terms,
+        )
+    )
     logging.basicConfig(
         level=getattr(logging, level, logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
+        handlers=[handler],
         force=True,
     )
 
@@ -27,16 +35,18 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config_path = Path(args.config).resolve()
+    sensitive_terms: Iterable[str] = ()
     try:
         cfg = load_config(config_path)
-        configure_logging(cfg.log_level)
+        sensitive_terms = cfg.passenger_names
+        configure_logging(cfg.log_level, sensitive_terms)
         logging.info("已加载配置: %s", cfg.config_path)
         if args.validate_config:
             logging.info("配置校验通过")
             return 0
         return TicketRunner(cfg).run()
     except AppError as exc:
-        configure_logging("INFO")
+        configure_logging("INFO", sensitive_terms)
         logging.error("%s", exc)
         return 2
     except KeyboardInterrupt:
