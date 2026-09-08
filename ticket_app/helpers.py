@@ -3,6 +3,8 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
+import json5
+
 from .configuration import MONTH_NAMES, SEAT_SPECS, WEEKDAY_NAMES
 
 
@@ -113,9 +115,79 @@ def _extract_js_object(text: str, variable_name: str) -> str:
 
 
 def _parse_js_object(text: str) -> Dict[str, Any]:
+    """Parse an embedded JavaScript object without treating it as JSON text.
+
+    Current initDc pages are often strict JSON, so keep that inexpensive path
+    first. Variant pages use JSON5 features (single-quoted strings, unquoted
+    keys and ``undefined``). Only a bare ``undefined`` outside a quoted string
+    is converted to JSON5's portable ``null`` equivalent.
+    """
+
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
-        cleaned = re.sub(r"([,{]\s*)([A-Za-z_]\w*)(\s*:)", r'\1"\2"\3', text)
-        cleaned = cleaned.replace("'", '"').replace("undefined", "null")
-        return json.loads(cleaned)
+        try:
+            parsed = json5.loads(_replace_bare_undefined(text))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("JavaScript 对象不是可解析的 JSON/JSON5 对象") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("JavaScript 对象根节点必须是对象")
+    return parsed
+
+
+def _is_js_identifier_char(value: str) -> bool:
+    return value.isalnum() or value in {"_", "$"}
+
+
+def _replace_bare_undefined(text: str) -> str:
+    """Replace only the JavaScript token ``undefined`` outside strings/comments."""
+
+    result: List[str] = []
+    index = 0
+    quote = ""
+    while index < len(text):
+        char = text[index]
+        if quote:
+            result.append(char)
+            if char == "\\" and index + 1 < len(text):
+                index += 1
+                result.append(text[index])
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            result.append(char)
+            index += 1
+            continue
+        # JSON5 comments are not data tokens. Preserve them exactly so the
+        # parser can handle them, rather than changing words inside a comment.
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "/":
+            end = text.find("\n", index + 2)
+            if end == -1:
+                result.append(text[index:])
+                break
+            result.append(text[index:end])
+            index = end
+            continue
+        if char == "/" and index + 1 < len(text) and text[index + 1] == "*":
+            end = text.find("*/", index + 2)
+            if end == -1:
+                result.append(text[index:])
+                break
+            end += 2
+            result.append(text[index:end])
+            index = end
+            continue
+        if text.startswith("undefined", index):
+            before = text[index - 1] if index else ""
+            after_index = index + len("undefined")
+            after = text[after_index] if after_index < len(text) else ""
+            if not _is_js_identifier_char(before) and not _is_js_identifier_char(after):
+                result.append("null")
+                index = after_index
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)

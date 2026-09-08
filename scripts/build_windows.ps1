@@ -44,7 +44,7 @@ if ($pythonVersion.Trim() -ne "3.12") {
     throw "Python 3.12 is required; selected interpreter reports $($pythonVersion.Trim())."
 }
 
-& $Python -c "import PyInstaller, PySide6; print(f'PyInstaller {PyInstaller.__version__}; PySide6 {PySide6.__version__}')"
+& $Python -c "import PyInstaller, PySide6, json5; print(f'PyInstaller {PyInstaller.__version__}; PySide6 {PySide6.__version__}; json5 {json5.__version__}')"
 if ($LASTEXITCODE -ne 0) {
     throw "Build dependencies are missing. Run: python -m pip install -r requirements-dev.txt"
 }

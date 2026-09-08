@@ -9,6 +9,7 @@ This notice covers the expected dependencies of the Windows onedir build. Direct
 | Python 3.12 | Python Software Foundation License | <https://docs.python.org/3/license.html> |
 | PySide6, PySide6-Essentials, PySide6-Addons, Shiboken6 and Qt 6 libraries/plugins | LGPL-3.0-only, GPL-3.0-only, or applicable Qt commercial license | <https://doc.qt.io/qtforpython-6/licenses.html> |
 | Requests | Apache-2.0 | <https://github.com/psf/requests/blob/main/LICENSE> |
+| json5 0.15.0 | Apache-2.0 | <https://github.com/dpranke/pyjson5/blob/v0.15.0/LICENSE> |
 | certifi | MPL-2.0 | <https://github.com/certifi/python-certifi/blob/master/LICENSE> |
 | charset-normalizer | MIT | <https://github.com/jawah/charset_normalizer/blob/master/LICENSE> |
 | idna | BSD-3-Clause | <https://github.com/kjd/idna/blob/master/LICENSE.md> |

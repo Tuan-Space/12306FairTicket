@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from PySide6.QtCore import QDate, QPointF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QTextCursor
+from PySide6.QtCore import QDate, QModelIndex, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDropEvent, QPainter, QPen, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QListView,
     QMessageBox,
     QPushButton,
     QSizePolicy,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyle,
     QStyleOptionViewItem,
+    QTabBar,
     QTabWidget,
     QTextEdit,
     QToolButton,
@@ -103,6 +105,19 @@ class CleanSpinBox(QSpinBox):
     def set_validation(self, state: str = "", message: str = "") -> None:
         set_validation_state(self, state, message)
 
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
+        """Do not let a passing mouse wheel silently change a number.
+
+        Ignoring an unfocused wheel event lets the containing scroll area use
+        it for page scrolling.  Once a user has explicitly focused a field,
+        Qt's normal keyboard-and-wheel adjustment remains available.
+        """
+
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 
 class CleanDoubleSpinBox(QDoubleSpinBox):
     """Floating point spin box without the platform-specific arrow chrome."""
@@ -113,6 +128,12 @@ class CleanDoubleSpinBox(QDoubleSpinBox):
 
     def set_validation(self, state: str = "", message: str = "") -> None:
         set_validation_state(self, state, message)
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
 
 
 class HelpLabel(QWidget):
@@ -161,6 +182,9 @@ class DatePickerWidget(QDateEdit):
         if self.lineEdit() is not None:
             # Keep the popup active while preventing ambiguous hand-typed dates.
             self.lineEdit().setReadOnly(True)
+        # A dedicated object name keeps the calendar navigation neutral in
+        # both application palettes instead of inheriting the platform blue.
+        self.calendarWidget().setObjectName("dateCalendar")
         calendar_icon = _asset_path("calendar.svg").as_posix()
         self.setStyleSheet(
             'QDateEdit#datePicker::down-arrow {'
@@ -186,9 +210,10 @@ class TimeFieldsWidget(QWidget):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        self.setObjectName("timeFields")
         self.optional = bool(optional)
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(4, 3, 4, 3)
         row.setSpacing(6)
 
         self.hour = self._part(0, 23, "时")
@@ -289,8 +314,11 @@ class TimeFieldsWidget(QWidget):
 
     def set_validation(self, state: str = "", message: str = "") -> None:
         set_validation_state(self, state, message)
+        # The three parts are one logical time value. Drawing a border around
+        # every spin box looks like three independent errors, so keep their
+        # chrome neutral and let the containing time editor own one outline.
         for part in self.parts:
-            set_validation_state(part, state, message)
+            set_validation_state(part)
 
 
 class _CheckmarkItemDelegate(QStyledItemDelegate):
@@ -342,8 +370,68 @@ class Card(QFrame):
             self.body.addWidget(subtitle_label)
 
 
+class _TwoColumnPriorityList(QListWidget):
+    """A fixed two-column item view that keeps the model in row-major order."""
+
+    COLUMNS = 2
+    CELL_HEIGHT = 34
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setViewMode(QListView.ViewMode.IconMode)
+        self.setFlow(QListView.Flow.LeftToRight)
+        self.setWrapping(True)
+        self.setMovement(QListView.Movement.Snap)
+        self.setUniformItemSizes(True)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self.sync_grid_size()
+
+    def sync_grid_size(self) -> None:
+        width = max(1, self.viewport().width())
+        self.setGridSize(QSize(max(1, width // self.COLUMNS), self.CELL_HEIGHT))
+
+    def _move_item(self, source_row: int, target_row: int, *, after: bool = False) -> bool:
+        """Move one model row and reset any free icon positions."""
+
+        count = self.count()
+        if not 0 <= source_row < count:
+            return False
+        destination = count if target_row < 0 else max(0, min(count, target_row + int(after)))
+        if destination in {source_row, source_row + 1}:
+            return False
+        moved = self.model().moveRow(QModelIndex(), source_row, QModelIndex(), destination)
+        if moved:
+            self.doItemsLayout()
+            self.setCurrentRow(destination - 1 if source_row < destination else destination)
+        return bool(moved)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt API
+        """Turn an icon drop into a deterministic row-major model move."""
+
+        if event.source() not in {self, self.viewport()}:
+            event.ignore()
+            return
+        source_row = self.currentRow()
+        point = event.position().toPoint()
+        target_index = self.indexAt(point)
+        target_row = target_index.row() if target_index.isValid() else -1
+        after = bool(target_index.isValid() and point.x() >= self.visualRect(target_index).center().x())
+        if self._move_item(source_row, target_row, after=after):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+
 class PriorityListEditor(QWidget):
+    """Two-column, row-major seat priority editor with direct drag sorting."""
+
     changed = Signal()
+    COLUMNS = _TwoColumnPriorityList.COLUMNS
+    CELL_HEIGHT = _TwoColumnPriorityList.CELL_HEIGHT
 
     def __init__(self, all_values: Iterable[str], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -351,11 +439,11 @@ class PriorityListEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        hint = QLabel("从上到下优先 · 勾选席别后可直接拖动排序")
+        hint = QLabel("从左到右、从上到下优先 · 勾选席别后可直接拖动排序")
         hint.setObjectName("muted")
         layout.addWidget(hint)
 
-        self.list = QListWidget()
+        self.list = _TwoColumnPriorityList()
         self.list.setObjectName("priorityList")
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -368,37 +456,84 @@ class PriorityListEditor(QWidget):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.list.setItemDelegate(_CheckmarkItemDelegate(self.list))
-        self.list.setToolTip("勾选并拖拽排序，程序会按从上到下的顺序尝试")
+        self.list.setToolTip("勾选并拖拽排序，程序会按从左到右、从上到下的顺序尝试")
+        self._mutating = True
         for value in all_values:
-            item = QListWidgetItem(str(value))
-            item.setSizeHint(QSize(0, 32))
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsDragEnabled
-                | Qt.ItemFlag.ItemIsDropEnabled
-            )
-            item.setCheckState(Qt.CheckState.Unchecked)
-            self.list.addItem(item)
+            self.list.addItem(self._make_item(str(value), checked=False))
+        self._mutating = False
         self._sync_list_height()
-        self.list.itemChanged.connect(lambda _item: self.changed.emit())
-        self.list.model().rowsMoved.connect(lambda *_args: self.changed.emit())
+        self._refresh_priority_labels()
+        self.list.itemChanged.connect(self._on_item_changed)
+        model = self.list.model()
+        model.rowsMoved.connect(self._on_structure_changed)
+        model.rowsInserted.connect(self._on_structure_changed)
+        model.rowsRemoved.connect(self._on_structure_changed)
         layout.addWidget(self.list)
 
+    def _make_item(self, value: str, *, checked: bool) -> QListWidgetItem:
+        item = QListWidgetItem(value)
+        item.setData(Qt.ItemDataRole.UserRole, value)
+        item.setSizeHint(QSize(0, self.CELL_HEIGHT - 2))
+        item.setFlags(
+            item.flags()
+            | Qt.ItemFlag.ItemIsUserCheckable
+            | Qt.ItemFlag.ItemIsDragEnabled
+            | Qt.ItemFlag.ItemIsDropEnabled
+        )
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        return item
+
+    @staticmethod
+    def _item_value(item: QListWidgetItem) -> str:
+        return str(item.data(Qt.ItemDataRole.UserRole) or item.text())
+
     def _sync_list_height(self) -> None:
-        rows = sum(max(32, self.list.sizeHintForRow(index)) for index in range(self.list.count()))
-        height = rows + self.list.frameWidth() * 2 + 10
+        rows = max(1, (self.list.count() + self.COLUMNS - 1) // self.COLUMNS)
+        height = rows * self.CELL_HEIGHT + self.list.frameWidth() * 2 + 10
         self.list.setFixedHeight(height)
+        self.list.sync_grid_size()
+
+    def _refresh_priority_labels(self) -> None:
+        """Show ranks only for checked items without changing their data value."""
+
+        rank = 0
+        self.list.blockSignals(True)
+        try:
+            for index in range(self.list.count()):
+                item = self.list.item(index)
+                value = self._item_value(item)
+                if item.checkState() == Qt.CheckState.Checked:
+                    rank += 1
+                    item.setText(f"{rank}. {value}")
+                    item.setToolTip(f"优先级 {rank}: {value}")
+                else:
+                    item.setText(value)
+                    item.setToolTip(value)
+        finally:
+            self.list.blockSignals(False)
+
+    def _on_item_changed(self, _item: QListWidgetItem) -> None:
+        if self._mutating:
+            return
+        self._refresh_priority_labels()
+        self.changed.emit()
+
+    def _on_structure_changed(self, *_args: object) -> None:
+        if self._mutating:
+            return
+        self._refresh_priority_labels()
+        self._sync_list_height()
+        self.changed.emit()
 
     def values(self) -> List[str]:
         return [
-            self.list.item(index).text()
+            self._item_value(self.list.item(index))
             for index in range(self.list.count())
             if self.list.item(index).checkState() == Qt.CheckState.Checked
         ]
 
     def set_values(self, values: Iterable[str]) -> None:
-        existing = [self.list.item(index).text() for index in range(self.list.count())]
+        existing = [self._item_value(self.list.item(index)) for index in range(self.list.count())]
         # Imported drafts may contain stale seat names or duplicates.  The
         # editor must always retain the fixed complete list supplied by the
         # caller, while preserving the valid requested priority order.
@@ -408,21 +543,17 @@ class PriorityListEditor(QWidget):
             if text in existing and text not in ordered:
                 ordered.append(text)
         final = ordered + [value for value in existing if value not in ordered]
+        self._mutating = True
         self.list.blockSignals(True)
-        self.list.clear()
-        for value in final:
-            item = QListWidgetItem(value)
-            item.setSizeHint(QSize(0, 32))
-            item.setFlags(
-                item.flags()
-                | Qt.ItemFlag.ItemIsUserCheckable
-                | Qt.ItemFlag.ItemIsDragEnabled
-                | Qt.ItemFlag.ItemIsDropEnabled
-            )
-            item.setCheckState(Qt.CheckState.Checked if value in ordered else Qt.CheckState.Unchecked)
-            self.list.addItem(item)
-        self.list.blockSignals(False)
+        try:
+            self.list.clear()
+            for value in final:
+                self.list.addItem(self._make_item(value, checked=value in ordered))
+        finally:
+            self.list.blockSignals(False)
+            self._mutating = False
         self._sync_list_height()
+        self._refresh_priority_labels()
         self.changed.emit()
 
 
@@ -604,6 +735,16 @@ class BerthCountWidget(QWidget):
         self._update_total()
 
 
+class _ActualTabWheelBar(QTabBar):
+    """Only let wheel navigation act on an actual, painted tab button."""
+
+    def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
+        if self.tabAt(event.position().toPoint()) >= 0:
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class PositionPreferences(QWidget):
     changed = Signal()
 
@@ -612,6 +753,7 @@ class PositionPreferences(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.tabs = QTabWidget()
+        self.tabs.setTabBar(_ActualTabWheelBar(self.tabs))
         self.tabs.setDocumentMode(True)
         self.seats = SeatMapWidget()
         self.berths = BerthCountWidget()
@@ -638,7 +780,9 @@ class PositionPreferences(QWidget):
             self.tabs.setCurrentIndex(0)
 
 
-class TimelineWidget(QListWidget):
+class CurrentPhaseWidget(QFrame):
+    """Compact current-stage display; transitions may move forward or back."""
+
     PHASES = [
         ("preparing", "准备任务"),
         ("syncing", "校准服务器时间"),
@@ -671,59 +815,79 @@ class TimelineWidget(QListWidget):
         "finished": "success",
     }
 
+    STATUS_LABELS = {
+        "failed": "任务失败",
+        "cancelled": "任务已停止",
+        "stopped": "任务已结束（未出票）",
+        "no_ticket": "任务已结束（未出票）",
+    }
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setObjectName("timeline")
-        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setObjectName("currentPhase")
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMinimumHeight(120)
-        self._active = -1
-        self._status = ""
+        self.setMinimumHeight(52)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(9)
+        self.phase_icon = QLabel("○")
+        self.phase_icon.setObjectName("currentPhaseIcon")
+        self.phase_title = QLabel()
+        self.phase_title.setObjectName("currentPhaseTitle")
+        self.phase_message = QLabel()
+        self.phase_message.setObjectName("currentPhaseMessage")
+        self.phase_message.setWordWrap(False)
+        self.phase_message.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(self.phase_icon)
+        row.addWidget(self.phase_title)
+        row.addWidget(self.phase_message, 1)
+        self.current_phase = ""
+        self.current_message = ""
         self.reset_timeline()
 
     def reset_timeline(self) -> None:
-        self._active = -1
-        self._status = ""
+        self.current_phase = ""
+        self.current_message = ""
         self._render()
 
     def set_phase(self, phase: str, message: str = "") -> None:
         phase = self.ALIASES.get(str(phase).lower(), str(phase).lower())
-        if phase in {"failed", "failure", "error", "cancelled", "canceled", "stopped", "no_ticket"}:
-            if phase in {"stopped", "no_ticket"}:
-                self._status = "stopped"
-            else:
-                self._status = "cancelled" if phase in {"cancelled", "canceled"} else "failed"
-        else:
-            for index, (key, _label) in enumerate(self.PHASES):
-                if key == phase:
-                    self._active = max(self._active, index)
-                    break
-        self._render(message)
+        if phase in {"failure", "error"}:
+            phase = "failed"
+        elif phase == "canceled":
+            phase = "cancelled"
+        # Deliberately assign rather than taking max(phase index): a retried
+        # login/query can legitimately return to an earlier displayed stage.
+        self.current_phase = phase
+        self.current_message = str(message or "")
+        self._render()
 
-    def _render(self, message: str = "") -> None:
-        self.clear()
-        for index, (_key, label) in enumerate(self.PHASES):
-            if index < self._active:
-                prefix, color = "✓", QColor("#2fb171")
-            elif index == self._active:
-                prefix, color = "●", QColor("#3388ff")
-            else:
-                prefix, color = "○", QColor("#77829a")
-            suffix = f"  {message}" if index == self._active and message else ""
-            item = QListWidgetItem(f"{prefix}   {label}{suffix}")
-            item.setForeground(color)
-            item.setSizeHint(item.sizeHint().expandedTo(self.viewport().size()).boundedTo(item.sizeHint()))
-            self.addItem(item)
-        if self._status:
-            if self._status == "cancelled":
-                label = "任务已停止"
-            elif self._status == "stopped":
-                label = "任务已结束（未出票）"
-            else:
-                label = "任务失败"
-            item = QListWidgetItem(f"●   {label}{'  ' + message if message else ''}")
-            item.setForeground(QColor("#e35d6a" if self._status == "failed" else "#ef9f43"))
-            self.addItem(item)
+    def _render(self) -> None:
+        phase_labels = dict(self.PHASES)
+        label = self.STATUS_LABELS.get(self.current_phase, phase_labels.get(self.current_phase, "当前阶段"))
+        if not self.current_phase:
+            label, symbol, state = "等待开始", "○", "idle"
+        elif self.current_phase == "success":
+            symbol, state = "✓", "success"
+        elif self.current_phase == "failed":
+            symbol, state = "!", "failed"
+        elif self.current_phase in {"cancelled", "stopped", "no_ticket"}:
+            symbol, state = "■", "stopped"
+        else:
+            symbol, state = "●", "active"
+        self.phase_icon.setText(symbol)
+        self.phase_icon.setProperty("phaseState", state)
+        self.phase_title.setText(label)
+        self.phase_message.setText(self.current_message)
+        self.phase_message.setToolTip(self.current_message)
+        self.setToolTip(f"{label}{'：' + self.current_message if self.current_message else ''}")
+        _repolish(self.phase_icon)
+
+
+class TimelineWidget(CurrentPhaseWidget):
+    """Backward-compatible name for code that still imports TimelineWidget."""
+
+    pass
 
 
 class LogView(QWidget):
@@ -799,14 +963,38 @@ class LogView(QWidget):
             self.refresh()
 
     def append_line(self, line: str, level: str) -> None:
-        level = level.upper() if level.upper() in self.LEVEL_VALUE else "INFO"
-        self._lines.append((line, level))
+        self.append_lines(((line, level),))
+
+    def append_lines(self, lines: Iterable[tuple[str, str]]) -> None:
+        """Store and render one transport batch with a single document edit."""
+
+        normalized: List[tuple[str, str]] = []
+        for line, level in lines:
+            normalized_level = level.upper() if level.upper() in self.LEVEL_VALUE else "INFO"
+            normalized.append((str(line), normalized_level))
+        if not normalized:
+            return
+        self._lines.extend(normalized)
         if len(self._lines) > self.MAX_LINES:
             del self._lines[: len(self._lines) - self.MAX_LINES]
-        if not self._paused and self._matches(line, level):
-            color = self._level_colors[level]
-            self.text.append(f'<span style="color:{color}; white-space:pre">{html.escape(line)}</span>')
-            self.text.moveCursor(QTextCursor.MoveOperation.End)
+        if self._paused:
+            return
+        chunks = [
+            f'<div style="color:{self._level_colors[level]}; white-space:pre">{html.escape(line)}</div>'
+            for line, level in normalized
+            if self._matches(line, level)
+        ]
+        if not chunks:
+            return
+        cursor = self.text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.beginEditBlock()
+        if not self.text.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml("".join(chunks))
+        cursor.endEditBlock()
+        self.text.setTextCursor(cursor)
+        self.text.ensureCursorVisible()
 
     def _matches(self, line: str, level: str) -> bool:
         minimum = self.LEVEL_VALUE.get(self.level.currentText(), 20)
@@ -818,8 +1006,10 @@ class LogView(QWidget):
         chunks = []
         for line, level in self._lines:
             if self._matches(line, level):
-                chunks.append(f'<span style="color:{self._level_colors[level]}; white-space:pre">{html.escape(line)}</span>')
-        self.text.setHtml("<br>".join(chunks))
+                chunks.append(
+                    f'<div style="color:{self._level_colors[level]}; white-space:pre">{html.escape(line)}</div>'
+                )
+        self.text.setHtml("".join(chunks))
         self.text.moveCursor(QTextCursor.MoveOperation.End)
 
     def filtered_text(self) -> str:

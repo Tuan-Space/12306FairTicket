@@ -4,11 +4,11 @@ import re
 import time
 import urllib.parse
 from http.cookiejar import MozillaCookieJar
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 
-from .configuration import AppConfig, AppError, BASE_URL, PreparedPassengerSet
+from .configuration import AppConfig, AppError, BASE_URL, PreparedPassengerSet, ResponseFormatError
 from .configuration import _elapsed_ms, _perf_log
 from .helpers import (
     _display_stock,
@@ -23,6 +23,9 @@ from .preferences import (
     OrderPreferencePayload,
 )
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
+
+
+_INIT_DC_SAFE_STOP = "尚未进入确认排队，本次任务已安全停止"
 
 
 class RailwayClient:
@@ -337,6 +340,18 @@ class RailwayClient:
             raise AppError(f"未获取到常用乘车人: {_message_from_payload(payload)}")
         return passengers
 
+    @staticmethod
+    def _response_json_object(response: Any, stage: str) -> Dict[str, Any]:
+        """Read an order endpoint JSON response without exposing its contents."""
+
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise ResponseFormatError(f"{stage} 返回的 JSON 格式无效，任务已停止") from exc
+        if not isinstance(payload, dict):
+            raise ResponseFormatError(f"{stage} 返回的 JSON 顶层不是对象，任务已停止")
+        return payload
+
     def submit_order_request(self, ticket: Dict[str, Any]) -> Tuple[bool, str]:
         data = {
             "secretStr": ticket["secret_str"],
@@ -353,8 +368,10 @@ class RailwayClient:
             data=data,
             timeout=self.cfg.request_timeout_seconds,
         )
-        payload = response.json()
-        if payload.get("status"):
+        payload = self._response_json_object(response, "submitOrderRequest")
+        if not isinstance(payload.get("status"), bool):
+            raise ResponseFormatError("submitOrderRequest 返回缺少 status 布尔字段，任务已停止")
+        if payload["status"]:
             return True, "OK"
         return False, _message_from_payload(payload)
 
@@ -367,12 +384,28 @@ class RailwayClient:
         html = response.text
         token_match = re.search(r"globalRepeatSubmitToken\s*=\s*'([^']+)'", html)
         if not token_match:
-            raise AppError("确认订单页没有返回 REPEAT_SUBMIT_TOKEN，可能登录已失效")
+            raise ResponseFormatError(f"initDc 返回缺少 REPEAT_SUBMIT_TOKEN；{_INIT_DC_SAFE_STOP}")
         ticket_info_text = _extract_js_object(html, "ticketInfoForPassengerForm")
         if not ticket_info_text:
-            raise AppError("确认订单页没有返回 ticketInfoForPassengerForm")
-        ticket_info = _parse_js_object(ticket_info_text)
+            raise ResponseFormatError(f"initDc 返回缺少 ticketInfoForPassengerForm；{_INIT_DC_SAFE_STOP}")
+        try:
+            ticket_info = _parse_js_object(ticket_info_text)
+        except ValueError as exc:
+            raise ResponseFormatError(
+                f"initDc 返回的 ticketInfoForPassengerForm 格式无效；{_INIT_DC_SAFE_STOP}"
+            ) from exc
         order_request = ticket_info.get("orderRequestDTO")
+        if order_request is not None and not isinstance(order_request, dict):
+            raise ResponseFormatError(f"initDc 返回的 orderRequestDTO 结构无效；{_INIT_DC_SAFE_STOP}")
+        query_request = ticket_info.get("queryLeftTicketRequestDTO")
+        # ``getQueueCount`` consumes this object after checkOrderInfo.  A
+        # truthy non-mapping would otherwise become a late AttributeError,
+        # which both loses the safe-stop explanation and obscures the initDc
+        # protocol failure.
+        if query_request is not None and not isinstance(query_request, Mapping):
+            raise ResponseFormatError(
+                f"initDc 返回的 queryLeftTicketRequestDTO 结构无效；{_INIT_DC_SAFE_STOP}"
+            )
         if isinstance(order_request, dict):
             dw_flag = order_request.get("dw_flag")
             if isinstance(dw_flag, str):
@@ -402,11 +435,22 @@ class RailwayClient:
             data=data,
             timeout=self.cfg.request_timeout_seconds,
         )
-        payload = response.json()
+        payload = self._response_json_object(response, "checkOrderInfo")
+        if not isinstance(payload.get("status"), bool):
+            raise ResponseFormatError("checkOrderInfo 返回缺少 status 布尔字段，任务已停止")
         response_data = payload.get("data")
+        if payload["status"] and not isinstance(response_data, dict):
+            raise ResponseFormatError("checkOrderInfo 返回的 data 结构无效，任务已停止")
         response_data = response_data if isinstance(response_data, dict) else {}
+        if payload["status"] and not isinstance(response_data.get("submitStatus"), bool):
+            # This endpoint is reached only after submitOrderRequest.  Do not
+            # treat an incomplete or type-shifted success response as an
+            # ordinary rejection and then try another candidate.
+            raise ResponseFormatError(
+                "checkOrderInfo 返回缺少或包含无效的 submitStatus 布尔字段，任务已停止"
+            )
         capabilities = OrderCapabilities.from_mapping(response_data)
-        success = payload.get("status") is True and response_data.get("submitStatus") is True
+        success = payload["status"] is True and response_data.get("submitStatus") is True
         message = "OK" if success else _message_from_payload(payload)
         return OrderCheckResult(success, message, capabilities)
 

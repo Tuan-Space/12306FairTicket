@@ -149,6 +149,18 @@ QDoubleSpinBox[validationState="warning"] {
     background: #2a2115;
 }
 
+QWidget#timeFields[validationState="error"] {
+    border: 2px solid #ef6472;
+    border-radius: 9px;
+    background: #271721;
+}
+
+QWidget#timeFields[validationState="warning"] {
+    border: 2px solid #e6ad50;
+    border-radius: 9px;
+    background: #2a2115;
+}
+
 QWidget[validationState="error"] QLabel#validationMessage {
     color: #ff9aa5;
 }
@@ -172,6 +184,31 @@ QWidget#fieldBlock[validationState="warning"] {
 QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;
     width: 24px;
+}
+
+/* Keep the calendar navigation neutral; selection may still use the accent. */
+QCalendarWidget#dateCalendar QWidget#qt_calendar_navigationbar {
+    background: #171f2d;
+    border: 0;
+}
+
+QCalendarWidget#dateCalendar QToolButton {
+    min-height: 26px;
+    background: #202938;
+    border-color: #3a465a;
+    color: #d8e1ed;
+}
+
+QCalendarWidget#dateCalendar QToolButton:hover {
+    background: #293547;
+    border-color: #536278;
+}
+
+QCalendarWidget#dateCalendar QAbstractItemView {
+    background: #101827;
+    alternate-background-color: #141e2f;
+    selection-background-color: #45627f;
+    selection-color: #ffffff;
 }
 
 QComboBox QAbstractItemView {
@@ -345,6 +382,26 @@ QListWidget#timeline::item {
     border-left: 1px solid #28354e;
     margin-left: 8px;
 }
+
+QFrame#currentPhase {
+    background: #0c1424;
+    border: 1px solid #253149;
+    border-radius: 9px;
+}
+
+QLabel#currentPhaseIcon {
+    min-width: 20px;
+    font-size: 18px;
+    font-weight: 700;
+    color: #5d7090;
+}
+
+QLabel#currentPhaseIcon[phaseState="active"] { color: #4b98f6; }
+QLabel#currentPhaseIcon[phaseState="success"] { color: #57c78c; }
+QLabel#currentPhaseIcon[phaseState="failed"] { color: #ef7180; }
+QLabel#currentPhaseIcon[phaseState="stopped"] { color: #eca652; }
+QLabel#currentPhaseTitle { color: #e6eefb; font-weight: 700; }
+QLabel#currentPhaseMessage { color: #99a8c0; }
 
 QTextEdit#logView {
     color: #cbd7eb;

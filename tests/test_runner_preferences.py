@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ticket_app.configuration import AppError, PreparedPassengerSet
+from ticket_app.configuration import AppError, PreparedPassengerSet, ResponseFormatError
 from ticket_app.preferences import (
     BerthPreference,
     OrderCapabilities,
@@ -158,3 +158,130 @@ def test_cancel_after_confirm_reports_an_unknown_submitted_order():
     with pytest.raises(AppError, match="订单已提交排队"):
         runner._book_ticket(candidate(), {"O": passengers()})
     assert client.preference_payload is not None
+
+
+def test_malformed_init_dc_terminates_instead_of_trying_queue_or_another_candidate():
+    class MalformedInitClient(FakeBookingClient):
+        def init_dc(self):
+            raise ResponseFormatError("initDc 返回的 ticketInfoForPassengerForm 格式无效，任务已停止")
+
+        def get_queue_count(self, *_args):
+            raise AssertionError("malformed initDc must never reach the queue endpoint")
+
+    client = MalformedInitClient(OrderCapabilities())
+    runner = make_runner(client)
+
+    with pytest.raises(ResponseFormatError, match="initDc 返回"):
+        runner._book_ticket(candidate(), {"O": passengers()})
+
+
+def test_run_stops_after_first_candidate_init_dc_format_error_without_trying_second():
+    """The outer candidate loop must not turn this unsafe error into fallback."""
+
+    runner = object.__new__(TicketRunner)
+    runner.cfg = SimpleNamespace(
+        max_retries=1,
+        auto_submit=True,
+        perf_log=False,
+        from_station="北京西",
+        to_station="郑州东",
+        train_date="2026-09-09",
+        seat_types=["二等座"],
+    )
+    runner.cancel_token = CancellationToken()
+    runner.event_sink = None
+    runner.clock = SimpleNamespace(sync=lambda *_args: None)
+    runner.stations = SimpleNamespace(load=lambda *_args: None, code=lambda name: name)
+    runner.client = SimpleNamespace(ensure_login=lambda: None, query_tickets=lambda *_args: [])
+    runner._phase = lambda *_args, **_kwargs: None
+    runner._select_passengers = lambda: []
+    runner._prepare_passengers_by_seat_code = lambda _passengers: {}
+    runner._resolve_target_start = lambda: None
+    runner._wait_for_query_start = lambda _target: None
+    runner._should_stop = lambda: False
+    runner._current_query_interval = lambda _target: 0
+    runner._sleep = lambda _seconds: None
+    first = {"ticket": {"station_train_code": "G1", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
+    second = {"ticket": {"station_train_code": "G2", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
+    runner._find_candidates = lambda _tickets: [first, second]
+    attempted: list[str] = []
+
+    def fail_init_format(candidate, _prepared):
+        attempted.append(candidate["ticket"]["station_train_code"])
+        raise ResponseFormatError("initDc 返回格式无效；尚未进入确认排队，本次任务已安全停止")
+
+    runner._book_ticket = fail_init_format
+
+    with pytest.raises(ResponseFormatError, match="尚未进入确认排队"):
+        runner._run()
+    assert attempted == ["G1"]
+
+
+def test_check_order_format_error_does_not_queue_or_try_a_second_candidate():
+    """A malformed pre-queue acknowledgement is terminal after submitOrder."""
+
+    class MalformedCheckClient(FakeBookingClient):
+        def __init__(self):
+            super().__init__(OrderCapabilities())
+            self.check_calls = 0
+            self.queue_calls = 0
+
+        def check_order_info(self, _passengers, _token):
+            self.check_calls += 1
+            raise ResponseFormatError(
+                "checkOrderInfo 返回缺少或包含无效的 submitStatus 布尔字段，任务已停止"
+            )
+
+        def get_queue_count(self, *_args):
+            self.queue_calls += 1
+            raise AssertionError("malformed checkOrderInfo must never reach the queue endpoint")
+
+    client = MalformedCheckClient()
+    client.ensure_login = lambda: None
+    client.query_tickets = lambda *_args: []
+    runner = object.__new__(TicketRunner)
+    runner.cfg = SimpleNamespace(
+        max_retries=1,
+        auto_submit=True,
+        perf_log=False,
+        from_station="北京西",
+        to_station="郑州东",
+        train_date="2026-09-09",
+        seat_types=["二等座"],
+        seat_relation_preference=SeatRelationPreference(),
+        berth_preference=BerthPreference(),
+        order_wait_attempts=1,
+        order_wait_interval_seconds=0.001,
+    )
+    runner.cancel_token = CancellationToken()
+    runner.event_sink = None
+    runner.clock = SimpleNamespace(sync=lambda *_args: None)
+    runner.stations = SimpleNamespace(load=lambda *_args: None, code=lambda name: name)
+    runner.client = client
+    runner._phase = lambda *_args, **_kwargs: None
+    runner._select_passengers = lambda: []
+    runner._prepare_passengers_by_seat_code = lambda _passengers: {"O": passengers()}
+    runner._resolve_target_start = lambda: None
+    runner._wait_for_query_start = lambda _target: None
+    runner._should_stop = lambda: False
+    runner._current_query_interval = lambda _target: 0
+    runner._sleep = lambda _seconds: None
+    first = {
+        "ticket": {"station_train_code": "G1", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"},
+        "seat_label": "二等座",
+        "seat_type": "O",
+        "stock": "1",
+    }
+    second = {
+        "ticket": {"station_train_code": "G2", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"},
+        "seat_label": "二等座",
+        "seat_type": "O",
+        "stock": "1",
+    }
+    runner._find_candidates = lambda _tickets: [first, second]
+
+    with pytest.raises(ResponseFormatError, match="submitStatus"):
+        runner._run()
+
+    assert client.check_calls == 1
+    assert client.queue_calls == 0

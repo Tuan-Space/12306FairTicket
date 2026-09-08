@@ -100,6 +100,103 @@ def test_profile_bar_only_has_save_and_import_json_buttons(main_window: gui_app.
     assert not hasattr(main_window, "profile_combo")
 
 
+def test_configuration_bar_explains_json_and_privacy(main_window: gui_app.MainWindow) -> None:
+    assert "JSON" in main_window.save_settings_button.toolTip()
+    assert "Cookie" in main_window.save_settings_button.toolTip()
+    assert "Token" in main_window.save_settings_button.toolTip()
+    assert "JSON" in main_window.import_settings_button.toolTip()
+    assert "version 1" in main_window.import_settings_button.toolTip()
+    assert "version 2" in main_window.import_settings_button.toolTip()
+
+
+def test_pristine_form_does_not_show_default_cross_field_errors(main_window: gui_app.MainWindow, qtbot) -> None:
+    main_window.show()
+    qtbot.wait(320)
+
+    assert main_window.passengers.property("validationState") in (None, "")
+    assert main_window.preferred_trains.property("validationState") in (None, "")
+    assert main_window.field_messages["passenger_names"].isHidden()
+    assert main_window.field_messages["preferred_trains"].isHidden()
+
+
+def test_live_validation_marks_only_touched_field_and_direct_dependencies(
+    main_window: gui_app.MainWindow, qtbot
+) -> None:
+    main_window.show()
+    main_window.from_station.setText("不存在的车站")
+    qtbot.waitUntil(lambda: main_window.from_station.property("validationState") == "error", timeout=1000)
+
+    assert main_window.to_station.property("validationState") in (None, "")
+    assert main_window.passengers.property("validationState") in (None, "")
+    assert main_window.preferred_trains.property("validationState") in (None, "")
+
+
+def test_train_checkbox_precedes_its_error_and_uses_one_error_boundary(main_window: gui_app.MainWindow, qtbot) -> None:
+    main_window.show()
+    main_window._validate_all()
+    qtbot.wait(20)
+    message = main_window.field_messages["preferred_trains"]
+    train_input = main_window.preferred_trains
+
+    assert train_input.property("validationState") == "error"
+    assert main_window.field_blocks["preferred_trains"].property("validationState") in (None, "")
+    assert main_window.only_preferred.mapToGlobal(main_window.only_preferred.rect().topLeft()).x() == train_input.mapToGlobal(train_input.rect().topLeft()).x()
+    assert main_window.only_preferred.mapToGlobal(main_window.only_preferred.rect().bottomLeft()).y() < message.mapToGlobal(message.rect().topLeft()).y()
+
+
+def test_basic_page_has_no_help_icons_and_status_panel_has_no_scroll_area(main_window: gui_app.MainWindow) -> None:
+    assert not main_window.basic_scroll.findChildren(gui_app.QToolButton, "helpButton")
+    assert main_window.advanced_scroll.findChildren(gui_app.QToolButton, "helpButton")
+    assert not any(
+        label.text() == "整组位置偏好"
+        for label in main_window.position_preferences.parentWidget().findChildren(gui_app.QLabel)
+    )
+    assert isinstance(main_window.timeline, gui_app.CurrentPhaseWidget)
+    assert not main_window.status_panel.findChildren(gui_app.QScrollArea)
+
+
+def test_status_controls_remain_visible_at_minimum_window_size(main_window: gui_app.MainWindow, qtbot) -> None:
+    main_window.resize(1200, 720)
+    main_window.show()
+    qtbot.wait(30)
+
+    panel_rect = main_window.status_panel.rect()
+    for widget in (
+        main_window.qr_image,
+        main_window.timeline,
+        main_window.validate_button,
+        main_window.start_button,
+        main_window.stop_button,
+        main_window.order_button,
+    ):
+        top_left = widget.mapTo(main_window.status_panel, widget.rect().topLeft())
+        bottom_right = widget.mapTo(main_window.status_panel, widget.rect().bottomRight())
+        assert panel_rect.contains(top_left)
+        assert panel_rect.contains(bottom_right)
+
+
+def test_log_transport_batch_updates_log_view_once(main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:
+    rendered: list[list[tuple[str, str]]] = []
+    monkeypatch.setattr(main_window.log_view, "append_lines", lambda lines: rendered.append(list(lines)))
+
+    main_window._on_log_batch((("line 1", "INFO"), ("line 2", "WARNING"), ("bad",)))
+
+    assert rendered == [[("line 1", "INFO"), ("line 2", "WARNING")]]
+
+
+def test_non_full_refresh_does_not_reveal_untouched_cross_field_errors(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda *_args: None)
+
+    main_window._on_station_refresh_finished({"北京西": "BXP", "郑州东": "ZAF"}, None)
+
+    assert main_window.passengers.property("validationState") in (None, "")
+    assert main_window.preferred_trains.property("validationState") in (None, "")
+    assert main_window.field_messages["passenger_names"].isHidden()
+    assert main_window.field_messages["preferred_trains"].isHidden()
+
+
 def test_save_and_import_buttons_round_trip_every_editable_setting(
     main_window: gui_app.MainWindow,
     monkeypatch: pytest.MonkeyPatch,
@@ -191,7 +288,8 @@ def test_all_ten_seat_types_are_expanded_without_internal_scrolling(main_window:
 
     assert seat_list.count() == 10
     assert seat_list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert seat_list.height() >= sum(seat_list.sizeHintForRow(index) for index in range(seat_list.count()))
+    expected_rows = (seat_list.count() + main_window.seat_types.COLUMNS - 1) // main_window.seat_types.COLUMNS
+    assert seat_list.height() >= expected_rows * main_window.seat_types.CELL_HEIGHT
 
 
 def test_station_update_is_disabled_and_not_started_while_task_runs(

@@ -1,6 +1,7 @@
 import base64
 import tempfile
 import unittest
+import json
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,8 @@ from unittest.mock import Mock, patch
 import requests
 
 from ticket_app.client import RailwayClient
-from ticket_app.configuration import AppConfig, AppError, PreparedPassengerSet
+from ticket_app.configuration import AppConfig, AppError, PreparedPassengerSet, ResponseFormatError
+from ticket_app.helpers import _parse_js_object
 from ticket_app.preferences import (
     BerthPreference,
     OrderCapabilities,
@@ -27,6 +29,15 @@ class FakeResponse:
 
     def json(self):
         return self._payload
+
+
+class InvalidJsonResponse:
+    """A response whose decoder fails without including server contents."""
+
+    text = ""
+
+    def json(self):
+        raise json.JSONDecodeError("Invalid \\escape", "{bad: \\d}", 7)
 
 
 def base_config_mapping(**updates):
@@ -233,7 +244,7 @@ class RailwayClientPreferenceTests(unittest.TestCase):
     @staticmethod
     def make_client(response):
         client = object.__new__(RailwayClient)
-        client.cfg = SimpleNamespace(request_timeout_seconds=5, choose_seats="")
+        client.cfg = SimpleNamespace(request_timeout_seconds=5, choose_seats="", purpose_codes="ADULT")
         client.session = Mock()
         client.session.post.return_value = response
         return client
@@ -297,6 +308,125 @@ class RailwayClientPreferenceTests(unittest.TestCase):
         self.assertEqual(token, "token")
         self.assertEqual(context["dw_flag"], "a,b,c,S")
         self.assertEqual(context["orderRequestDTO"]["dw_flag"], "a,b,c,S")
+
+    def test_init_dc_parses_json5_escapes_and_only_replaces_bare_undefined(self):
+        html = (
+            "globalRepeatSubmitToken = 'token';"
+            "var ticketInfoForPassengerForm = {"
+            "orderRequestDTO: {dw_flag: 'a,b,c,S'}, "
+            "leftTicketStr: 'left\\d', "
+            "hexValue: '\\x2F', "
+            "legacyValue: undefined, "
+            "literalValue: 'undefined', "
+            "quotedBrace: 'it\\'s {safe}'"
+            "};"
+        )
+        client = self.make_client(FakeResponse(text=html))
+
+        token, context = client.init_dc()
+
+        self.assertEqual(token, "token")
+        self.assertEqual(context["dw_flag"], "a,b,c,S")
+        self.assertIsNone(context["legacyValue"])
+        self.assertEqual(context["literalValue"], "undefined")
+        self.assertEqual(context["quotedBrace"], "it's {safe}")
+        # JSON5 applies JavaScript string-escape semantics: an unknown escape
+        # such as ``\\d`` is the literal ``d`` and ``\\x2F`` is ``/``.
+        self.assertEqual(context["leftTicketStr"], "leftd")
+        self.assertEqual(context["hexValue"], "/")
+
+    def test_js_object_root_must_be_a_mapping(self):
+        with self.assertRaisesRegex(ValueError, "根节点"):
+            _parse_js_object("[1, 2]")
+
+    def test_order_endpoints_report_json_and_structure_errors_without_response_body(self):
+        client = self.make_client(InvalidJsonResponse())
+        ticket = {
+            "secret_str": "secret",
+            "date": "2026-09-09",
+            "from_station": "北京西",
+            "to_station": "郑州东",
+        }
+        with self.assertRaisesRegex(ResponseFormatError, "submitOrderRequest 返回的 JSON 格式无效"):
+            client.submit_order_request(ticket)
+
+        client = self.make_client(FakeResponse({"message": "missing status"}))
+        with self.assertRaisesRegex(ResponseFormatError, "submitOrderRequest 返回缺少 status"):
+            client.submit_order_request(ticket)
+
+        client = self.make_client(FakeResponse({"status": True, "data": []}))
+        passengers = PreparedPassengerSet([], "O,0,...", "甲,1,..._")
+        with self.assertRaisesRegex(ResponseFormatError, "checkOrderInfo 返回的 data 结构无效"):
+            client.check_order_info(passengers, "token")
+
+        client = self.make_client(InvalidJsonResponse())
+        with self.assertRaisesRegex(ResponseFormatError, "checkOrderInfo 返回的 JSON 格式无效"):
+            client.check_order_info(passengers, "token")
+
+        invalid_submit_payloads = (
+            {},
+            {"submitStatus": None},
+            {"submitStatus": "true"},
+            {"submitStatus": 1},
+        )
+        for invalid_submit_data in invalid_submit_payloads:
+            with self.subTest(data=invalid_submit_data):
+                client = self.make_client(
+                    FakeResponse({"status": True, "data": invalid_submit_data})
+                )
+                with self.assertRaisesRegex(
+                    ResponseFormatError,
+                    "checkOrderInfo 返回缺少或包含无效的 submitStatus 布尔字段，任务已停止",
+                ):
+                    client.check_order_info(passengers, "token")
+
+    def test_init_dc_structure_errors_are_terminal_format_errors(self):
+        client = self.make_client(FakeResponse(text="globalRepeatSubmitToken = 'token';"))
+        with self.assertRaisesRegex(
+            ResponseFormatError,
+            "initDc 返回缺少 ticketInfoForPassengerForm；尚未进入确认排队，本次任务已安全停止",
+        ):
+            client.init_dc()
+
+        malformed = (
+            "globalRepeatSubmitToken = 'token';"
+            "var ticketInfoForPassengerForm = {orderRequestDTO: };"
+        )
+        client = self.make_client(FakeResponse(text=malformed))
+        with self.assertRaisesRegex(
+            ResponseFormatError,
+            "ticketInfoForPassengerForm 格式无效；尚未进入确认排队，本次任务已安全停止",
+        ):
+            client.init_dc()
+
+        invalid_query_dto = (
+            "globalRepeatSubmitToken = 'token';"
+            "var ticketInfoForPassengerForm = {"
+            "queryLeftTicketRequestDTO: ['SECRET_SHOULD_NOT_APPEAR']"
+            "};"
+        )
+        client = self.make_client(FakeResponse(text=invalid_query_dto))
+        with self.assertRaisesRegex(
+            ResponseFormatError,
+            "queryLeftTicketRequestDTO 结构无效；尚未进入确认排队，本次任务已安全停止",
+        ) as raised:
+            client.init_dc()
+        self.assertNotIn("SECRET_SHOULD_NOT_APPEAR", str(raised.exception))
+
+        for invalid_empty_query_dto in ("", []):
+            with self.subTest(queryLeftTicketRequestDTO=invalid_empty_query_dto):
+                html = (
+                    "globalRepeatSubmitToken = 'token';"
+                    "var ticketInfoForPassengerForm = "
+                    + repr({"queryLeftTicketRequestDTO": invalid_empty_query_dto})
+                    + ";"
+                )
+                client = self.make_client(FakeResponse(text=html))
+                with self.assertRaisesRegex(
+                    ResponseFormatError,
+                    "queryLeftTicketRequestDTO 结构无效；尚未进入确认排队，本次任务已安全停止",
+                ):
+                    client.init_dc()
 
     def test_qr_creation_returns_memory_bytes_and_uuid(self):
         image_bytes = b"fake-png"

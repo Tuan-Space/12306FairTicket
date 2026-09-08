@@ -23,6 +23,15 @@ class AppError(Exception):
     """Expected runtime failure that can be shown cleanly."""
 
 
+class ResponseFormatError(AppError):
+    """A server response cannot be safely interpreted for an order action.
+
+    Retrying another candidate after a malformed order response is unsafe: the
+    server may already have reserved or submitted the original request.  The
+    runner therefore lets this error terminate the current task.
+    """
+
+
 @dataclass(frozen=True)
 class SeatSpec:
     stock_key: str

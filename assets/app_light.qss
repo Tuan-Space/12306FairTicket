@@ -77,6 +77,18 @@ QDoubleSpinBox[validationState="warning"] {
     background: #fff9ed;
 }
 
+QWidget#timeFields[validationState="error"] {
+    border: 2px solid #d84759;
+    border-radius: 9px;
+    background: #fff4f5;
+}
+
+QWidget#timeFields[validationState="warning"] {
+    border: 2px solid #b7791f;
+    border-radius: 9px;
+    background: #fff9ed;
+}
+
 QWidget[validationState="error"] QLabel#validationMessage { color: #bc3044; }
 QWidget[validationState="warning"] QLabel#validationMessage { color: #956114; }
 QWidget#fieldBlock[validationState="error"] {
@@ -96,6 +108,31 @@ QComboBox QAbstractItemView {
     border-color: #cad5e5;
     selection-background-color: #d9eaff;
     selection-color: #184f8f;
+}
+
+QCalendarWidget#dateCalendar QWidget#qt_calendar_navigationbar {
+    background: #edf1f5;
+    border: 0;
+}
+
+QCalendarWidget#dateCalendar QToolButton {
+    color: #3b4a60;
+    background: #f7f9fc;
+    border-color: #d3dce8;
+}
+
+QCalendarWidget#dateCalendar QToolButton:hover {
+    color: #263a54;
+    background: #e9eef4;
+    border-color: #b8c5d5;
+}
+
+QCalendarWidget#dateCalendar QAbstractItemView {
+    color: #34435d;
+    background: #ffffff;
+    alternate-background-color: #f6f8fb;
+    selection-background-color: #607991;
+    selection-color: #ffffff;
 }
 
 QPushButton, QToolButton {
@@ -185,6 +222,19 @@ QListWidget#priorityList::item:selected {
 }
 
 QListWidget#timeline::item { border-left-color: #d6dfeb; }
+
+QFrame#currentPhase {
+    background: #f8fafd;
+    border-color: #d4deea;
+}
+
+QLabel#currentPhaseIcon { color: #78879b; }
+QLabel#currentPhaseIcon[phaseState="active"] { color: #2878d2; }
+QLabel#currentPhaseIcon[phaseState="success"] { color: #19895f; }
+QLabel#currentPhaseIcon[phaseState="failed"] { color: #ca3a50; }
+QLabel#currentPhaseIcon[phaseState="stopped"] { color: #b57925; }
+QLabel#currentPhaseTitle { color: #2b3c56; }
+QLabel#currentPhaseMessage { color: #697992; }
 
 QTextEdit#logView {
     color: #273852;

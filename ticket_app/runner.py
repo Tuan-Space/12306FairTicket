@@ -7,7 +7,7 @@ import requests
 
 from .client import RailwayClient
 from .clock import ServerClock
-from .configuration import AppConfig, AppError, PreparedPassengerSet, SEAT_SPECS, _elapsed_ms, _perf_log, _resolve_schedule_time
+from .configuration import AppConfig, AppError, PreparedPassengerSet, ResponseFormatError, SEAT_SPECS, _elapsed_ms, _perf_log, _resolve_schedule_time
 from .helpers import _build_passenger_strings, _is_terminal_order_failure, _resolve_submit_seat_code, _stock_available
 from .preferences import OrderPreferencePayload, build_order_preference_payload
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
@@ -275,6 +275,10 @@ class TicketRunner:
             step_start = time.perf_counter()
             token, ticket_info = self.client.init_dc()
             _perf_log(self.cfg, "initDc 耗时 %.1fms", _elapsed_ms(step_start))
+        except ResponseFormatError:
+            # A malformed initDc response leaves the server-side reservation
+            # state unknown. Do not continue to another candidate or queue.
+            raise
         except AppError as exc:
             logging.warning("初始化确认订单页失败: %s", exc)
             return False
