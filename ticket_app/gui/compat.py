@@ -1,9 +1,9 @@
-"""Compatibility helpers shared by the desktop UI.
+"""Safe configuration and local station-data helpers for the desktop UI.
 
-The GUI never imports a user supplied ``config.py``.  Legacy configuration is
-read with ``ast.literal_eval`` and converted into the structured AppConfig
-mapping instead.  This module also deliberately tolerates both the original
-AppConfig and the extended structured-preference version.
+GUI configuration is JSON-only.  ``safe_read_legacy_config`` remains as a
+deprecated, non-executing migration helper for third-party callers, but the
+desktop application must not offer or invoke it.  In particular, no GUI-owned
+configuration API imports (or executes) a user supplied ``config.py``.
 """
 
 from __future__ import annotations
@@ -11,7 +11,9 @@ from __future__ import annotations
 import ast
 import inspect
 import json
+import math
 import os
+import tempfile
 from dataclasses import MISSING, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
@@ -29,6 +31,10 @@ else:
 RUNTIME_DIR = LOCAL_DATA_DIR
 PROFILE_FILE = RUNTIME_DIR / "gui_profiles.json"
 LEGACY_CONFIG_FILE = PROJECT_ROOT / "config.py"
+GUI_CONFIG_VERSION = 2
+GUI_CONFIG_MAX_BYTES = 1_000_000
+STATION_CACHE_FILE = LOCAL_DATA_DIR / "stations.json"
+STATION_SNAPSHOT_FILE = PROJECT_ROOT / "assets" / "stations_snapshot.json"
 
 COMMON_STATIONS = (
     "北京",
@@ -141,20 +147,28 @@ DEFAULT_VALUES: Dict[str, Any] = {
 }
 
 
+# These are every setting a GUI user is allowed to change.  Runtime paths,
+# session persistence and identity/login fields deliberately do not appear in
+# this allow-list, so unknown future keys cannot accidentally be persisted.
+EDITABLE_SETTINGS_KEYS = frozenset(
+    {
+        "from_station", "to_station", "train_date", "passenger_names",
+        "seat_types", "preferred_trains", "only_preferred_trains",
+        "start_at", "stop_at", "query_interval_seconds", "max_retries",
+        "pre_query_seconds", "hot_query_interval_seconds", "hot_window_seconds",
+        "auto_submit", "seat_position_preferences", "berth_preference",
+        "request_timeout_seconds", "login_qr_timeout_seconds",
+        "login_qr_poll_seconds", "time_sync_samples", "time_sync_max_rtt_seconds",
+        "order_wait_attempts", "order_wait_interval_seconds", "station_cache_days",
+        "log_level", "perf_log",
+    }
+)
+# Kept as a public compatibility name for the v1 named-profile reader.
 PROFILE_KEYS = frozenset(
     {
-        "from_station",
-        "to_station",
-        "train_date",
-        "passenger_names",
-        "seat_types",
-        "preferred_trains",
-        "only_preferred_trains",
-        "start_at",
-        "stop_at",
-        "auto_submit",
-        "seat_position_preferences",
-        "berth_preference",
+        "from_station", "to_station", "train_date", "passenger_names",
+        "seat_types", "preferred_trains", "only_preferred_trains", "start_at",
+        "stop_at", "auto_submit", "seat_position_preferences", "berth_preference",
         "position_fallback",
     }
 )
@@ -255,11 +269,34 @@ def safe_read_legacy_config(path: Path) -> Dict[str, Any]:
     return result
 
 
-def cached_station_names() -> list[str]:
-    """Load autocomplete names from local caches only, never the network."""
+def _station_names_from_document(document: Any) -> set[str]:
+    """Extract station names from a StationStore cache or a plain mapping."""
+
+    stations = document.get("stations", document) if isinstance(document, Mapping) else {}
+    if not isinstance(stations, Mapping):
+        return set()
+    return {str(name).strip() for name in stations if str(name).strip()}
+
+
+def bundled_station_names(snapshot_path: Path = STATION_SNAPSHOT_FILE) -> list[str]:
+    """Return packaged station names without ever contacting the network."""
 
     names = set(COMMON_STATIONS)
-    candidates = (LOCAL_DATA_DIR / "stations.json",)
+    try:
+        if snapshot_path.exists():
+            names.update(_station_names_from_document(json.loads(snapshot_path.read_text(encoding="utf-8"))))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # The compact built-in list keeps autocomplete usable if a damaged
+        # installation omitted its optional snapshot.
+        pass
+    return sorted(names)
+
+
+def cached_station_names(cache_path: Optional[Path] = None) -> list[str]:
+    """Load packaged and current-user station names; this is strictly offline."""
+
+    names = set(bundled_station_names())
+    candidates = (cache_path or STATION_CACHE_FILE,)
     for path in candidates:
         if not path.exists():
             continue
@@ -267,9 +304,7 @@ def cached_station_names() -> list[str]:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
-        stations = document.get("stations", document) if isinstance(document, Mapping) else {}
-        if isinstance(stations, Mapping):
-            names.update(str(name).strip() for name in stations if str(name).strip())
+        names.update(_station_names_from_document(document))
     return sorted(names)
 
 
@@ -339,6 +374,144 @@ def config_to_mapping(cfg: AppConfig) -> Dict[str, Any]:
 def profile_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
     canonical = canonical_mapping(values)
     return {key: _json_value(canonical[key]) for key in sorted(PROFILE_KEYS) if key in canonical}
+
+
+def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
+    """Produce the complete, privacy-safe version 2 settings mapping.
+
+    Defaults are filled in intentionally: saving an unfinished form is valid,
+    and an imported v1 document receives the advanced settings introduced by
+    version 2.  Only the allow-listed keys can reach disk.
+    """
+
+    canonical = canonical_mapping(values)
+    payload = {
+        key: _json_value(canonical[key])
+        for key in sorted(EDITABLE_SETTINGS_KEYS)
+        if key in canonical
+    }
+    float_keys = {
+        "query_interval_seconds", "pre_query_seconds", "hot_query_interval_seconds",
+        "hot_window_seconds", "request_timeout_seconds", "login_qr_timeout_seconds",
+        "login_qr_poll_seconds", "time_sync_max_rtt_seconds", "order_wait_interval_seconds",
+    }
+    integer_keys = {"max_retries", "time_sync_samples", "order_wait_attempts", "station_cache_days"}
+    boolean_keys = {"only_preferred_trains", "auto_submit", "perf_log"}
+    try:
+        for key in float_keys:
+            raw = payload[key]
+            if isinstance(raw, bool):
+                raise ValueError("布尔值不是数值")
+            number = float(raw)
+            if not math.isfinite(number):
+                raise ValueError("必须是有限数值")
+            payload[key] = number
+        for key in integer_keys:
+            raw = payload[key]
+            if isinstance(raw, bool):
+                raise ValueError("布尔值不是整数")
+            number = int(raw)
+            if float(raw) != number:
+                raise ValueError("必须是整数")
+            payload[key] = number
+        for key in boolean_keys:
+            if not isinstance(payload[key], bool):
+                raise ValueError("必须是布尔值")
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AppError(f"配置字段类型无效: {exc}") from exc
+    return payload
+
+
+def _read_json_file(path: Path) -> Mapping[str, Any]:
+    """Read one bounded JSON object and give UI callers a friendly error."""
+
+    try:
+        if path.suffix.lower() != ".json":
+            raise AppError("GUI 配置仅支持 JSON 文件")
+        if path.stat().st_size > GUI_CONFIG_MAX_BYTES:
+            raise AppError("配置 JSON 超过 1 MB，已拒绝导入")
+        loaded = json.loads(path.read_text(encoding="utf-8-sig"))
+    except AppError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AppError(f"配置 JSON 无法读取: {exc}") from exc
+    if not isinstance(loaded, Mapping):
+        raise AppError("配置 JSON 顶层必须是对象")
+    return loaded
+
+
+def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
+    """Atomically replace a JSON file, leaving the old file intact on error."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(document, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        # ``os.replace`` removes it on success; this cleanup only covers a
+        # serialization/write failure before replacement.
+        if temporary is not None and temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
+    """Save all editable GUI settings as a version 2 document atomically."""
+
+    _atomic_write_json(
+        path,
+        {"version": GUI_CONFIG_VERSION, "settings": editable_settings_payload(values)},
+    )
+
+
+def load_gui_settings(path: Path) -> Dict[str, Any]:
+    """Import a version 2 document or a safe subset of the legacy version 1.
+
+    Version 1 exports used ``values`` and contain only the former profile
+    fields.  Old named-profile database documents are intentionally not
+    interpreted, because importing one silently would reintroduce the removed
+    named-profile model.
+    """
+
+    document = _read_json_file(path)
+    version = document.get("version")
+    if type(version) is not int:
+        raise AppError("配置 JSON 缺少整数 version")
+    if version == GUI_CONFIG_VERSION:
+        settings = document.get("settings")
+        if not isinstance(settings, Mapping):
+            raise AppError("version 2 配置的 settings 必须是对象")
+        return canonical_mapping(editable_settings_payload(settings))
+    if version == 1:
+        settings = document.get("values")
+        if not isinstance(settings, Mapping):
+            raise AppError("version 1 配置必须包含 values 对象")
+        return canonical_mapping(editable_settings_payload(settings))
+    raise AppError(f"不支持的配置版本: {version}")
+
+
+class GuiConfigStore:
+    """Stateless JSON-only save/import facade used by the simplified UI."""
+
+    def save_file(self, path: Path, values: Mapping[str, Any]) -> None:
+        save_gui_settings(path, values)
+
+    def import_file(self, path: Path) -> Dict[str, Any]:
+        return load_gui_settings(path)
 
 
 class ProfileStore:

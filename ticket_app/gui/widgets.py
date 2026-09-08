@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import html
+import re
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QTextCursor
+from PySide6.QtCore import QDate, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QDateEdit,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -24,12 +29,299 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QStyledItemDelegate,
+    QStyle,
+    QStyleOptionViewItem,
     QTabWidget,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+
+def _asset_path(name: str) -> Path:
+    """Return an asset path in both source and PyInstaller onedir builds."""
+
+    frozen_root = getattr(sys, "_MEIPASS", None)
+    root = Path(frozen_root) if frozen_root else Path(__file__).resolve().parents[2]
+    return root / "assets" / name
+
+
+def _repolish(widget: QWidget) -> None:
+    style = widget.style()
+    style.unpolish(widget)
+    style.polish(widget)
+    # Some item views expose only their more specific ``update(QRect)``
+    # overload through PySide. Calling the QWidget implementation directly
+    # keeps validation repaints generic across line edits and list widgets.
+    QWidget.update(widget)
+
+
+def set_validation_state(widget: QWidget, state: str = "", message: str = "") -> None:
+    """Set the dynamic validation property consumed by the application QSS.
+
+    The original tooltip is restored after an error is repaired, so validation
+    messages do not permanently replace field help.
+    """
+
+    normalized = str(state).strip().lower()
+    # ``warning`` is useful for incomplete drafts which can still be saved.
+    # Keep the public API deliberately small while accepting the common yellow
+    # aliases used by callers and stylesheets.
+    if normalized in {"warn", "yellow"}:
+        normalized = "warning"
+    elif normalized not in {"error", "warning"}:
+        normalized = ""
+    previous = widget.property("validationState") or ""
+    if normalized and previous != normalized:
+        widget.setProperty("validationBaseToolTip", widget.toolTip())
+    widget.setProperty("validationState", normalized)
+    if normalized:
+        widget.setToolTip(message)
+        widget.setAccessibleDescription(message)
+    elif previous:
+        widget.setToolTip(str(widget.property("validationBaseToolTip") or ""))
+        widget.setAccessibleDescription("")
+    _repolish(widget)
+
+
+def hide_spin_buttons(widget: QAbstractSpinBox) -> QAbstractSpinBox:
+    """Apply the compact, keyboard-editable no-arrow spin-box treatment."""
+
+    widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+    return widget
+
+
+class CleanSpinBox(QSpinBox):
+    """Integer spin box without the platform-specific up/down arrow chrome."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        hide_spin_buttons(self)
+
+    def set_validation(self, state: str = "", message: str = "") -> None:
+        set_validation_state(self, state, message)
+
+
+class CleanDoubleSpinBox(QDoubleSpinBox):
+    """Floating point spin box without the platform-specific arrow chrome."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        hide_spin_buttons(self)
+
+    def set_validation(self, state: str = "", message: str = "") -> None:
+        set_validation_state(self, state, message)
+
+
+class HelpLabel(QWidget):
+    """A field label with a consistent, keyboard-accessible help affordance."""
+
+    def __init__(self, text: str, help_text: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+        self.label = QLabel(text)
+        self.label.setObjectName("fieldLabel")
+        self.help_button = QToolButton()
+        self.help_button.setObjectName("helpButton")
+        self.help_button.setText("?")
+        self.help_button.setToolTip(help_text)
+        self.help_button.setAccessibleName(f"{text}说明")
+        self.help_button.setAccessibleDescription(help_text)
+        self.help_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.help_button.setAutoRaise(True)
+        self.help_button.setFixedSize(20, 20)
+        row.addWidget(self.label)
+        row.addWidget(self.help_button)
+        row.addStretch(1)
+
+    def text(self) -> str:
+        return self.label.text()
+
+    def setText(self, text: str) -> None:  # noqa: N802 - mirrors QLabel
+        self.label.setText(text)
+
+
+class DatePickerWidget(QDateEdit):
+    """Read-only date text with a calendar popup and no past dates."""
+
+    changed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("datePicker")
+        self.setDisplayFormat("yyyy-MM-dd")
+        self.setCalendarPopup(True)
+        self.setMinimumDate(QDate.currentDate())
+        self.setDate(QDate.currentDate())
+        self.setToolTip("点击右侧日历按钮选择乘车日期；不能选择过去的日期")
+        if self.lineEdit() is not None:
+            # Keep the popup active while preventing ambiguous hand-typed dates.
+            self.lineEdit().setReadOnly(True)
+        calendar_icon = _asset_path("calendar.svg").as_posix()
+        self.setStyleSheet(
+            'QDateEdit#datePicker::down-arrow {'
+            f' image: url("{calendar_icon}"); width: 16px; height: 16px;'
+            " }"
+        )
+        self.dateChanged.connect(lambda _date: self.changed.emit())
+
+    def set_validation(self, state: str = "", message: str = "") -> None:
+        set_validation_state(self, state, message)
+
+
+class TimeFieldsWidget(QWidget):
+    """Three explicit hour/minute/second inputs with an optional off state."""
+
+    changed = Signal()
+    _TIME_RE = re.compile(r"^(\d{1,2}):(\d{1,2}):(\d{1,2})$")
+
+    def __init__(
+        self,
+        optional: bool = False,
+        disabled_label: str = "不设置",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.optional = bool(optional)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        self.hour = self._part(0, 23, "时")
+        self.minute = self._part(0, 59, "分")
+        self.second = self._part(0, 59, "秒")
+        self.parts = (self.hour, self.minute, self.second)
+        for index, (part, suffix) in enumerate(zip(self.parts, ("时", "分", "秒"))):
+            row.addWidget(part)
+            label = QLabel(suffix)
+            label.setObjectName("timeUnit")
+            row.addWidget(label)
+            if index < 2:
+                separator = QLabel(":")
+                separator.setObjectName("timeSeparator")
+                row.addWidget(separator)
+
+        self.optional_checkbox: Optional[QCheckBox] = None
+        if self.optional:
+            self.optional_checkbox = QCheckBox(disabled_label)
+            self.optional_checkbox.setObjectName("timeDisabledToggle")
+            self.optional_checkbox.toggled.connect(self._on_disabled_toggled)
+            row.addSpacing(5)
+            row.addWidget(self.optional_checkbox)
+        row.addStretch(1)
+
+    def _part(self, minimum: int, maximum: int, accessible_name: str) -> CleanSpinBox:
+        part = CleanSpinBox()
+        part.setObjectName("timePart")
+        part.setRange(minimum, maximum)
+        part.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        part.setFixedWidth(48)
+        part.setMinimumHeight(34)
+        part.setAccessibleName(accessible_name)
+        part.setWrapping(False)
+        part.valueChanged.connect(lambda _value: self.changed.emit())
+        return part
+
+    def text(self) -> str:
+        if self.is_disabled():
+            return ""
+        return f"{self.hour.value():02d}:{self.minute.value():02d}:{self.second.value():02d}"
+
+    def setText(self, value: str) -> None:  # noqa: N802 - field-like API
+        raw = str(value or "").strip()
+        if not raw:
+            if self.optional:
+                self.set_disabled(True)
+                return
+            raw = "00:00:00"
+        match = self._TIME_RE.fullmatch(raw)
+        if match is None:
+            raise ValueError("时间必须使用 HH:MM:SS 格式")
+        hour, minute, second = (int(part) for part in match.groups())
+        if hour > 23 or minute > 59 or second > 59:
+            raise ValueError("时间必须是有效的 24 小时时间")
+
+        for part in self.parts:
+            part.blockSignals(True)
+        self.hour.setValue(hour)
+        self.minute.setValue(minute)
+        self.second.setValue(second)
+        for part in self.parts:
+            part.blockSignals(False)
+        if self.optional:
+            self.set_disabled(False, emit=False)
+        self.changed.emit()
+
+    def is_disabled(self) -> bool:
+        return bool(self.optional_checkbox and self.optional_checkbox.isChecked())
+
+    def set_disabled(self, disabled: bool, *, emit: bool = True) -> None:
+        if not self.optional:
+            # A required time has no off state.  Silently keep it enabled so
+            # generic form code can safely call this method for both widgets.
+            disabled = False
+        disabled = bool(disabled)
+        if self.optional_checkbox is not None:
+            self.optional_checkbox.blockSignals(True)
+            self.optional_checkbox.setChecked(disabled)
+            self.optional_checkbox.blockSignals(False)
+        self._sync_enabled(disabled)
+        if emit:
+            self.changed.emit()
+
+    def _on_disabled_toggled(self, disabled: bool) -> None:
+        self._sync_enabled(disabled)
+        self.changed.emit()
+
+    def _sync_enabled(self, disabled: Optional[bool] = None) -> None:
+        disabled = self.is_disabled() if disabled is None else disabled
+        for part in self.parts:
+            part.setEnabled(self.isEnabled() and not disabled)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt override
+        super().setEnabled(enabled)
+        if hasattr(self, "parts"):
+            self._sync_enabled()
+
+    def set_validation(self, state: str = "", message: str = "") -> None:
+        set_validation_state(self, state, message)
+        for part in self.parts:
+            set_validation_state(part, state, message)
+
+
+class _CheckmarkItemDelegate(QStyledItemDelegate):
+    """Overlay a real tick on stylesheet-painted QListWidget indicators."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[no-untyped-def]
+        super().paint(painter, option, index)
+        if index.data(Qt.ItemDataRole.CheckStateRole) != Qt.CheckState.Checked.value:
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = opt.widget.style() if opt.widget is not None else None
+        if style is None:
+            return
+        rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, opt, opt.widget)
+        if not rect.isValid():
+            return
+        painter.save()
+        pen = QPen(QColor("#ffffff"), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawLine(
+            QPointF(rect.left() + rect.width() * 0.24, rect.top() + rect.height() * 0.52),
+            QPointF(rect.left() + rect.width() * 0.43, rect.top() + rect.height() * 0.71),
+        )
+        painter.drawLine(
+            QPointF(rect.left() + rect.width() * 0.43, rect.top() + rect.height() * 0.71),
+            QPointF(rect.left() + rect.width() * 0.78, rect.top() + rect.height() * 0.30),
+        )
+        painter.restore()
 
 
 class Card(QFrame):
@@ -55,50 +347,48 @@ class PriorityListEditor(QWidget):
 
     def __init__(self, all_values: Iterable[str], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        hint = QLabel("从上到下优先 · 勾选席别后可直接拖动排序")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
 
         self.list = QListWidget()
         self.list.setObjectName("priorityList")
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list.setDragEnabled(True)
+        self.list.setAcceptDrops(True)
+        self.list.setDropIndicatorShown(True)
+        self.list.setDragDropOverwriteMode(False)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.list.setMinimumHeight(132)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.list.setItemDelegate(_CheckmarkItemDelegate(self.list))
         self.list.setToolTip("勾选并拖拽排序，程序会按从上到下的顺序尝试")
         for value in all_values:
             item = QListWidgetItem(str(value))
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            item.setSizeHint(QSize(0, 32))
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
             item.setCheckState(Qt.CheckState.Unchecked)
             self.list.addItem(item)
+        self._sync_list_height()
         self.list.itemChanged.connect(lambda _item: self.changed.emit())
         self.list.model().rowsMoved.connect(lambda *_args: self.changed.emit())
-        row.addWidget(self.list, 1)
+        layout.addWidget(self.list)
 
-        controls = QVBoxLayout()
-        controls.setSpacing(6)
-        up = QToolButton()
-        up.setText("↑")
-        up.setToolTip("提高优先级")
-        down = QToolButton()
-        down.setText("↓")
-        down.setToolTip("降低优先级")
-        up.clicked.connect(lambda: self._move(-1))
-        down.clicked.connect(lambda: self._move(1))
-        controls.addWidget(up)
-        controls.addWidget(down)
-        controls.addStretch(1)
-        row.addLayout(controls)
-
-    def _move(self, offset: int) -> None:
-        current = self.list.currentRow()
-        target = current + offset
-        if current < 0 or target < 0 or target >= self.list.count():
-            return
-        item = self.list.takeItem(current)
-        self.list.insertItem(target, item)
-        self.list.setCurrentRow(target)
-        self.changed.emit()
+    def _sync_list_height(self) -> None:
+        rows = sum(max(32, self.list.sizeHintForRow(index)) for index in range(self.list.count()))
+        height = rows + self.list.frameWidth() * 2 + 10
+        self.list.setFixedHeight(height)
 
     def values(self) -> List[str]:
         return [
@@ -108,17 +398,31 @@ class PriorityListEditor(QWidget):
         ]
 
     def set_values(self, values: Iterable[str]) -> None:
-        ordered = [str(value) for value in values]
         existing = [self.list.item(index).text() for index in range(self.list.count())]
+        # Imported drafts may contain stale seat names or duplicates.  The
+        # editor must always retain the fixed complete list supplied by the
+        # caller, while preserving the valid requested priority order.
+        ordered: List[str] = []
+        for value in values:
+            text = str(value)
+            if text in existing and text not in ordered:
+                ordered.append(text)
         final = ordered + [value for value in existing if value not in ordered]
         self.list.blockSignals(True)
         self.list.clear()
         for value in final:
             item = QListWidgetItem(value)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+            item.setSizeHint(QSize(0, 32))
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsDragEnabled
+                | Qt.ItemFlag.ItemIsDropEnabled
+            )
             item.setCheckState(Qt.CheckState.Checked if value in ordered else Qt.CheckState.Unchecked)
             self.list.addItem(item)
         self.list.blockSignals(False)
+        self._sync_list_height()
         self.changed.emit()
 
 
@@ -140,7 +444,10 @@ class SeatMapWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        guide = QLabel("选中与乘车人数相同的格子。这是相对关系图，不是真实排号；可用字母由车型和席别决定。")
+        guide = QLabel(
+            "选中与乘车人数相同的格子。“前排/后排”仅表示同一订单的两排相对关系，"
+            "不代表行驶方向、车厢位置或真实排号。"
+        )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
         layout.addWidget(guide)
@@ -149,9 +456,9 @@ class SeatMapWidget(QWidget):
         for relation_row in (1, 2):
             seat_row = QHBoxLayout()
             seat_row.setSpacing(7)
-            row_name = QLabel(f"关系 {relation_row}")
+            row_name = QLabel("前排" if relation_row == 1 else "后排")
             row_name.setObjectName("muted")
-            row_name.setMinimumWidth(48)
+            row_name.setMinimumWidth(38)
             seat_row.addWidget(row_name)
             left_window = QLabel("窗")
             left_window.setObjectName("windowMarker")
@@ -180,7 +487,7 @@ class SeatMapWidget(QWidget):
         button = QToolButton()
         button.setObjectName("seatButton")
         button.setCheckable(True)
-        button.setMinimumSize(58, 58)
+        button.setMinimumSize(48, 52)
         button.setToolTip(f"相对格子 {token} / {letter} 座 / {self.POSITION_LABELS[letter]}")
         button.clicked.connect(lambda checked, value=token: self._toggle(value, checked))
         self.buttons[token] = button
@@ -238,18 +545,42 @@ class BerthCountWidget(QWidget):
         layout.addWidget(note)
 
         self.spins: Dict[str, QSpinBox] = {}
+        self.minus_buttons: Dict[str, QToolButton] = {}
+        self.plus_buttons: Dict[str, QToolButton] = {}
         for key, label, hint in self.LABELS:
             row = QHBoxLayout()
+            row.setSpacing(7)
             name = QLabel(label)
             name.setMinimumWidth(52)
-            spin = QSpinBox()
+            minus = QToolButton()
+            minus.setObjectName("berthStepButton")
+            minus.setText("−")
+            minus.setAccessibleName(f"减少{label}数量")
+            minus.setToolTip(f"减少一张{label}")
+            spin = CleanSpinBox()
             spin.setRange(0, 5)
-            spin.setSuffix(" 张")
+            spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            spin.setFixedWidth(48)
+            spin.setAccessibleName(f"{label}数量")
             spin.setToolTip(hint)
             spin.valueChanged.connect(lambda _value: self._update_total())
+            plus = QToolButton()
+            plus.setObjectName("berthStepButton")
+            plus.setText("+")
+            plus.setAccessibleName(f"增加{label}数量")
+            plus.setToolTip(f"增加一张{label}")
+            minus.clicked.connect(lambda _checked=False, target=spin: target.stepDown())
+            plus.clicked.connect(lambda _checked=False, target=spin: target.stepUp())
             self.spins[key] = spin
+            self.minus_buttons[key] = minus
+            self.plus_buttons[key] = plus
             row.addWidget(name)
+            row.addWidget(minus)
             row.addWidget(spin)
+            row.addWidget(plus)
+            unit = QLabel("张")
+            unit.setObjectName("muted")
+            row.addWidget(unit)
             row.addStretch(1)
             layout.addLayout(row)
 

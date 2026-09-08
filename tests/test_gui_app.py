@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from ticket_app import client as client_module  # noqa: E402
 from ticket_app.gui import app as gui_app  # noqa: E402
-from ticket_app.gui.compat import DEFAULT_VALUES, ProfileStore  # noqa: E402
 from ticket_app.gui.worker import EventRelay, GuiCancelToken  # noqa: E402
 from ticket_app.gui.worker import TicketWorker  # noqa: E402
 from ticket_app.runtime import RuntimeEvent  # noqa: E402
@@ -41,11 +41,9 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
     monkeypatch.setattr(client_module.RailwayClient, "__init__", reject_network)
     monkeypatch.setattr(client_module.requests.sessions.Session, "request", reject_network)
 
-    profile_path = tmp_path / "LocalAppData" / "12306FairTicket" / "gui_profiles.json"
-    monkeypatch.setattr(gui_app, "ProfileStore", lambda: ProfileStore(profile_path))
-    monkeypatch.setattr(gui_app, "LOCAL_DATA_DIR", profile_path.parent)
-    monkeypatch.setattr(gui_app, "LEGACY_CONFIG_FILE", tmp_path / "missing-config.py")
-    monkeypatch.setattr(gui_app, "safe_read_legacy_config", lambda _path: dict(DEFAULT_VALUES))
+    local_data_dir = tmp_path / "LocalAppData" / "12306FairTicket"
+    monkeypatch.setattr(gui_app, "LOCAL_DATA_DIR", local_data_dir)
+    monkeypatch.setattr(gui_app, "STATION_CACHE_FILE", local_data_dir / "stations.json")
     monkeypatch.setattr(gui_app, "cached_station_names", lambda: ["北京西", "郑州东"])
 
     def disable_tray(window: gui_app.MainWindow) -> None:
@@ -58,12 +56,18 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
         yield window
     finally:
         window.clock_timer.stop()
+        window.validation_timer.stop()
+        window.query_ui_timer.stop()
         # Individual lifecycle tests use lightweight thread doubles.  Remove
         # them so closeEvent never opens a modal confirmation in teardown.
         window.thread = None
         window.worker = None
         window.cancel_token = None
         window.close()
+        # ``closeEvent`` owns normal shutdown, but explicitly close here as
+        # well so a test that closes the window early cannot leak a listener.
+        logging.getLogger().removeHandler(window.log_pipeline.handler)
+        window.log_pipeline.close()
         logging.getLogger().setLevel(root_level)
 
 
@@ -85,6 +89,202 @@ def test_main_window_can_be_created_offline_without_starting_a_task(main_window:
     assert main_window.start_button.isEnabled()
     assert main_window.advanced["station_cache_days"].minimum() == 1
     assert main_window._test_network_calls == []  # type: ignore[attr-defined]
+
+
+def test_profile_bar_only_has_save_and_import_json_buttons(main_window: gui_app.MainWindow) -> None:
+    profile_bar = main_window.save_settings_button.parentWidget()
+    assert profile_bar is not None
+    buttons = profile_bar.findChildren(type(main_window.save_settings_button))
+
+    assert [button.text() for button in buttons] == ["保存为…", "导入…"]
+    assert not hasattr(main_window, "profile_combo")
+
+
+def test_save_and_import_buttons_round_trip_every_editable_setting(
+    main_window: gui_app.MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "all-settings.json"
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("G79")
+    main_window.from_station.setText("北京西")
+    main_window.to_station.setText("郑州东")
+    main_window.advanced["query_interval_seconds"].setValue(1.25)  # type: ignore[attr-defined]
+    monkeypatch.setattr(gui_app.QFileDialog, "getSaveFileName", lambda *_args: (str(target), ""))
+    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda *_args: None)
+
+    main_window._save_settings()
+
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["version"] == 2
+    assert document["settings"]["query_interval_seconds"] == 1.25
+    serialized = target.read_text(encoding="utf-8").lower()
+    assert "session_file" not in serialized
+    assert "cookie" not in serialized
+    assert "token" not in serialized
+
+    main_window.from_station.setText("郑州东")
+    main_window.advanced["query_interval_seconds"].setValue(2.5)  # type: ignore[attr-defined]
+    monkeypatch.setattr(gui_app.QFileDialog, "getOpenFileName", lambda *_args: (str(target), ""))
+    monkeypatch.setattr(gui_app.QMessageBox, "warning", lambda *_args: None)
+    main_window._import_settings()
+
+    assert main_window.from_station.text() == "北京西"
+    assert main_window.advanced["query_interval_seconds"].value() == 1.25  # type: ignore[attr-defined]
+
+
+def test_full_validation_switches_page_and_focuses_the_first_error(
+    main_window: gui_app.MainWindow, qtbot
+) -> None:
+    main_window.show()
+    main_window.config_tabs.setCurrentIndex(1)
+    main_window.from_station.setText("不存在的车站")
+
+    errors = main_window._validate_all(focus_first=True)
+
+    assert next(iter(errors)) == "from_station"
+    assert main_window.config_tabs.currentIndex() == 0
+    qtbot.waitUntil(lambda: QApplication.focusWidget() is main_window.from_station, timeout=1000)
+
+
+def test_time_editors_use_three_parts_and_optional_toggles(main_window: gui_app.MainWindow) -> None:
+    start = main_window.start_at
+    stop = main_window.stop_at
+    assert len(start.parts) == len(stop.parts) == 3
+
+    start.setText("12:34:56")
+    assert [part.value() for part in start.parts] == [12, 34, 56]
+    assert start.text() == "12:34:56"
+    assert start.optional_checkbox is not None
+    start.optional_checkbox.setChecked(True)
+    assert start.text() == ""
+    assert not any(part.isEnabled() for part in start.parts)
+    start.optional_checkbox.setChecked(False)
+    assert start.text() == "12:34:56"
+
+    stop.setText("23:59:58")
+    assert stop.optional_checkbox is not None
+    stop.optional_checkbox.setChecked(True)
+    assert stop.text() == ""
+    assert not any(part.isEnabled() for part in stop.parts)
+
+
+def test_unknown_station_is_marked_and_clears_after_correction(main_window: gui_app.MainWindow) -> None:
+    main_window.from_station.setText("不存在的车站")
+    errors = main_window._validate_all()
+
+    assert "from_station" in errors
+    assert main_window.from_station.property("validationState") == "error"
+    assert not main_window.field_messages["from_station"].isHidden()
+
+    main_window.from_station.setText("北京西")
+    errors = main_window._validate_all()
+
+    assert "from_station" not in errors
+    assert main_window.from_station.property("validationState") in (None, "")
+    assert main_window.field_messages["from_station"].isHidden()
+
+
+def test_all_ten_seat_types_are_expanded_without_internal_scrolling(main_window: gui_app.MainWindow) -> None:
+    seat_list = main_window.seat_types.list
+
+    assert seat_list.count() == 10
+    assert seat_list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert seat_list.height() >= sum(seat_list.sizeHintForRow(index) for index in range(seat_list.count()))
+
+
+def test_station_update_is_disabled_and_not_started_while_task_runs(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RunningThread:
+        @staticmethod
+        def isRunning() -> bool:  # noqa: N802 - mirrors Qt
+            return True
+
+    main_window.thread = RunningThread()  # type: ignore[assignment]
+    main_window._set_forms_enabled(False)
+    assert not main_window.update_stations_button.isEnabled()
+    assert not main_window.swap_stations_button.isEnabled()
+
+    def unexpected_worker(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("station update must not start while task is running")
+
+    monkeypatch.setattr(gui_app, "StationRefreshWorker", unexpected_worker)
+    main_window._refresh_stations()
+    assert main_window.station_refresh_worker is None
+
+
+def test_successful_station_refresh_updates_completers_and_repairs_validation(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    imported_station = "测试新站"
+    main_window.from_station.setText(imported_station)
+    assert "from_station" in main_window._validate_all()
+    assert main_window.from_station.property("validationState") == "error"
+    notices: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        gui_app.QMessageBox,
+        "information",
+        lambda _parent, title, message: notices.append((title, message)),
+    )
+
+    main_window._on_station_refresh_finished({imported_station: "TST"}, None)
+
+    assert imported_station in main_window.station_names
+    assert "from_station" not in main_window._last_validation_errors
+    assert main_window.from_station.property("validationState") in (None, "")
+    completer = main_window.from_station.completer()
+    assert completer is not None
+    names = {
+        completer.model().data(completer.model().index(row, 0))
+        for row in range(completer.model().rowCount())
+    }
+    assert imported_station in names
+    assert notices == [("站点已更新", f"已载入 {len(main_window.station_names)} 个站名。")]
+
+
+def test_failed_station_refresh_keeps_existing_stations_and_reports_reason(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    existing_names = set(main_window.station_names)
+    warnings: list[tuple[object, str, str]] = []
+    monkeypatch.setattr(
+        gui_app.QMessageBox,
+        "warning",
+        lambda parent, title, message: warnings.append((parent, title, message)),
+    )
+
+    main_window._on_station_refresh_finished(None, RuntimeError("离线测试失败"))
+
+    assert main_window.station_names == existing_names
+    assert warnings == [
+        (main_window, "更新站点失败", "现有站点数据未改变。\n\n离线测试失败")
+    ]
+
+
+def test_main_configuration_scroll_areas_never_show_horizontal_scrollbars(main_window: gui_app.MainWindow) -> None:
+    assert main_window.basic_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert main_window.advanced_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_high_frequency_query_events_are_rendered_once_per_batch(main_window: gui_app.MainWindow, qtbot) -> None:
+    rendered_attempts: list[str] = []
+    original_flush = main_window._flush_query_event
+
+    def track_flush() -> None:
+        original_flush()
+        rendered_attempts.append(main_window.query_metric.value_label.text())  # type: ignore[attr-defined]
+
+    main_window.query_ui_timer.timeout.disconnect()
+    main_window.query_ui_timer.timeout.connect(track_flush)
+    for attempt in range(1, 41):
+        main_window._on_runtime_event("query", {"attempt": attempt, "message": f"查询 {attempt}"})
+
+    assert main_window.query_ui_timer.isActive()
+    assert rendered_attempts == []
+    qtbot.waitUntil(lambda: not main_window.query_ui_timer.isActive(), timeout=1000)
+    assert rendered_attempts == ["40"]
 
 
 def test_start_is_a_noop_while_an_existing_task_is_running(

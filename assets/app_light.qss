@@ -63,6 +63,33 @@ QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus, QDoubleSpinBo
     background: #ffffff;
 }
 
+QLineEdit[validationState="error"], QComboBox[validationState="error"],
+QDateEdit[validationState="error"], QSpinBox[validationState="error"],
+QDoubleSpinBox[validationState="error"] {
+    border: 2px solid #d84759;
+    background: #fff4f5;
+}
+
+QLineEdit[validationState="warning"], QComboBox[validationState="warning"],
+QDateEdit[validationState="warning"], QSpinBox[validationState="warning"],
+QDoubleSpinBox[validationState="warning"] {
+    border: 2px solid #b7791f;
+    background: #fff9ed;
+}
+
+QWidget[validationState="error"] QLabel#validationMessage { color: #bc3044; }
+QWidget[validationState="warning"] QLabel#validationMessage { color: #956114; }
+QWidget#fieldBlock[validationState="error"] {
+    border: 1px solid #d94257;
+    border-radius: 9px;
+    background: #fff2f4;
+}
+QWidget#fieldBlock[validationState="warning"] {
+    border: 1px solid #c58a28;
+    border-radius: 9px;
+    background: #fff9eb;
+}
+
 QComboBox QAbstractItemView {
     color: #26344d;
     background: #ffffff;
@@ -119,7 +146,27 @@ QToolButton#seatButton:checked {
 
 QCheckBox { color: #34435d; }
 QCheckBox::indicator { background: #ffffff; border-color: #9aaac0; }
-QCheckBox::indicator:checked { background: #2f7fdf; border-color: #2f7fdf; }
+QCheckBox::indicator:checked { background: #2f7fdf; border-color: #2f7fdf; image: url(assets/check.svg); }
+
+QListWidget#priorityList::indicator {
+    width: 17px;
+    height: 17px;
+    border: 1px solid #9aaac0;
+    border-radius: 5px;
+    background: #ffffff;
+}
+
+QListWidget#priorityList::indicator:checked {
+    background: #2f7fdf;
+    border-color: #2f7fdf;
+    image: url(assets/check.svg);
+}
+
+QToolButton#helpButton {
+    color: #216dbd;
+    background: #e9f3ff;
+    border-color: #9fc5ed;
+}
 QCheckBox:disabled { color: #94a0b2; }
 
 QTabBar::tab { color: #687792; }

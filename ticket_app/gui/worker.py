@@ -15,6 +15,8 @@ from ticket_app.logging_utils import RedactingFormatter, redact_text
 from ticket_app.runner import TicketRunner
 from ticket_app.runtime import CancellationToken, RunCancelled
 
+from .async_logging import AsyncLogPipeline, AsyncQueueLogHandler, GuiLogLine
+
 
 def redact_log_text(text: str) -> str:
     return redact_text(text)
@@ -22,6 +24,41 @@ def redact_log_text(text: str) -> str:
 
 class LogBridge(QObject):
     message = Signal(str, str)
+    # The asynchronous listener emits one tuple of ``(line, level)`` values at
+    # most every 100 ms.  Keeping the original single-line signal preserves a
+    # compatibility path for tests and third-party integrations.
+    messages = Signal(object)
+
+    def publish_batch(self, lines: object) -> None:
+        """Publish a listener-owned batch without rendering in a worker thread.
+
+        ``AsyncLogPipeline`` invokes this method from its plain Python
+        listener thread.  Qt queues delivery to slots whose receiver belongs
+        to the UI thread, so neither a ticket request nor the listener ever
+        edits a widget directly.
+        """
+
+        self.messages.emit(lines)
+
+
+def create_async_log_pipeline(
+    bridge: LogBridge,
+    *,
+    level: int = logging.DEBUG,
+    batch_interval: float = 0.1,
+) -> AsyncLogPipeline:
+    """Create the GUI's non-blocking log transport.
+
+    The application attaches ``pipeline.handler`` to the root logger and
+    connects :attr:`LogBridge.messages` to a batch-aware log view.  The old
+    ``QtLogHandler`` remains available for integrations that have not moved
+    to the asynchronous transport yet.
+    """
+
+    def publish(lines: tuple[GuiLogLine, ...]) -> None:
+        bridge.publish_batch(lines)
+
+    return AsyncLogPipeline(gui_batch_sink=publish, level=level, batch_interval=batch_interval)
 
 
 class QtLogHandler(logging.Handler):

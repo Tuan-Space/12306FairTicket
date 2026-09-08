@@ -21,6 +21,9 @@ $requiredPaths = @(
     (Join-Path $projectRoot "assets"),
     (Join-Path $projectRoot "assets\app.qss"),
     (Join-Path $projectRoot "assets\app_icon.svg"),
+    (Join-Path $projectRoot "assets\calendar.svg"),
+    (Join-Path $projectRoot "assets\check.svg"),
+    (Join-Path $projectRoot "assets\stations_snapshot.json"),
     $specPath,
     (Join-Path $projectRoot "README_GUI.md"),
     (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md")

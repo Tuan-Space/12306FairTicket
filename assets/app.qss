@@ -135,6 +135,40 @@ QLineEdit:focus, QComboBox:focus, QDateEdit:focus, QSpinBox:focus, QDoubleSpinBo
     background: #0e192d;
 }
 
+QLineEdit[validationState="error"], QComboBox[validationState="error"],
+QDateEdit[validationState="error"], QSpinBox[validationState="error"],
+QDoubleSpinBox[validationState="error"] {
+    border: 2px solid #ef6472;
+    background: #271721;
+}
+
+QLineEdit[validationState="warning"], QComboBox[validationState="warning"],
+QDateEdit[validationState="warning"], QSpinBox[validationState="warning"],
+QDoubleSpinBox[validationState="warning"] {
+    border: 2px solid #e6ad50;
+    background: #2a2115;
+}
+
+QWidget[validationState="error"] QLabel#validationMessage {
+    color: #ff9aa5;
+}
+
+QWidget[validationState="warning"] QLabel#validationMessage {
+    color: #f3c46d;
+}
+
+QWidget#fieldBlock[validationState="error"] {
+    border: 1px solid #ef6472;
+    border-radius: 9px;
+    background: #211621;
+}
+
+QWidget#fieldBlock[validationState="warning"] {
+    border: 1px solid #e6ad50;
+    border-radius: 9px;
+    background: #252015;
+}
+
 QComboBox::drop-down, QDateEdit::drop-down {
     border: 0;
     width: 24px;
@@ -222,6 +256,44 @@ QCheckBox::indicator {
 QCheckBox::indicator:checked {
     background: #3986f3;
     border-color: #65a3fb;
+    image: url(assets/check.svg);
+}
+
+QListWidget#priorityList::indicator {
+    width: 17px;
+    height: 17px;
+    border: 1px solid #41506d;
+    border-radius: 5px;
+    background: #0d1526;
+}
+
+QListWidget#priorityList::indicator:checked {
+    background: #3986f3;
+    border-color: #65a3fb;
+    image: url(assets/check.svg);
+}
+
+QToolButton#helpButton {
+    min-width: 20px;
+    min-height: 20px;
+    max-width: 20px;
+    max-height: 20px;
+    border-radius: 10px;
+    padding: 0;
+    color: #9fc9ff;
+    background: #182a46;
+    border: 1px solid #42658e;
+    font-weight: 700;
+}
+
+QToolButton#berthStepButton {
+    min-width: 30px;
+    min-height: 30px;
+    max-width: 30px;
+    max-height: 30px;
+    padding: 0;
+    border-radius: 15px;
+    font-size: 18px;
 }
 
 QCheckBox:disabled {

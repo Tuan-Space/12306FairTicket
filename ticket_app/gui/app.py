@@ -12,18 +12,17 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import requests
-from PySide6.QtCore import QDate, QThread, QTimer, QUrl, Qt
+from PySide6.QtCore import QDate, QEvent, QObject, QThread, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
     QCheckBox,
     QComboBox,
-    QDateEdit,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -40,25 +39,37 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
-    QInputDialog,
 )
 
 from ticket_app.configuration import AppConfig, AppError, SEAT_SPECS
-from ticket_app.logging_utils import make_rotating_file_handler
 
 from .compat import (
     DEFAULT_VALUES,
+    GuiConfigStore,
     LEGACY_CONFIG_FILE,
     LOCAL_DATA_DIR,
     PROJECT_ROOT,
-    ProfileStore,
+    STATION_CACHE_FILE,
     build_app_config,
     cached_station_names,
     canonical_mapping,
-    safe_read_legacy_config,
 )
-from .widgets import Card, LogView, PositionPreferences, PriorityListEditor, TimelineWidget
-from .worker import EventRelay, GuiCancelToken, LogBridge, QtLogHandler, TicketWorker
+from .station_worker import StationRefreshWorker
+from .validation import validate_gui_mapping
+from .widgets import (
+    Card,
+    CleanDoubleSpinBox,
+    CleanSpinBox,
+    DatePickerWidget,
+    HelpLabel,
+    LogView,
+    PositionPreferences,
+    PriorityListEditor,
+    TimeFieldsWidget,
+    TimelineWidget,
+    set_validation_state,
+)
+from .worker import EventRelay, GuiCancelToken, LogBridge, TicketWorker, create_async_log_pipeline
 
 
 ASSET_DIR = PROJECT_ROOT / "assets"
@@ -75,12 +86,19 @@ def _scroll_page() -> tuple[QScrollArea, QWidget, QVBoxLayout]:
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     page = QWidget()
     layout = QVBoxLayout(page)
     layout.setContentsMargins(4, 4, 10, 12)
     layout.setSpacing(14)
     scroll.setWidget(page)
     return scroll, page, layout
+
+
+class StationRefreshRelay(QObject):
+    """Move the plain Python station worker callback onto the GUI thread."""
+
+    completed = Signal(object, object)
 
 
 class MainWindow(QMainWindow):
@@ -92,7 +110,17 @@ class MainWindow(QMainWindow):
         if APP_ICON.exists():
             self.setWindowIcon(QIcon(str(APP_ICON)))
 
-        self.profile_store = ProfileStore()
+        self.config_store = GuiConfigStore()
+        self.station_names = set(cached_station_names())
+        self.station_refresh_worker: Optional[StationRefreshWorker] = None
+        self.station_refresh_relay = StationRefreshRelay(self)
+        self.station_refresh_relay.completed.connect(self._on_station_refresh_finished)
+        self.field_widgets: Dict[str, QWidget] = {}
+        self.field_blocks: Dict[str, QWidget] = {}
+        self.field_messages: Dict[str, QLabel] = {}
+        self.field_pages: Dict[str, int] = {}
+        self._applying_values = False
+        self._last_validation_errors: Dict[str, str] = {}
         # Kept only in memory. Sequential tasks in this application process can
         # reuse a confirmed login without ever writing cookies to disk.
         self.shared_session = requests.Session()
@@ -100,7 +128,6 @@ class MainWindow(QMainWindow):
         self.worker: Optional[TicketWorker] = None
         self.event_relay: Optional[EventRelay] = None
         self.cancel_token: Optional[GuiCancelToken] = None
-        self.file_log_handler: Optional[logging.Handler] = None
         self._pending_restart = False
         self._close_when_finished = False
         self._qr_deadline = 0.0
@@ -112,10 +139,19 @@ class MainWindow(QMainWindow):
         self._completion_prompt_shown = False
         self._last_phase = ""
 
+        self.validation_timer = QTimer(self)
+        self.validation_timer.setSingleShot(True)
+        self.validation_timer.setInterval(250)
+        self.validation_timer.timeout.connect(self._validate_live)
+
+        self.query_ui_timer = QTimer(self)
+        self.query_ui_timer.setSingleShot(True)
+        self.query_ui_timer.setInterval(100)
+        self.query_ui_timer.timeout.connect(self._flush_query_event)
+        self._pending_query_payload: Optional[Dict[str, Any]] = None
+
         self.log_bridge = LogBridge()
-        self.gui_log_handler = QtLogHandler(self.log_bridge)
-        logging.getLogger().addHandler(self.gui_log_handler)
-        logging.getLogger().setLevel(logging.DEBUG)
+        self.log_pipeline = create_async_log_pipeline(self.log_bridge, batch_interval=0.1)
 
         self._build_ui()
         application = QApplication.instance()
@@ -127,7 +163,9 @@ class MainWindow(QMainWindow):
         )
         self.log_view.set_light_palette(not is_dark_theme)
         self._install_station_completers()
-        self.log_bridge.message.connect(self._on_log_message)
+        self.log_bridge.messages.connect(self._on_log_batch)
+        logging.getLogger().addHandler(self.log_pipeline.handler)
+        logging.getLogger().setLevel(logging.DEBUG)
         self._setup_tray()
         self._load_initial_values()
 
@@ -162,10 +200,6 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(logo)
         header_layout.addLayout(title_box)
         header_layout.addStretch(1)
-        privacy = QLabel("●  每次启动均重新扫码")
-        privacy.setObjectName("privacyBadge")
-        privacy.setToolTip("不持久化登录 Cookie，二维码只在当前会话中展示")
-        header_layout.addWidget(privacy)
         root.addWidget(header)
 
         root.addWidget(self._build_profile_bar())
@@ -175,9 +209,9 @@ class MainWindow(QMainWindow):
         horizontal.addWidget(self._build_config_tabs())
         horizontal.addWidget(self._build_status_panel())
         horizontal.setMinimumHeight(360)
-        horizontal.setStretchFactor(0, 6)
-        horizontal.setStretchFactor(1, 5)
-        horizontal.setSizes([690, 530])
+        horizontal.setStretchFactor(0, 46)
+        horizontal.setStretchFactor(1, 54)
+        horizontal.setSizes([530, 620])
         vertical.addWidget(horizontal)
 
         log_card = Card("运行日志 · 自动脱敏")
@@ -197,99 +231,204 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(8)
-        label = QLabel("配置档案")
-        label.setObjectName("fieldLabel")
-        self.profile_combo = QComboBox()
-        self.profile_combo.setMinimumWidth(190)
-        self.profile_combo.currentIndexChanged.connect(self._profile_selected)
-        save = QPushButton("保存为…")
-        save.clicked.connect(self._save_profile)
-        delete = QPushButton("删除")
-        delete.clicked.connect(self._delete_profile)
-        import_json = QPushButton("导入 JSON")
-        import_json.clicked.connect(self._import_profile)
-        export_json = QPushButton("导出 JSON")
-        export_json.clicked.connect(self._export_profile)
-        legacy = QPushButton("安全读取 config.py")
-        legacy.clicked.connect(self._import_legacy)
-        layout.addWidget(label)
-        layout.addWidget(self.profile_combo)
-        layout.addWidget(save)
-        layout.addWidget(delete)
-        layout.addWidget(import_json)
-        layout.addWidget(export_json)
-        layout.addWidget(legacy)
+        self.save_settings_button = QPushButton("保存为…")
+        self.save_settings_button.setToolTip("将当前界面中全部可编辑参数保存为 version 2 JSON")
+        self.save_settings_button.clicked.connect(self._save_settings)
+        self.import_settings_button = QPushButton("导入…")
+        self.import_settings_button.setToolTip("导入 version 1 或 version 2 JSON 配置")
+        self.import_settings_button.clicked.connect(self._import_settings)
+        layout.addWidget(self.save_settings_button)
+        layout.addWidget(self.import_settings_button)
         layout.addStretch(1)
         return bar
 
     def _build_config_tabs(self) -> QWidget:
-        tabs = QTabWidget()
-        tabs.setObjectName("configTabs")
-        tabs.addTab(self._build_basic_page(), "基础参数")
-        tabs.addTab(self._build_advanced_page(), "高级参数")
-        return tabs
+        self.config_tabs = QTabWidget()
+        self.config_tabs.setObjectName("configTabs")
+        self.config_tabs.setMinimumWidth(500)
+        self.config_tabs.addTab(self._build_basic_page(), "基础参数")
+        self.config_tabs.addTab(self._build_advanced_page(), "高级参数")
+        return self.config_tabs
+
+    def _field_block(
+        self,
+        key: str,
+        label: str,
+        widget: QWidget,
+        *,
+        help_text: str = "",
+        page_index: int = 0,
+    ) -> QWidget:
+        """Wrap one editor with a label and its own inline validation text."""
+
+        block = QWidget()
+        block.setObjectName("fieldBlock")
+        block_layout = QVBoxLayout(block)
+        block_layout.setContentsMargins(0, 0, 0, 0)
+        block_layout.setSpacing(5)
+        if help_text:
+            block_layout.addWidget(HelpLabel(label, help_text))
+        else:
+            field_label = QLabel(label)
+            field_label.setObjectName("fieldLabel")
+            block_layout.addWidget(field_label)
+        block_layout.addWidget(widget)
+        error = QLabel()
+        error.setObjectName("validationMessage")
+        error.setWordWrap(True)
+        error.setVisible(False)
+        block_layout.addWidget(error)
+        self.field_widgets[key] = widget
+        self.field_blocks[key] = block
+        self.field_messages[key] = error
+        self.field_pages[key] = page_index
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QWidget):
+            child.installEventFilter(self)
+        return block
+
+    def _add_field_alias(self, key: str, widget: QWidget, block: QWidget, page_index: int) -> None:
+        error = QLabel()
+        error.setObjectName("validationMessage")
+        error.setWordWrap(True)
+        error.setVisible(False)
+        assert isinstance(block.layout(), QVBoxLayout)
+        block.layout().addWidget(error)
+        self.field_widgets[key] = widget
+        self.field_blocks[key] = block
+        self.field_messages[key] = error
+        self.field_pages[key] = page_index
+        widget.installEventFilter(self)
+        for child in widget.findChildren(QWidget):
+            child.installEventFilter(self)
 
     def _build_basic_page(self) -> QWidget:
         scroll, _page, layout = _scroll_page()
+        self.basic_scroll = scroll
 
         trip = Card("行程与时间", "站名需与 12306 显示完全一致。")
-        form = QFormLayout()
-        form.setSpacing(10)
-        station_row = QHBoxLayout()
+        trip_grid = QGridLayout()
+        trip_grid.setHorizontalSpacing(8)
+        trip_grid.setVerticalSpacing(10)
+        trip_grid.setColumnStretch(0, 1)
+        trip_grid.setColumnStretch(2, 1)
         self.from_station = QLineEdit()
         self.from_station.setPlaceholderText("出发站")
         self.from_station.setClearButtonEnabled(True)
         self.to_station = QLineEdit()
         self.to_station.setPlaceholderText("到达站")
         self.to_station.setClearButtonEnabled(True)
-        swap = QToolButton()
-        swap.setText("⇄")
-        swap.setToolTip("交换出发站和到达站")
-        swap.clicked.connect(self._swap_stations)
-        station_row.addWidget(self.from_station)
-        station_row.addWidget(swap)
-        station_row.addWidget(self.to_station)
-        form.addRow("路线", station_row)
-        self.train_date = QDateEdit()
-        self.train_date.setCalendarPopup(True)
-        self.train_date.setDisplayFormat("yyyy-MM-dd")
-        self.train_date.setMinimumDate(QDate.currentDate())
-        form.addRow("乘车日期", self.train_date)
-        self.start_at = QLineEdit()
-        self.start_at.setPlaceholderText("HH:MM:SS 或 YYYY-MM-DD HH:MM:SS")
-        self.start_at.textChanged.connect(self._target_edited)
-        form.addRow("开始 / 开售时间", self.start_at)
-        self.stop_at = QLineEdit()
-        self.stop_at.setPlaceholderText("留空表示不按时间停止")
-        form.addRow("停止时间", self.stop_at)
-        trip.body.addLayout(form)
+        self.swap_stations_button = QToolButton()
+        self.swap_stations_button.setText("⇄")
+        self.swap_stations_button.setFixedWidth(36)
+        self.swap_stations_button.setToolTip("交换出发站和到达站")
+        self.swap_stations_button.clicked.connect(self._swap_stations)
+        self.update_stations_button = QPushButton("更新站点")
+        self.update_stations_button.setToolTip("手动从 12306 获取最新站点列表；程序启动时不会自动联网")
+        self.update_stations_button.clicked.connect(self._refresh_stations)
+        trip_grid.addWidget(self._field_block("from_station", "出发站", self.from_station), 0, 0)
+        trip_grid.addWidget(self.swap_stations_button, 0, 1, alignment=Qt.AlignmentFlag.AlignBottom)
+        trip_grid.addWidget(self._field_block("to_station", "到达站", self.to_station), 0, 2)
+        trip_grid.addWidget(self.update_stations_button, 0, 3, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self.train_date = DatePickerWidget()
+        trip_grid.addWidget(
+            self._field_block(
+                "train_date",
+                "乘车日期",
+                self.train_date,
+                help_text="点击日历选择日期；过去的日期不可选。",
+            ),
+            1,
+            0,
+            1,
+            4,
+        )
+        self.start_at = TimeFieldsWidget(optional=True, disabled_label="立即开始")
+        self.stop_at = TimeFieldsWidget(optional=True, disabled_label="不设停止时间")
+        trip_grid.addWidget(
+            self._field_block(
+                "start_at",
+                "开始 / 开售时间",
+                self.start_at,
+                help_text="按时、分、秒设置每日开始时间；勾选“立即开始”后不等待。",
+            ),
+            2,
+            0,
+            1,
+            4,
+        )
+        trip_grid.addWidget(
+            self._field_block(
+                "stop_at",
+                "停止时间",
+                self.stop_at,
+                help_text="到达该时间后协作停止查询；勾选“不设停止时间”则由最大轮数控制。",
+            ),
+            3,
+            0,
+            1,
+            4,
+        )
+        trip.body.addLayout(trip_grid)
         layout.addWidget(trip)
 
         people = Card("乘车人与抢票顺序", "只保存常用乘车人姓名，不存储身份证号和手机号。")
-        people_form = QFormLayout()
-        people_form.setSpacing(10)
+        people_grid = QGridLayout()
+        people_grid.setHorizontalSpacing(10)
+        people_grid.setVerticalSpacing(10)
+        people_grid.setColumnStretch(0, 1)
+        people_grid.setColumnStretch(1, 1)
         self.passengers = QLineEdit()
         self.passengers.setPlaceholderText("张三，李四（最多 5 人）")
         self.passengers.setClearButtonEnabled(True)
-        people_form.addRow("乘车人", self.passengers)
         self.preferred_trains = QLineEdit()
         self.preferred_trains.setPlaceholderText("G79, G95（从左到右优先）")
         self.preferred_trains.setClearButtonEnabled(True)
-        people_form.addRow("优先车次", self.preferred_trains)
         self.only_preferred = QCheckBox("只尝试上述车次")
-        people_form.addRow("", self.only_preferred)
-        people.body.addLayout(people_form)
-        seat_label = QLabel("席别优先级")
-        seat_label.setObjectName("fieldLabel")
-        people.body.addWidget(seat_label)
+        people_grid.addWidget(
+            self._field_block(
+                "passenger_names",
+                "乘车人",
+                self.passengers,
+                help_text="自动提交时填写 1–5 个已在 12306 账户中的姓名；仅监控可留空。",
+            ),
+            0,
+            0,
+        )
+        train_block = self._field_block(
+            "preferred_trains",
+            "优先车次",
+            self.preferred_trains,
+            help_text="多个车次用逗号分隔，程序按从左到右的顺序尝试。",
+        )
+        assert isinstance(train_block.layout(), QVBoxLayout)
+        train_block.layout().addWidget(self.only_preferred)
+        people_grid.addWidget(train_block, 0, 1)
+        people.body.addLayout(people_grid)
         self.seat_types = PriorityListEditor(SEAT_SPECS.keys())
         self.seat_types.changed.connect(self._seat_types_changed)
-        people.body.addWidget(self.seat_types)
+        seat_block = self._field_block(
+            "seat_types",
+            "席别优先级",
+            self.seat_types,
+            help_text="勾选可接受的席别并直接拖动；从上到下优先，十种席别始终全部展示。",
+        )
+        self.field_widgets["seat_types"] = self.seat_types.list
+        people.body.addWidget(seat_block)
         layout.addWidget(people)
 
         position = Card("座位与铺位偏好", "偏好只提交一次；若 12306 未开放或无法满足，订单仍保留并由系统分配其他位置。")
         self.position_preferences = PositionPreferences()
-        position.body.addWidget(self.position_preferences)
+        position_block = self._field_block(
+            "seat_position_preferences",
+            "整组位置偏好",
+            self.position_preferences,
+            help_text="座位格子或铺位数量必须为零，或等于乘车人数；不支持时会自动降级为随机分配。",
+        )
+        self.field_widgets["seat_position_preferences"] = self.position_preferences.seats
+        self._add_field_alias("berth_preference", self.position_preferences.berths, position_block, 0)
+        position.body.addWidget(position_block)
         layout.addWidget(position)
 
         action = Card("任务模式")
@@ -297,90 +436,136 @@ class MainWindow(QMainWindow):
         self.auto_submit.setChecked(True)
         hint = QLabel("结果出来后仍需在 12306 官方渠道手动完成支付。")
         hint.setObjectName("muted")
-        action.body.addWidget(self.auto_submit)
+        action.body.addWidget(
+            self._field_block(
+                "auto_submit",
+                "提交方式",
+                self.auto_submit,
+                help_text="关闭后仅查询并提示票源，不提交订单，也不要求填写乘车人。",
+            )
+        )
         action.body.addWidget(hint)
         layout.addWidget(action)
+
+        self.from_station.textChanged.connect(self._schedule_validation)
+        self.to_station.textChanged.connect(self._schedule_validation)
+        self.train_date.changed.connect(self._schedule_validation)
+        self.start_at.changed.connect(self._target_edited)
+        self.start_at.changed.connect(self._schedule_validation)
+        self.stop_at.changed.connect(self._schedule_validation)
+        self.passengers.textChanged.connect(self._schedule_validation)
+        self.preferred_trains.textChanged.connect(self._schedule_validation)
+        self.only_preferred.toggled.connect(self._schedule_validation)
+        self.seat_types.changed.connect(self._schedule_validation)
+        self.position_preferences.changed.connect(self._schedule_validation)
+        self.auto_submit.toggled.connect(self._schedule_validation)
         layout.addStretch(1)
         return scroll
 
     def _build_advanced_page(self) -> QWidget:
         scroll, _page, layout = _scroll_page()
+        self.advanced_scroll = scroll
         self.advanced: Dict[str, QWidget] = {}
 
         query = Card("查询与热身", "频率过高可能导致限流，建议优先使用默认值。")
-        query_form = QFormLayout()
-        self._add_double(query_form, "query_interval_seconds", "常规查询间隔", 0.05, 60.0, 0.05, " 秒")
-        self._add_int(query_form, "max_retries", "最大查询轮数", 1, 100000)
-        self._add_double(query_form, "pre_query_seconds", "提前热身", 0.0, 60.0, 0.1, " 秒")
-        self._add_double(query_form, "hot_query_interval_seconds", "热身查询间隔", 0.05, 10.0, 0.05, " 秒")
-        self._add_double(query_form, "hot_window_seconds", "开售后热身窗口", 0.0, 120.0, 0.5, " 秒")
-        query.body.addLayout(query_form)
+        query_grid = QGridLayout()
+        query_grid.setSpacing(10)
+        query_grid.setColumnStretch(0, 1)
+        query_grid.setColumnStretch(1, 1)
+        self._add_double(query_grid, "query_interval_seconds", "常规查询间隔", 0.05, 60.0, 0.05, " 秒", 0, 0, "默认 0.60 秒，范围 0.05–60 秒。过低可能触发限流。")
+        self._add_int(query_grid, "max_retries", "最大查询轮数", 1, 100000, 0, 1, "默认 1000 轮，范围 1–100000。数值越大，任务可能运行越久。")
+        self._add_double(query_grid, "pre_query_seconds", "提前热身", 0.0, 60.0, 0.1, " 秒", 1, 0, "默认 1.50 秒，范围 0–60 秒。在开始时间前进入热身。")
+        self._add_double(query_grid, "hot_query_interval_seconds", "热身查询间隔", 0.05, 10.0, 0.05, " 秒", 1, 1, "默认 0.25 秒，范围 0.05–10 秒。过低可能触发限流。")
+        self._add_double(query_grid, "hot_window_seconds", "开售后热身窗口", 0.0, 120.0, 0.5, " 秒", 2, 0, "默认 5 秒，范围 0–120 秒。窗口后恢复常规查询间隔。")
+        query.body.addLayout(query_grid)
         layout.addWidget(query)
 
         network = Card("网络、登录与校时")
-        network_form = QFormLayout()
-        self._add_double(network_form, "request_timeout_seconds", "请求超时", 1.0, 120.0, 1.0, " 秒")
-        self._add_double(network_form, "login_qr_timeout_seconds", "扫码超时", 30.0, 900.0, 10.0, " 秒")
-        self._add_double(network_form, "login_qr_poll_seconds", "扫码状态间隔", 0.2, 10.0, 0.1, " 秒")
-        self._add_int(network_form, "time_sync_samples", "校时采样数", 1, 30)
-        self._add_double(network_form, "time_sync_max_rtt_seconds", "校时最大 RTT", 0.05, 10.0, 0.05, " 秒")
-        remember = QCheckBox("记住登录状态")
-        remember.setChecked(False)
-        remember.setEnabled(False)
-        remember.setToolTip("桌面端安全策略固定为每次启动重新扫码")
-        network_form.addRow("会话策略", remember)
-        network.body.addLayout(network_form)
+        network_grid = QGridLayout()
+        network_grid.setSpacing(10)
+        network_grid.setColumnStretch(0, 1)
+        network_grid.setColumnStretch(1, 1)
+        self._add_double(network_grid, "request_timeout_seconds", "请求超时", 1.0, 120.0, 1.0, " 秒", 0, 0, "默认 10 秒，范围 1–120 秒。过短会把慢响应误判为失败。")
+        self._add_double(network_grid, "login_qr_timeout_seconds", "扫码超时", 30.0, 900.0, 10.0, " 秒", 0, 1, "默认 180 秒，范围 30–900 秒。到期后可手动刷新二维码。")
+        self._add_double(network_grid, "login_qr_poll_seconds", "扫码状态间隔", 0.2, 10.0, 0.1, " 秒", 1, 0, "默认 1 秒，范围 0.2–10 秒。过低会增加登录接口请求。")
+        self._add_int(network_grid, "time_sync_samples", "校时采样数", 1, 30, 1, 1, "默认 7 次，范围 1–30。更多采样会延长准备阶段。")
+        self._add_double(network_grid, "time_sync_max_rtt_seconds", "校时最大 RTT", 0.05, 10.0, 0.05, " 秒", 2, 0, "默认 1 秒，范围 0.05–10 秒。高延迟样本将被丢弃。")
+        network.body.addLayout(network_grid)
         layout.addWidget(network)
 
         order = Card("出票等待与诊断")
-        order_form = QFormLayout()
-        self._add_int(order_form, "order_wait_attempts", "出票查询次数", 1, 1000)
-        self._add_double(order_form, "order_wait_interval_seconds", "出票查询间隔", 0.1, 60.0, 0.1, " 秒")
-        self._add_int(order_form, "station_cache_days", "站点缓存天数", 1, 365)
+        order_grid = QGridLayout()
+        order_grid.setSpacing(10)
+        order_grid.setColumnStretch(0, 1)
+        order_grid.setColumnStretch(1, 1)
+        self._add_int(order_grid, "order_wait_attempts", "出票查询次数", 1, 1000, 0, 0, "默认 300 次，范围 1–1000。用于提交后的排队结果查询。")
+        self._add_double(order_grid, "order_wait_interval_seconds", "出票查询间隔", 0.1, 60.0, 0.1, " 秒", 0, 1, "默认 2 秒，范围 0.1–60 秒。过低会增加排队接口请求。")
+        self._add_int(order_grid, "station_cache_days", "站点缓存天数", 1, 365, 1, 0, "默认 7 天，范围 1–365。仅影响购票任务对缓存新鲜度的判断。")
         self.log_level = QComboBox()
         self.log_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         self.advanced["log_level"] = self.log_level
-        order_form.addRow("日志级别", self.log_level)
+        order_grid.addWidget(
+            self._field_block("log_level", "日志级别", self.log_level, help_text="默认 INFO。DEBUG 信息最多，ERROR 只显示错误。", page_index=1),
+            1,
+            1,
+        )
         self.perf_log = QCheckBox("显示关键阶段耗时")
         self.advanced["perf_log"] = self.perf_log
-        order_form.addRow("性能日志", self.perf_log)
-        purpose = QComboBox()
-        purpose.addItem("ADULT")
-        purpose.setEnabled(False)
-        purpose.setToolTip("当前版本只暴露稳定的成人票查询参数")
-        order_form.addRow("查询用途", purpose)
-        order.body.addLayout(order_form)
+        order_grid.addWidget(
+            self._field_block("perf_log", "性能日志", self.perf_log, help_text="默认开启；记录校时、查询、提交等阶段耗时，不改变请求节奏。", page_index=1),
+            2,
+            0,
+        )
+        order.body.addLayout(order_grid)
         layout.addWidget(order)
 
-        reset = QPushButton("恢复高级参数默认值")
-        reset.clicked.connect(self._reset_advanced)
-        layout.addWidget(reset, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.log_level.currentTextChanged.connect(self._schedule_validation)
+        self.perf_log.toggled.connect(self._schedule_validation)
+
+        self.reset_advanced_button = QPushButton("恢复高级参数默认值")
+        self.reset_advanced_button.clicked.connect(self._reset_advanced)
+        layout.addWidget(self.reset_advanced_button, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
         return scroll
 
     def _add_double(
         self,
-        form: QFormLayout,
+        grid: QGridLayout,
         key: str,
         label: str,
         minimum: float,
         maximum: float,
         step: float,
-        suffix: str = "",
+        suffix: str,
+        row: int,
+        column: int,
+        help_text: str,
     ) -> None:
-        spin = QDoubleSpinBox()
+        spin = CleanDoubleSpinBox()
         spin.setRange(minimum, maximum)
         spin.setDecimals(2)
         spin.setSingleStep(step)
         spin.setSuffix(suffix)
         self.advanced[key] = spin
-        form.addRow(label, spin)
+        spin.valueChanged.connect(self._schedule_validation)
+        grid.addWidget(self._field_block(key, label, spin, help_text=help_text, page_index=1), row, column)
 
-    def _add_int(self, form: QFormLayout, key: str, label: str, minimum: int, maximum: int) -> None:
-        spin = QSpinBox()
+    def _add_int(
+        self,
+        grid: QGridLayout,
+        key: str,
+        label: str,
+        minimum: int,
+        maximum: int,
+        row: int,
+        column: int,
+        help_text: str,
+    ) -> None:
+        spin = CleanSpinBox()
         spin.setRange(minimum, maximum)
         self.advanced[key] = spin
-        form.addRow(label, spin)
+        spin.valueChanged.connect(self._schedule_validation)
+        grid.addWidget(self._field_block(key, label, spin, help_text=help_text, page_index=1), row, column)
 
     def _build_status_panel(self) -> QWidget:
         panel = QWidget()
@@ -501,109 +686,49 @@ class MainWindow(QMainWindow):
         frame.value_label = number  # type: ignore[attr-defined]
         return frame
 
-    # ----- Profiles and configuration -------------------------------------
+    # ----- JSON settings and configuration -------------------------------
     def _load_initial_values(self) -> None:
-        self._refresh_profile_combo()
-        values: Mapping[str, Any]
-        last = self.profile_store.last_profile
-        stored = self.profile_store.get(last) if last else None
-        if stored:
-            values = stored
-            self._select_profile_name(last)
-        else:
-            try:
-                values = safe_read_legacy_config(LEGACY_CONFIG_FILE)
-            except AppError as exc:
-                values = DEFAULT_VALUES
-                logging.warning("旧 config.py 读取失败: %s", exc)
-        self._apply_mapping(values)
+        self._apply_mapping(DEFAULT_VALUES)
 
-    def _refresh_profile_combo(self, selected: str = "") -> None:
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.clear()
-        self.profile_combo.addItem("临时配置", "")
-        for name in self.profile_store.names():
-            self.profile_combo.addItem(name, name)
-        self.profile_combo.blockSignals(False)
-        self._select_profile_name(selected)
-
-    def _select_profile_name(self, name: str) -> None:
-        index = self.profile_combo.findData(name)
-        self.profile_combo.setCurrentIndex(max(0, index))
-
-    def _profile_selected(self, _index: int) -> None:
-        name = str(self.profile_combo.currentData() or "")
+    def _save_settings(self) -> None:
+        name, _filter = QFileDialog.getSaveFileName(
+            self,
+            "保存全部界面参数",
+            "我的行程.json",
+            "JSON 配置 (*.json)",
+        )
         if not name:
             return
-        values = self.profile_store.get(name)
-        if values:
-            self._apply_mapping(values)
-            self.profile_store.mark_last(name)
-            logging.info("已加载配置档案: %s", name)
-
-    def _save_profile(self) -> None:
-        suggested = str(self.profile_combo.currentData() or "我的行程")
-        name, ok = QInputDialog.getText(self, "保存配置档案", "档案名称", text=suggested)
-        if not ok:
-            return
+        path = Path(name)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(".json")
         try:
-            self.profile_store.put(name, self._collect_mapping())
-        except (AppError, OSError, ValueError) as exc:
+            self.config_store.save_file(path, self._collect_mapping())
+        except (AppError, OSError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        self._refresh_profile_combo(name.strip())
-        logging.info("已保存配置档案: %s", name.strip())
+        logging.info("已保存 version 2 JSON 配置: %s", path)
+        QMessageBox.information(self, "保存成功", "已保存全部可编辑参数；文件不包含登录态或身份信息。")
 
-    def _delete_profile(self) -> None:
-        name = str(self.profile_combo.currentData() or "")
-        if not name:
-            return
-        answer = QMessageBox.question(self, "删除档案", f"确定删除“{name}”吗？")
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self.profile_store.delete(name)
-        except OSError as exc:
-            QMessageBox.warning(self, "删除失败", str(exc))
-            return
-        self._refresh_profile_combo()
-
-    def _import_profile(self) -> None:
-        name, _filter = QFileDialog.getOpenFileName(self, "导入配置档案", "", "JSON (*.json)")
+    def _import_settings(self) -> None:
+        name, _filter = QFileDialog.getOpenFileName(self, "导入界面参数", "", "JSON 配置 (*.json)")
         if not name:
             return
         try:
-            profile_name = self.profile_store.import_file(Path(name))
-            values = self.profile_store.get(profile_name)
-            if values:
-                self._apply_mapping(values)
-        except (AppError, OSError, ValueError) as exc:
+            values = self.config_store.import_file(Path(name))
+            import_errors, warnings = self._apply_mapping(values)
+        except (AppError, OSError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
             return
-        self._refresh_profile_combo(profile_name)
-
-    def _export_profile(self) -> None:
-        profile_name = str(self.profile_combo.currentData() or "临时配置")
-        name, _filter = QFileDialog.getSaveFileName(self, "导出配置档案", f"{profile_name}.json", "JSON (*.json)")
-        if not name:
-            return
-        try:
-            self.profile_store.export_file(Path(name), profile_name, self._collect_mapping())
-        except OSError as exc:
-            QMessageBox.warning(self, "导出失败", str(exc))
-
-    def _import_legacy(self) -> None:
-        name, _filter = QFileDialog.getOpenFileName(self, "安全读取旧 config.py", str(LEGACY_CONFIG_FILE), "Python config (config.py *.py)")
-        if not name:
-            return
-        try:
-            values = safe_read_legacy_config(Path(name))
-        except AppError as exc:
-            QMessageBox.warning(self, "配置读取失败", str(exc))
-            return
-        self._apply_mapping(values)
-        self.profile_combo.setCurrentIndex(0)
-        logging.info("已通过 AST 安全读取旧配置（未执行 Python 代码）")
+        errors = self._validate_all(extra_errors=import_errors)
+        logging.info("已导入 JSON 配置: %s", name)
+        if warnings:
+            logging.warning("；".join(warnings))
+        if errors:
+            self._focus_first_error(errors)
+            QMessageBox.warning(self, "配置已导入", f"已导入，但有 {len(errors)} 项需要修改；已标出第一个问题。")
+        else:
+            QMessageBox.information(self, "导入成功", "全部可编辑参数已载入并通过字段检查。")
 
     def _collect_mapping(self) -> Dict[str, Any]:
         values: Dict[str, Any] = {
@@ -638,45 +763,150 @@ class MainWindow(QMainWindow):
                 values[key] = widget.isChecked()
         return values
 
-    def _apply_mapping(self, raw_values: Mapping[str, Any]) -> None:
+    def _apply_mapping(self, raw_values: Mapping[str, Any]) -> tuple[Dict[str, str], list[str]]:
         values = canonical_mapping(raw_values)
-        self.from_station.setText(str(values["from_station"]))
-        self.to_station.setText(str(values["to_station"]))
-        parsed = QDate.fromString(str(values["train_date"]), "yyyy-MM-dd")
-        self.train_date.setDate(parsed if parsed.isValid() and parsed >= QDate.currentDate() else QDate.currentDate())
-        self.passengers.setText("，".join(values["passenger_names"]))
-        self.preferred_trains.setText(", ".join(values["preferred_trains"]))
-        self.only_preferred.setChecked(bool(values["only_preferred_trains"]))
-        self.start_at.setText(str(values["start_at"]))
-        self.stop_at.setText(str(values["stop_at"]))
-        self.auto_submit.setChecked(bool(values["auto_submit"]))
-        self.seat_types.set_values(values["seat_types"])
-        self.position_preferences.seats.set_positions(values["seat_position_preferences"])
-        self.position_preferences.berths.set_values(values["berth_preference"])
-        for key, widget in self.advanced.items():
-            value = values.get(key, DEFAULT_VALUES.get(key))
-            if isinstance(widget, QDoubleSpinBox):
-                widget.setValue(float(value))
-            elif isinstance(widget, QSpinBox):
-                widget.setValue(int(value))
-            elif isinstance(widget, QComboBox):
-                widget.setCurrentText(str(value))
-            elif isinstance(widget, QCheckBox):
-                widget.setChecked(bool(value))
-        self._seat_types_changed()
-        self._target_edited()
+        import_errors: Dict[str, str] = {}
+        warnings: list[str] = []
+        self._applying_values = True
+        try:
+            self.from_station.setText(str(values["from_station"]))
+            self.to_station.setText(str(values["to_station"]))
+            raw_date = str(values["train_date"])
+            parsed = QDate.fromString(raw_date, "yyyy-MM-dd")
+            if raw_date and (not parsed.isValid() or parsed < QDate.currentDate()):
+                import_errors["train_date"] = "导入的乘车日期无效或已经过去，请重新选择"
+            self.train_date.setDate(parsed if parsed.isValid() and parsed >= QDate.currentDate() else QDate.currentDate())
+            self.passengers.setText("，".join(values["passenger_names"]))
+            self.preferred_trains.setText(", ".join(values["preferred_trains"]))
+            self.only_preferred.setChecked(bool(values["only_preferred_trains"]))
+            for key, editor in (("start_at", self.start_at), ("stop_at", self.stop_at)):
+                raw_time = str(values[key] or "").strip()
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw_time):
+                    raw_time = raw_time[-8:]
+                    warnings.append(f"{key} 的旧版完整日期时间已转换为每日 {raw_time}")
+                try:
+                    editor.setText(raw_time)
+                except ValueError:
+                    editor.set_disabled(True)
+                    import_errors[key] = "导入时间不是有效的 HH:MM:SS，请重新设置"
+            self.auto_submit.setChecked(bool(values["auto_submit"]))
+            requested_seats = list(values["seat_types"])
+            unknown_seats = [seat for seat in requested_seats if seat not in SEAT_SPECS]
+            self.seat_types.set_values(requested_seats)
+            if unknown_seats:
+                import_errors["seat_types"] = f"导入配置包含未知席别：{'、'.join(unknown_seats)}"
+            self.position_preferences.seats.set_positions(values["seat_position_preferences"])
+            self.position_preferences.berths.set_values(values["berth_preference"])
+            for key, widget in self.advanced.items():
+                value = values.get(key, DEFAULT_VALUES.get(key))
+                if isinstance(widget, QDoubleSpinBox):
+                    number = float(value)
+                    if number < widget.minimum() or number > widget.maximum():
+                        import_errors[key] = f"导入值 {number:g} 超出允许范围 {widget.minimum():g}–{widget.maximum():g}"
+                    widget.setValue(number)
+                elif isinstance(widget, QSpinBox):
+                    number = int(value)
+                    if number < widget.minimum() or number > widget.maximum():
+                        import_errors[key] = f"导入值 {number} 超出允许范围 {widget.minimum()}–{widget.maximum()}"
+                    widget.setValue(number)
+                elif isinstance(widget, QComboBox):
+                    if widget.findText(str(value)) < 0:
+                        import_errors[key] = f"导入值“{value}”不受支持"
+                    else:
+                        widget.setCurrentText(str(value))
+                elif isinstance(widget, QCheckBox):
+                    widget.setChecked(bool(value))
+            self._seat_types_changed()
+            self._target_edited()
+        finally:
+            self._applying_values = False
+        return import_errors, warnings
 
     def _reset_advanced(self) -> None:
         current = self._collect_mapping()
         for key in self.advanced:
             current[key] = DEFAULT_VALUES[key]
         self._apply_mapping(current)
+        self._validate_all()
         logging.info("已恢复高级参数默认值")
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt API
+        if event.type() == QEvent.Type.FocusOut:
+            self._schedule_validation()
+        return super().eventFilter(watched, event)
+
+    def _schedule_validation(self, *_args: object) -> None:
+        if not self._applying_values:
+            self.validation_timer.start(250)
+
+    def _validate_live(self) -> None:
+        self._validate_all()
+
+    def _validate_all(
+        self,
+        *,
+        focus_first: bool = False,
+        extra_errors: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, str]:
+        errors = validate_gui_mapping(self._collect_mapping(), self.station_names)
+        if extra_errors:
+            errors.update({str(key): str(value) for key, value in extra_errors.items()})
+        self._apply_validation(errors)
+        if focus_first and errors:
+            self._focus_first_error(errors)
+        return errors
+
+    def _apply_validation(self, errors: Mapping[str, str]) -> None:
+        self._last_validation_errors = dict(errors)
+        touched_blocks = set(self.field_blocks.values())
+        for block in touched_blocks:
+            set_validation_state(block)
+        for key, widget in self.field_widgets.items():
+            message = str(errors.get(key, ""))
+            setter = getattr(widget, "set_validation", None)
+            if callable(setter):
+                setter("error" if message else "", message)
+            else:
+                set_validation_state(widget, "error" if message else "", message)
+            label = self.field_messages[key]
+            label.setText(f"⚠ {message}" if message else "")
+            label.setVisible(bool(message))
+        for key, message in errors.items():
+            block = self.field_blocks.get(key)
+            if block is not None:
+                set_validation_state(block, "error", str(message))
+
+    def _focus_first_error(self, errors: Mapping[str, str]) -> None:
+        key = next((name for name in errors if name in self.field_widgets), "")
+        if not key:
+            return
+        page_index = self.field_pages.get(key, 0)
+        self.config_tabs.setCurrentIndex(page_index)
+        block = self.field_blocks[key]
+        scroll = self.basic_scroll if page_index == 0 else self.advanced_scroll
+        scroll.ensureWidgetVisible(block, 24, 24)
+        widget = self.field_widgets[key]
+        if key == "seat_position_preferences":
+            self.position_preferences.tabs.setCurrentIndex(0)
+            focus_target = next(iter(self.position_preferences.seats.buttons.values()))
+        elif key == "berth_preference":
+            self.position_preferences.tabs.setCurrentIndex(1)
+            focus_target = self.position_preferences.berths.spins["lower"]
+        elif isinstance(widget, TimeFieldsWidget):
+            focus_target = widget.parts[0]
+        else:
+            focus_target = widget
+        QTimer.singleShot(0, focus_target.setFocus)
 
     def _build_current_config(self) -> AppConfig:
         return build_app_config(self._collect_mapping(), LEGACY_CONFIG_FILE)
 
     def _validate_clicked(self) -> None:
+        errors = self._validate_all(focus_first=True)
+        if errors:
+            first = next(iter(errors.values()))
+            QMessageBox.warning(self, "配置需要修改", f"发现 {len(errors)} 项问题。\n\n{first}")
+            return
         try:
             cfg = self._build_current_config()
         except (AppError, TypeError, ValueError) as exc:
@@ -691,6 +921,14 @@ class MainWindow(QMainWindow):
     # ----- Task lifecycle --------------------------------------------------
     def _start_task(self) -> None:
         if self.thread and self.thread.isRunning():
+            return
+        if self.station_refresh_worker and self.station_refresh_worker.is_alive():
+            QMessageBox.information(self, "站点正在更新", "请等待站点列表更新完成后再开始任务。")
+            return
+        errors = self._validate_all(focus_first=True)
+        if errors:
+            first = next(iter(errors.values()))
+            QMessageBox.warning(self, "无法启动", f"请先修改标红的 {len(errors)} 项参数。\n\n{first}")
             return
         try:
             cfg = self._build_current_config()
@@ -750,6 +988,8 @@ class MainWindow(QMainWindow):
         self._qr_deadline = 0.0
         self._target_timestamp = None
         self._server_anchor = None
+        self._pending_query_payload = None
+        self.query_ui_timer.stop()
         self.qr_image.setPixmap(QPixmap())
         self.qr_image.setText("正在准备登录…")
         self.qr_status.setText("等待生成二维码")
@@ -766,21 +1006,14 @@ class MainWindow(QMainWindow):
         self._set_forms_enabled(False)
 
         level = getattr(logging, cfg.log_level, logging.INFO)
-        self.gui_log_handler.setLevel(level)
-        self.gui_log_handler.set_sensitive_terms(cfg.passenger_names)
-        if self.file_log_handler is not None:
-            logging.getLogger().removeHandler(self.file_log_handler)
-            self.file_log_handler.close()
-            self.file_log_handler = None
         try:
-            self.file_log_handler = make_rotating_file_handler(
-                LOCAL_DATA_DIR / "logs" / "app.log",
+            self.log_pipeline.configure_task(
                 level,
-                sensitive_terms=cfg.passenger_names,
+                cfg.passenger_names,
+                LOCAL_DATA_DIR / "logs" / "app.log",
             )
-            logging.getLogger().addHandler(self.file_log_handler)
-        except OSError as exc:
-            logging.warning("无法创建本地轮转日志: %s", exc)
+        except RuntimeError as exc:
+            logging.warning("无法配置异步日志: %s", exc)
 
     def _stop_task(self) -> None:
         if not self.cancel_token:
@@ -883,8 +1116,12 @@ class MainWindow(QMainWindow):
                 self.qr_countdown.setText("已过期")
                 self.refresh_qr_button.setEnabled(True)
         elif kind == "query":
-            self._set_phase("querying", message)
-            self.query_metric.value_label.setText(str(payload.get("attempt", "--")))  # type: ignore[attr-defined]
+            # Query events can arrive much faster than a screen can repaint.
+            # Keep the newest metrics and render at most once per 100 ms;
+            # candidate/order/result events below remain immediate.
+            self._pending_query_payload = payload
+            if not self.query_ui_timer.isActive():
+                self.query_ui_timer.start()
         elif kind == "candidate":
             self._set_phase("querying", message)
             self.phase_badge.setText(message or "发现候选票")
@@ -914,6 +1151,14 @@ class MainWindow(QMainWindow):
         if target is not None:
             self._target_timestamp = float(target)
 
+    def _flush_query_event(self) -> None:
+        payload = self._pending_query_payload
+        self._pending_query_payload = None
+        if not payload:
+            return
+        self._set_phase("querying", str(payload.get("message", "")))
+        self.query_metric.value_label.setText(str(payload.get("attempt", "--")))  # type: ignore[attr-defined]
+
     def _show_qr(self, image: object) -> None:
         pixmap = QPixmap()
         if isinstance(image, (bytes, bytearray, memoryview)):
@@ -937,6 +1182,13 @@ class MainWindow(QMainWindow):
         self._last_phase = phase
         self.timeline.set_phase(phase, message)
         self.phase_badge.setText(message or phase)
+
+    def _on_log_batch(self, lines: object) -> None:
+        if not isinstance(lines, Iterable) or isinstance(lines, (str, bytes, bytearray)):
+            return
+        for item in lines:
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                self._on_log_message(str(item[0]), str(item[1]))
 
     def _on_log_message(self, line: str, level: str) -> None:
         self.log_view.append_line(line, level)
@@ -1019,7 +1271,7 @@ class MainWindow(QMainWindow):
         self.tray.show()
 
     def _install_station_completers(self) -> None:
-        names = cached_station_names()
+        names = sorted(self.station_names)
         for field in (self.from_station, self.to_station):
             completer = QCompleter(names, field)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
@@ -1027,6 +1279,44 @@ class MainWindow(QMainWindow):
             completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
             completer.setMaxVisibleItems(12)
             field.setCompleter(completer)
+
+    def _refresh_stations(self) -> None:
+        if self.thread and self.thread.isRunning():
+            return
+        if self.station_refresh_worker and self.station_refresh_worker.is_alive():
+            return
+        timeout_widget = self.advanced.get("request_timeout_seconds")
+        timeout_seconds = float(timeout_widget.value()) if isinstance(timeout_widget, QDoubleSpinBox) else 10.0
+        self.update_stations_button.setEnabled(False)
+        self.update_stations_button.setText("更新中…")
+        self.start_button.setEnabled(False)
+        self.station_refresh_worker = StationRefreshWorker(
+            cache_path=STATION_CACHE_FILE,
+            timeout_seconds=timeout_seconds,
+            callback=lambda stations, error: self.station_refresh_relay.completed.emit(stations, error),
+        )
+        logging.info("正在手动更新站点列表")
+        self.station_refresh_worker.start()
+
+    def _on_station_refresh_finished(self, stations: object, error: object) -> None:
+        self.station_refresh_worker = None
+        self.update_stations_button.setText("更新站点")
+        task_running = bool(self.thread and self.thread.isRunning())
+        self.update_stations_button.setEnabled(not task_running)
+        self.start_button.setEnabled(not task_running)
+        if error is not None:
+            message = str(error)
+            logging.warning("站点列表更新失败，继续使用现有数据: %s", message)
+            QMessageBox.warning(self, "更新站点失败", f"现有站点数据未改变。\n\n{message}")
+            return
+        if isinstance(stations, Mapping):
+            self.station_names.update(str(name).strip() for name in stations if str(name).strip())
+        else:
+            self.station_names = set(cached_station_names())
+        self._install_station_completers()
+        self._validate_all()
+        logging.info("站点列表已更新，共 %d 个站名", len(self.station_names))
+        QMessageBox.information(self, "站点已更新", f"已载入 {len(self.station_names)} 个站名。")
 
     def _notify(self, title: str, message: str, sound: bool = True) -> None:
         if self.tray:
@@ -1047,6 +1337,7 @@ class MainWindow(QMainWindow):
         for widget in (
             self.from_station,
             self.to_station,
+            self.swap_stations_button,
             self.train_date,
             self.passengers,
             self.preferred_trains,
@@ -1056,11 +1347,16 @@ class MainWindow(QMainWindow):
             self.seat_types,
             self.position_preferences,
             self.auto_submit,
-            self.profile_combo,
+            self.save_settings_button,
+            self.import_settings_button,
         ):
             widget.setEnabled(enabled)
         for widget in self.advanced.values():
             widget.setEnabled(enabled)
+        self.update_stations_button.setEnabled(
+            enabled and not bool(self.station_refresh_worker and self.station_refresh_worker.is_alive())
+        )
+        self.reset_advanced_button.setEnabled(enabled)
 
     def _open_order_page(self) -> None:
         QDesktopServices.openUrl(QUrl(ORDER_URL))
@@ -1081,11 +1377,8 @@ class MainWindow(QMainWindow):
             self._stop_task()
             event.ignore()
             return
-        logging.getLogger().removeHandler(self.gui_log_handler)
-        if self.file_log_handler:
-            logging.getLogger().removeHandler(self.file_log_handler)
-            self.file_log_handler.close()
-            self.file_log_handler = None
+        logging.getLogger().removeHandler(self.log_pipeline.handler)
+        self.log_pipeline.close()
         if self.tray:
             self.tray.hide()
         self.shared_session.cookies.clear()
@@ -1093,13 +1386,23 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def _load_stylesheet(application: QApplication) -> str:
-    is_dark = application.palette().color(QPalette.ColorRole.Window).lightness() < 128
+def _load_stylesheet(application: QApplication, dark_override: Optional[bool] = None) -> str:
+    is_dark = (
+        application.palette().color(QPalette.ColorRole.Window).lightness() < 128
+        if dark_override is None
+        else dark_override
+    )
     try:
-        base = APP_QSS.read_text(encoding="utf-8")
+        check_icon = (ASSET_DIR / "check.svg").as_posix()
+        base = APP_QSS.read_text(encoding="utf-8").replace(
+            "url(assets/check.svg)", f'url("{check_icon}")'
+        )
         if is_dark:
             return base
-        return base + "\n" + (ASSET_DIR / "app_light.qss").read_text(encoding="utf-8")
+        light = (ASSET_DIR / "app_light.qss").read_text(encoding="utf-8").replace(
+            "url(assets/check.svg)", f'url("{check_icon}")'
+        )
+        return base + "\n" + light
     except OSError:
         return ""
 
@@ -1109,6 +1412,8 @@ def run_gui(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--screenshot")
+    parser.add_argument("--window-size", choices=("1200x720", "1260x850"))
+    parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
     options, remaining = parser.parse_known_args(argv[1:])
     qt_argv = [argv[0], *remaining]
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -1117,14 +1422,16 @@ def run_gui(argv: Optional[list[str]] = None) -> int:
     application = QApplication(qt_argv)
     application.setApplicationName("12306 Fair Ticket")
     application.setOrganizationName("Tuan-Space")
-    application.setProperty(
-        "darkTheme",
-        application.palette().color(QPalette.ColorRole.Window).lightness() < 128,
-    )
+    system_dark = application.palette().color(QPalette.ColorRole.Window).lightness() < 128
+    is_dark = system_dark if options.theme == "system" else options.theme == "dark"
+    application.setProperty("darkTheme", is_dark)
     if APP_ICON.exists():
         application.setWindowIcon(QIcon(str(APP_ICON)))
-    application.setStyleSheet(_load_stylesheet(application))
+    application.setStyleSheet(_load_stylesheet(application, is_dark))
     window = MainWindow()
+    if options.window_size:
+        width, height = (int(part) for part in options.window_size.split("x", 1))
+        window.resize(width, height)
     window.show()
 
     if options.smoke_test or options.screenshot:
