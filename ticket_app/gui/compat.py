@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 
 from ticket_app.configuration import AppConfig, AppError
+from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.preferences import SeatRelationPreference
 
 
@@ -207,11 +208,12 @@ def canonical_mapping(values: Mapping[str, Any]) -> Dict[str, Any]:
     for name in ("passenger_names", "seat_types", "preferred_trains"):
         value = result.get(name)
         if isinstance(value, str):
-            result[name] = [item.strip() for item in value.split(",") if item.strip()]
+            result[name] = split_multi_value_text(value)
         elif isinstance(value, Iterable) and not isinstance(value, Mapping):
             result[name] = [str(item).strip() for item in value if str(item).strip()]
         else:
             result[name] = []
+    result["preferred_trains"] = [item.upper() for item in result["preferred_trains"]]
 
     positions = result.get("seat_position_preferences", [])
     if not structured_position_supplied and result.get("choose_seats"):

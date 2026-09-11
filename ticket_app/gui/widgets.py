@@ -8,11 +8,12 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from PySide6.QtCore import QDate, QModelIndex, QPointF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QDropEvent, QPainter, QPen, QTextCursor, QWheelEvent
+from PySide6.QtCore import QDate, QEvent, QModelIndex, QPersistentModelIndex, QPoint, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QDropEvent, QPainter, QPen, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -324,6 +325,24 @@ class TimeFieldsWidget(QWidget):
 class _CheckmarkItemDelegate(QStyledItemDelegate):
     """Overlay a real tick on stylesheet-painted QListWidget indicators."""
 
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # noqa: N802
+        view = self.parent()
+        if isinstance(view, QListView):
+            # IconMode does not expand an item's size hint to its grid cell.
+            return QSize(max(1, view.gridSize().width()), max(1, view.gridSize().height() - 2))
+        return super().sizeHint(option, index)
+
+    def editorEvent(self, event, model, option, index) -> bool:  # type: ignore[no-untyped-def]  # noqa: N802
+        if event.type() in {
+            QEvent.Type.MouseButtonPress,
+            QEvent.Type.MouseButtonRelease,
+            QEvent.Type.MouseButtonDblClick,
+        }:
+            # The view owns whole-cell clicks; retaining the native indicator
+            # handler here would toggle a checkbox twice on a single click.
+            return False
+        return super().editorEvent(event, model, option, index)
+
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[no-untyped-def]
         super().paint(painter, option, index)
         if index.data(Qt.ItemDataRole.CheckStateRole) != Qt.CheckState.Checked.value:
@@ -384,6 +403,10 @@ class _TwoColumnPriorityList(QListWidget):
         self.setMovement(QListView.Movement.Snap)
         self.setUniformItemSizes(True)
         self.setResizeMode(QListView.ResizeMode.Adjust)
+        self._click_index = QPersistentModelIndex()
+        self._press_position = QPoint()
+        self._dragged = False
+        self._drag_index = QPersistentModelIndex()
 
     def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         super().resizeEvent(event)
@@ -391,7 +414,67 @@ class _TwoColumnPriorityList(QListWidget):
 
     def sync_grid_size(self) -> None:
         width = max(1, self.viewport().width())
-        self.setGridSize(QSize(max(1, width // self.COLUMNS), self.CELL_HEIGHT))
+        # IconMode compares against the inclusive right edge when wrapping.
+        self.setGridSize(QSize(max(1, (width - 1) // self.COLUMNS), self.CELL_HEIGHT))
+        self.doItemsLayout()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
+        self._click_index = QPersistentModelIndex()
+        self._dragged = False
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._click_index = QPersistentModelIndex(self.indexAt(event.position().toPoint()))
+            self._press_position = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._click_index.isValid() and event.buttons() & Qt.MouseButton.LeftButton:
+            distance = (event.position().toPoint() - self._press_position).manhattanLength()
+            if distance >= QApplication.startDragDistance():
+                self._dragged = True
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
+        pressed = self._click_index
+        point = event.position().toPoint()
+        should_toggle = (
+            event.button() == Qt.MouseButton.LeftButton
+            and pressed.isValid()
+            and not self._dragged
+            and (point - self._press_position).manhattanLength() < QApplication.startDragDistance()
+            and pressed == self.indexAt(point)
+        )
+        self._click_index = QPersistentModelIndex()
+        super().mouseReleaseEvent(event)
+        if should_toggle and pressed.isValid():
+            item = self.itemFromIndex(QModelIndex(pressed))
+            required = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+            if item is not None and item.flags() & required == required:
+                item.setCheckState(
+                    Qt.CheckState.Unchecked
+                    if item.checkState() == Qt.CheckState.Checked
+                    else Qt.CheckState.Checked
+                )
+
+    def startDrag(self, supported_actions) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
+        self._dragged = True
+        self._drag_index = QPersistentModelIndex(self.currentIndex())
+        self._click_index = QPersistentModelIndex()
+        if not self._drag_index.isValid():
+            return
+        index = QModelIndex(self._drag_index)
+        drag = QDrag(self)
+        drag.setMimeData(self.model().mimeData([index]))
+        rect = self.visualRect(index)
+        drag.setPixmap(self.viewport().grab(rect))
+        drag.setHotSpot(self._press_position - rect.topLeft())
+        try:
+            # dropEvent moves the model row itself. IconMode's native startDrag
+            # would additionally remove the source row after a successful drop.
+            drag.exec(supported_actions & Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            self._drag_index = QPersistentModelIndex()
+            self.setState(QAbstractItemView.State.NoState)
+            drag.deleteLater()
 
     def _move_item(self, source_row: int, target_row: int, *, after: bool = False) -> bool:
         """Move one model row and reset any free icon positions."""
@@ -414,7 +497,7 @@ class _TwoColumnPriorityList(QListWidget):
         if event.source() not in {self, self.viewport()}:
             event.ignore()
             return
-        source_row = self.currentRow()
+        source_row = self._drag_index.row() if self._drag_index.isValid() else self.currentRow()
         point = event.position().toPoint()
         target_index = self.indexAt(point)
         target_row = target_index.row() if target_index.isValid() else -1
@@ -439,7 +522,7 @@ class PriorityListEditor(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        hint = QLabel("从左到右、从上到下优先 · 勾选席别后可直接拖动排序")
+        hint = QLabel("从左到右、从上到下优先 · 点击席别勾选，可直接拖动排序")
         hint.setObjectName("muted")
         layout.addWidget(hint)
 
@@ -456,7 +539,7 @@ class PriorityListEditor(QWidget):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.list.setItemDelegate(_CheckmarkItemDelegate(self.list))
-        self.list.setToolTip("勾选并拖拽排序，程序会按从左到右、从上到下的顺序尝试")
+        self.list.setToolTip("点击席别可勾选或取消；拖拽可排序，程序按从左到右、从上到下的顺序尝试")
         self._mutating = True
         for value in all_values:
             self.list.addItem(self._make_item(str(value), checked=False))
@@ -473,7 +556,6 @@ class PriorityListEditor(QWidget):
     def _make_item(self, value: str, *, checked: bool) -> QListWidgetItem:
         item = QListWidgetItem(value)
         item.setData(Qt.ItemDataRole.UserRole, value)
-        item.setSizeHint(QSize(0, self.CELL_HEIGHT - 2))
         item.setFlags(
             item.flags()
             | Qt.ItemFlag.ItemIsUserCheckable
@@ -661,6 +743,7 @@ class SeatMapWidget(QWidget):
 
 class BerthCountWidget(QWidget):
     changed = Signal()
+    select_seat_types_requested = Signal()
 
     LABELS = (("lower", "下铺", "优先最高"), ("middle", "中铺", "仅部分卧铺"), ("upper", "上铺", "优先最低"))
 
@@ -674,6 +757,19 @@ class BerthCountWidget(QWidget):
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
+
+        self.seat_type_hint = QWidget()
+        hint_layout = QVBoxLayout(self.seat_type_hint)
+        hint_layout.setContentsMargins(0, 0, 0, 0)
+        hint_layout.setSpacing(6)
+        self.seat_type_message = QLabel("请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。")
+        self.seat_type_message.setObjectName("muted")
+        self.seat_type_message.setWordWrap(True)
+        hint_layout.addWidget(self.seat_type_message)
+        self.select_seat_types_button = QPushButton("去选择卧铺席别")
+        self.select_seat_types_button.clicked.connect(self.select_seat_types_requested)
+        hint_layout.addWidget(self.select_seat_types_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.seat_type_hint)
 
         self.spins: Dict[str, QSpinBox] = {}
         self.minus_buttons: Dict[str, QToolButton] = {}
@@ -717,11 +813,22 @@ class BerthCountWidget(QWidget):
 
         self.total = QLabel("已选 0 张铺位偏好")
         self.total.setObjectName("muted")
-        layout.addWidget(self.total)
+        total_row = QHBoxLayout()
+        total_row.addWidget(self.total)
+        total_row.addStretch(1)
+        self.clear_button = QPushButton("清空铺位偏好")
+        self.clear_button.setEnabled(False)
+        self.clear_button.clicked.connect(lambda: self.set_values({}))
+        total_row.addWidget(self.clear_button)
+        layout.addLayout(total_row)
+
+    def set_sleeper_available(self, available: bool) -> None:
+        self.seat_type_hint.setVisible(not available)
 
     def _update_total(self) -> None:
         count = sum(spin.value() for spin in self.spins.values())
         self.total.setText(f"已选 {count} 张铺位偏好")
+        self.clear_button.setEnabled(count > 0)
         self.changed.emit()
 
     def values(self) -> Dict[str, int]:
@@ -767,6 +874,7 @@ class PositionPreferences(QWidget):
         values = list(seat_types)
         sleeper = any("卧" in value for value in values)
         seated = any("座" in value and value != "无座" for value in values)
+        self.berths.set_sleeper_available(sleeper)
         # Keep both pages reachable so users can clear preferences left over
         # from another seat type. Validation can otherwise fail on a hidden,
         # disabled page with no way to repair the configuration.
@@ -776,7 +884,7 @@ class PositionPreferences(QWidget):
         self.tabs.setTabToolTip(1, "当前席别包含卧铺时生效" if not sleeper else "设置下、中、上铺数量")
         if sleeper and not seated:
             self.tabs.setCurrentIndex(1)
-        elif seated and not sleeper:
+        elif seated and not sleeper and not any(self.berths.values().values()):
             self.tabs.setCurrentIndex(0)
 
 

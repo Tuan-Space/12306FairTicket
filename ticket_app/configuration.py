@@ -6,6 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .input_parsing import split_multi_value_text
 from .preferences import (
     BERTH_SEAT_TYPES,
     BerthPreference,
@@ -326,7 +327,7 @@ def _as_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
+        return split_multi_value_text(value)
     if isinstance(value, Iterable):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []

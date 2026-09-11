@@ -12,6 +12,7 @@ from datetime import date, datetime
 from typing import Any, Iterable, Mapping
 
 from ticket_app.configuration import SEAT_SPECS
+from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.preferences import (
     BERTH_SEAT_TYPES,
     BerthPreference,
@@ -41,7 +42,7 @@ def _string_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [item.strip() for item in re.split(r"[,，;；\n]+", value) if item.strip()]
+        return split_multi_value_text(value)
     if isinstance(value, Iterable) and not isinstance(value, (Mapping, bytes, bytearray)):
         return [str(item).strip() for item in value if str(item).strip()]
     text = str(value).strip()
@@ -199,7 +200,7 @@ def validate_gui_mapping(
                 else:
                     configured_codes = {SEAT_SPECS[label].submit_code for label in seat_types if label in SEAT_SPECS}
                     if not configured_codes.intersection(BERTH_SEAT_TYPES):
-                        errors["berth_preference"] = "铺位偏好需要至少选择一种卧铺席别"
+                        errors["berth_preference"] = "请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。"
 
     for key, label, minimum, maximum, inclusive, integer in (
         ("query_interval_seconds", "查询间隔", 0, 60, False, False),

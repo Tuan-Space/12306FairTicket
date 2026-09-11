@@ -16,7 +16,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt  # noqa: E402
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, Qt  # noqa: E402
 from PySide6.QtGui import QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -69,6 +69,10 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
         logging.getLogger().removeHandler(window.log_pipeline.handler)
         window.log_pipeline.close()
         logging.getLogger().setLevel(root_level)
+        # Destroy the closed window after resetting lifecycle doubles. Merely
+        # hiding it leaves thousands of widgets participating in later theme tests.
+        window.deleteLater()
+        QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
 
 
 def _png_bytes() -> bytes:
@@ -80,6 +84,94 @@ def _png_bytes() -> bytes:
     assert image.save(buffer, "PNG")
     buffer.close()
     return bytes(payload)
+
+
+def _click_seat(main_window: gui_app.MainWindow, qtbot, label: str) -> None:
+    seat_list = main_window.seat_types.list
+    main_window._focus_seat_types()
+    for row in range(seat_list.count()):
+        item = seat_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == label:
+            qtbot.mouseClick(seat_list.viewport(), Qt.MouseButton.LeftButton,
+                             pos=seat_list.visualItemRect(item).center())
+            return
+    raise AssertionError(f"Missing seat type: {label}")
+
+
+@pytest.mark.parametrize("sleeper", ["硬卧", "软卧", "高级软卧"])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_real_sleeper_selection_repairs_berth_error_and_removal_restores_guidance(
+    main_window: gui_app.MainWindow, qtbot, sleeper: str, mixed: bool
+) -> None:
+    main_window.show()
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("G79")
+    main_window.seat_types.set_values(["二等座"] if mixed else [])
+    berths = main_window.position_preferences.berths
+    main_window.position_preferences.tabs.setCurrentIndex(1)
+    berths.plus_buttons["lower"].click()
+    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    assert not berths.seat_type_hint.isHidden()
+    assert "席别优先级" in main_window.field_messages["berth_preference"].text()
+
+    _click_seat(main_window, qtbot, sleeper)
+    qtbot.waitUntil(lambda: "berth_preference" not in main_window._last_validation_errors)
+    assert berths.seat_type_hint.isHidden()
+    assert main_window._validate_all() == {}
+    cfg = main_window._build_current_config()
+    assert cfg.seat_types == (["二等座", sleeper] if mixed else [sleeper])
+    assert cfg.berth_preference.lower == 1
+
+    main_window.position_preferences.tabs.setCurrentIndex(1)
+    _click_seat(main_window, qtbot, sleeper)
+    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    assert not berths.seat_type_hint.isHidden()
+    assert main_window.position_preferences.tabs.currentIndex() == 1
+    assert berths.values() == {"lower": 1, "middle": 0, "upper": 0}
+
+
+def test_berth_guidance_navigates_to_seats_and_clear_keeps_seat_selection(
+    main_window: gui_app.MainWindow, qtbot
+) -> None:
+    main_window.show()
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("G79")
+    berths = main_window.position_preferences.berths
+    original_seats = main_window.seat_types.values()
+    main_window.position_preferences.tabs.setCurrentIndex(1)
+    main_window.basic_scroll.ensureWidgetVisible(berths)
+    berths.plus_buttons["lower"].click()
+    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    berths.select_seat_types_button.click()
+    assert main_window.config_tabs.currentIndex() == 0
+    assert QApplication.focusWidget() is main_window.seat_types.list
+    assert main_window.basic_scroll.viewport().rect().intersects(
+        main_window.seat_types.list.rect().translated(
+            main_window.seat_types.list.mapTo(main_window.basic_scroll.viewport(),
+                                            main_window.seat_types.list.rect().topLeft())
+        )
+    )
+    assert main_window.seat_types.values() == original_seats
+    berths.clear_button.click()
+    qtbot.waitUntil(lambda: "berth_preference" not in main_window._last_validation_errors)
+    assert berths.values() == {"lower": 0, "middle": 0, "upper": 0}
+    assert not berths.clear_button.isEnabled()
+    assert main_window.seat_types.values() == original_seats
+
+
+@pytest.mark.parametrize("separator", [",", "，", "、", ";", "；", "\n", "\r\n", "\t", "，;、\t"])
+def test_multi_value_form_collects_and_validates_the_same_lists(
+    main_window: gui_app.MainWindow, separator: str
+) -> None:
+    main_window.passengers.setText(separator + separator.join([" 张三 ", "李四", "Mary Jane"]) + separator)
+    main_window.preferred_trains.setText(separator.join(["g79", " D123 ", "k45"]))
+    values = main_window._collect_mapping()
+    assert values["passenger_names"] == ["张三", "李四", "Mary Jane"]
+    assert values["preferred_trains"] == ["G79", "D123", "K45"]
+    assert main_window._validate_all() == {}
+    cfg = main_window._build_current_config()
+    assert cfg.passenger_names == values["passenger_names"]
+    assert cfg.preferred_trains == values["preferred_trains"]
 
 
 def test_main_window_can_be_created_offline_without_starting_a_task(main_window: gui_app.MainWindow) -> None:

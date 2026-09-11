@@ -89,7 +89,7 @@ def test_seat_relation_and_berth_preferences_reuse_protocol_validators() -> None
     )
     errors = validate(values)
     assert "ABCDF 布局不兼容" in errors["seat_position_preferences"]
-    assert "卧铺席别" in errors["berth_preference"]
+    assert errors["berth_preference"] == "请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。"
 
     values["seat_position_preferences"] = ["2A"]
     errors = validate(values)

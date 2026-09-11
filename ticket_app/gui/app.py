@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ticket_app import __version__
 from ticket_app.configuration import AppConfig, AppError, SEAT_SPECS
+from ticket_app.input_parsing import split_multi_value_text
 
 from .compat import (
     DEFAULT_VALUES,
@@ -79,7 +81,7 @@ ORDER_URL = "https://kyfw.12306.cn/otn/view/train_order.html"
 
 
 def _split_names(text: str) -> list[str]:
-    return [item.strip() for item in re.split(r"[,，;；\n]+", text) if item.strip()]
+    return split_multi_value_text(text)
 
 
 def _scroll_page() -> tuple[QScrollArea, QWidget, QVBoxLayout]:
@@ -393,11 +395,17 @@ class MainWindow(QMainWindow):
         self.passengers = QLineEdit()
         self.passengers.setPlaceholderText("张三，李四（最多 5 人）")
         self.passengers.setClearButtonEnabled(True)
-        self.passengers.setToolTip("自动提交时填写 1–5 个已在当前 12306 账户中的姓名；仅监控可留空。")
+        self.passengers.setToolTip(
+            "自动提交时填写 1–5 个已在当前 12306 账户中的姓名；仅监控可留空。"
+            "多个姓名可用中英文逗号、顿号、中英文分号、换行或制表符分隔。"
+        )
         self.preferred_trains = QLineEdit()
         self.preferred_trains.setPlaceholderText("G79, G95（从左到右优先）")
         self.preferred_trains.setClearButtonEnabled(True)
-        self.preferred_trains.setToolTip("多个车次用逗号分隔，程序按从左到右的顺序优先尝试。")
+        self.preferred_trains.setToolTip(
+            "多个车次可用中英文逗号、顿号、中英文分号、换行或制表符分隔，"
+            "程序按填写顺序优先尝试。"
+        )
         self.only_preferred = QCheckBox("只尝试上述车次")
         self.only_preferred.setToolTip("勾选后不会尝试优先车次输入框以外的其他车次。")
         people_grid.addWidget(
@@ -436,6 +444,7 @@ class MainWindow(QMainWindow):
 
         position = Card("座位与铺位偏好", "偏好只提交一次；若 12306 未开放或无法满足，订单仍保留并由系统分配其他位置。")
         self.position_preferences = PositionPreferences()
+        self.position_preferences.berths.select_seat_types_requested.connect(self._focus_seat_types)
         position_block = self._field_block(
             "seat_position_preferences",
             "",
@@ -1364,6 +1373,11 @@ class MainWindow(QMainWindow):
     def _seat_types_changed(self) -> None:
         self.position_preferences.adapt_to_seats(self.seat_types.values())
 
+    def _focus_seat_types(self) -> None:
+        self.config_tabs.setCurrentIndex(0)
+        self.basic_scroll.ensureWidgetVisible(self.field_blocks["seat_types"], 24, 24)
+        self.seat_types.list.setFocus()
+
     def _swap_stations(self) -> None:
         left, right = self.from_station.text(), self.to_station.text()
         self.from_station.setText(right)
@@ -1458,6 +1472,7 @@ def run_gui(argv: Optional[list[str]] = None) -> int:
     )
     application = QApplication(qt_argv)
     application.setApplicationName("12306 Fair Ticket")
+    application.setApplicationVersion(__version__)
     application.setOrganizationName("Tuan-Space")
     system_dark = application.palette().color(QPalette.ColorRole.Window).lightness() < 128
     is_dark = system_dark if options.theme == "system" else options.theme == "dark"
