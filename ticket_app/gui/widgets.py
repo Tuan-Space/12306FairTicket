@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -41,6 +42,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ..configuration import SEAT_SPECS
+from ..preferences import BERTH_SEAT_TYPES, seat_layout_positions
 
 
 def _asset_path(name: str) -> Path:
@@ -389,10 +393,10 @@ class Card(QFrame):
             self.body.addWidget(subtitle_label)
 
 
-class _TwoColumnPriorityList(QListWidget):
-    """A fixed two-column item view that keeps the model in row-major order."""
+class _ThreeColumnPriorityList(QListWidget):
+    """A fixed three-column item view that keeps the model in row-major order."""
 
-    COLUMNS = 2
+    COLUMNS = 3
     CELL_HEIGHT = 34
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -510,11 +514,11 @@ class _TwoColumnPriorityList(QListWidget):
 
 
 class PriorityListEditor(QWidget):
-    """Two-column, row-major seat priority editor with direct drag sorting."""
+    """Three-column, row-major seat priority editor with direct drag sorting."""
 
     changed = Signal()
-    COLUMNS = _TwoColumnPriorityList.COLUMNS
-    CELL_HEIGHT = _TwoColumnPriorityList.CELL_HEIGHT
+    COLUMNS = _ThreeColumnPriorityList.COLUMNS
+    CELL_HEIGHT = _ThreeColumnPriorityList.CELL_HEIGHT
 
     def __init__(self, all_values: Iterable[str], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -526,7 +530,7 @@ class PriorityListEditor(QWidget):
         hint.setObjectName("muted")
         layout.addWidget(hint)
 
-        self.list = _TwoColumnPriorityList()
+        self.list = _ThreeColumnPriorityList()
         self.list.setObjectName("priorityList")
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -639,6 +643,123 @@ class PriorityListEditor(QWidget):
         self.changed.emit()
 
 
+class _SeatChoiceBox(QCheckBox):
+    """Make the entire group cell an accessible click target."""
+
+    def hitButton(self, point: QPoint) -> bool:  # noqa: N802 - Qt API
+        return self.rect().contains(point)
+
+
+class GroupedSeatEditor(PriorityListEditor):
+    """Choose from permanent groups and sort the selected seats together."""
+
+    GROUPS = (
+        ("seated", "坐席", ("商务座", "特等座", "一等座", "二等座", "软座", "硬座", "无座")),
+        ("sleeper", "卧铺", ("高级软卧", "软卧", "硬卧")),
+    )
+
+    def __init__(self, all_values: Iterable[str] = SEAT_SPECS, parent: Optional[QWidget] = None) -> None:
+        self._all_values = list(dict.fromkeys(str(value) for value in all_values))
+        super().__init__((), parent)
+        self.groups: Dict[str, QToolButton] = {}
+        self.group_contents: Dict[str, QWidget] = {}
+        self.checkboxes: Dict[str, QCheckBox] = {}
+        groups_widget = QWidget()
+        groups_layout = QVBoxLayout(groups_widget)
+        groups_layout.setContentsMargins(0, 0, 0, 0)
+        groups_layout.setSpacing(6)
+        for key, label, values in self.GROUPS:
+            header = QToolButton()
+            header.setObjectName("seatGroupHeader")
+            header.setCheckable(True)
+            header.setChecked(True)
+            header.setText(label)
+            header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            header.setArrowType(Qt.ArrowType.DownArrow)
+            header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            header.setAccessibleName(f"展开或收起{label}")
+            groups_layout.addWidget(header)
+            content = QWidget()
+            grid = QGridLayout(content)
+            grid.setContentsMargins(16, 0, 0, 4)
+            for column in range(self.COLUMNS):
+                grid.setColumnStretch(column, 1)
+            for index, value in enumerate(value for value in values if value in self._all_values):
+                checkbox = _SeatChoiceBox(value)
+                checkbox.setMinimumHeight(32)
+                checkbox.setAccessibleName(f"选择{value}")
+                checkbox.toggled.connect(lambda checked, seat=value: self._toggle_seat(seat, checked))
+                grid.addWidget(checkbox, index // self.COLUMNS, index % self.COLUMNS)
+                self.checkboxes[value] = checkbox
+            header.toggled.connect(lambda expanded, group=key: self._set_group_expanded(group, expanded))
+            self.groups[key] = header
+            self.group_contents[key] = content
+            groups_layout.addWidget(content)
+        self.layout().insertWidget(0, groups_widget)
+        title = QLabel("已选席别与优先顺序")
+        title.setObjectName("fieldLabel")
+        self.layout().insertWidget(1, title)
+        self.empty_hint = QLabel("请在上方分组中勾选接受的席别。")
+        self.empty_hint.setObjectName("muted")
+        self.layout().addWidget(self.empty_hint)
+        self._sync_selection_controls()
+
+    def _set_group_expanded(self, key: str, expanded: bool) -> None:
+        header = self.groups[key]
+        header.setChecked(expanded)
+        header.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        self.group_contents[key].setVisible(expanded)
+
+    def adapt_to_trains(self, classification: Optional[str]) -> None:
+        """Keep user-controlled groups unchanged for older form callers."""
+
+    def focus_sleeper_group(self) -> None:
+        self._set_group_expanded("sleeper", True)
+        checkbox = self.checkboxes.get("硬卧")
+        if checkbox is not None:
+            checkbox.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _toggle_seat(self, value: str, checked: bool) -> None:
+        selected = self.values()
+        if checked and value not in selected:
+            selected.append(value)
+        elif not checked and value in selected:
+            selected.remove(value)
+        self.set_values(selected)
+
+    def set_values(self, values: Iterable[str]) -> None:
+        ordered = list(dict.fromkeys(str(value) for value in values if str(value) in self._all_values))
+        self._mutating = True
+        self.list.blockSignals(True)
+        try:
+            self.list.clear()
+            for value in ordered:
+                self.list.addItem(self._make_item(value, checked=True))
+        finally:
+            self.list.blockSignals(False)
+            self._mutating = False
+        self._refresh_priority_labels()
+        self._sync_list_height()
+        self._sync_selection_controls()
+        self.changed.emit()
+
+    def _on_item_changed(self, _item: QListWidgetItem) -> None:
+        if not self._mutating:
+            # Unchecking a selected row also removes it from this priority list.
+            self.set_values(self.values())
+
+    def _sync_selection_controls(self) -> None:
+        selected = self.values()
+        for value, checkbox in self.checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(value in selected)
+            checkbox.blockSignals(False)
+        for key, label, values in self.GROUPS:
+            count = sum(value in selected for value in values)
+            self.groups[key].setText(f"{label} · 已选 {count}" if count else label)
+        self.empty_hint.setVisible(not selected)
+
+
 class SeatMapWidget(QWidget):
     changed = Signal()
 
@@ -656,15 +777,26 @@ class SeatMapWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        guide = QLabel(
+        self.guide = QLabel(
             "选中与乘车人数相同的格子。“前排/后排”仅表示同一订单的两排相对关系，"
             "不代表行驶方向、车厢位置或真实排号。"
         )
-        guide.setObjectName("muted")
-        guide.setWordWrap(True)
-        layout.addWidget(guide)
+        self.guide.setObjectName("muted")
+        self.guide.setWordWrap(True)
+        layout.addWidget(self.guide)
 
+        self.inactive_hint = QLabel("座位偏好未启用：请先选择商务座、特等座、一等座或二等座。")
+        self.inactive_hint.setObjectName("muted")
+        self.inactive_hint.setWordWrap(True)
+        self.inactive_hint.hide()
+        layout.addWidget(self.inactive_hint)
+        self.grid = QWidget()
+        grid_layout = QVBoxLayout(self.grid)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(10)
+        layout.addWidget(self.grid)
         self.buttons: Dict[str, QToolButton] = {}
         for relation_row in (1, 2):
             seat_row = QHBoxLayout()
@@ -687,13 +819,28 @@ class SeatMapWidget(QWidget):
             right_window = QLabel("窗")
             right_window.setObjectName("windowMarker")
             seat_row.addWidget(right_window)
-            layout.addLayout(seat_row)
+            grid_layout.addLayout(seat_row)
+
+        self.availability_note = QLabel()
+        self.availability_note.setObjectName("muted")
+        self.availability_note.setWordWrap(True)
+        layout.addWidget(self.availability_note)
+        self.saved_summary = QLabel()
+        self.saved_summary.setObjectName("muted")
+        self.saved_summary.setWordWrap(True)
+        layout.addWidget(self.saved_summary)
+        self.clear_button = QPushButton("清空座位偏好")
+        self.clear_button.setEnabled(False)
+        self.clear_button.clicked.connect(lambda: self.set_positions(()))
+        layout.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignRight)
+        self._available_positions = set(self.buttons)
 
         self.fallback = QCheckBox("偏好无法满足时，接受 12306 自动分配")
         self.fallback.setChecked(True)
         self.fallback.setEnabled(False)
         self.fallback.setToolTip("平台在确认前无法可靠判断具体座位，因此固定保留降级策略")
         layout.addWidget(self.fallback)
+        self._refresh()
 
     def _seat_button(self, token: str) -> QToolButton:
         letter = token[1]
@@ -724,6 +871,32 @@ class SeatMapWidget(QWidget):
             else:
                 button.setText(f"{letter}\n{self.POSITION_LABELS[letter]}")
                 button.setChecked(False)
+        if hasattr(self, "saved_summary"):
+            saved = "、".join(self._selected) or "无"
+            self.saved_summary.setText(f"已保存座位偏好：{saved}")
+            unavailable = [value for value in self._selected if value not in self._available_positions]
+            if unavailable and self._available_positions:
+                self.saved_summary.setText(
+                    f"已保存座位偏好：{saved}；{'、'.join(unavailable)} 不适用于当前席别，请调整或清空。"
+                )
+            self.clear_button.setEnabled(bool(self._selected))
+
+    def set_available_positions(self, positions: Iterable[str], *, business: bool = False) -> None:
+        self._available_positions = set(positions)
+        active = bool(self._available_positions)
+        self.guide.setVisible(active)
+        self.fallback.setVisible(active)
+        self.grid.setVisible(active)
+        self.inactive_hint.setVisible(not active)
+        for token, button in self.buttons.items():
+            button.setEnabled(token in self._available_positions)
+            button.setVisible(token in self._available_positions)
+        self.availability_note.setText(
+            "仅显示所选席别可用的座位字母；商务座的 C 位是否提供，以实际车型为准。"
+            if business else "仅显示所选席别可用的座位字母；实际开放情况以下单时 12306 返回为准。"
+        )
+        self.availability_note.setVisible(active)
+        self._refresh()
 
     def positions(self) -> List[str]:
         return list(self._selected)
@@ -824,6 +997,13 @@ class BerthCountWidget(QWidget):
 
     def set_sleeper_available(self, available: bool) -> None:
         self.seat_type_hint.setVisible(not available)
+        self.seat_type_message.setText(
+            "铺位偏好未启用：请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。已填写数量会保留。"
+        )
+        for key, spin in self.spins.items():
+            spin.setEnabled(available)
+            self.minus_buttons[key].setEnabled(available)
+            self.plus_buttons[key].setEnabled(available)
 
     def _update_total(self) -> None:
         count = sum(spin.value() for spin in self.spins.values())
@@ -872,16 +1052,21 @@ class PositionPreferences(QWidget):
 
     def adapt_to_seats(self, seat_types: Iterable[str]) -> None:
         values = list(seat_types)
-        sleeper = any("卧" in value for value in values)
-        seated = any("座" in value and value != "无座" for value in values)
+        codes = {SEAT_SPECS[value].submit_code for value in values if value in SEAT_SPECS}
+        positions = {position for code in codes for position in seat_layout_positions(code, None)}
+        sleeper = bool(codes.intersection(BERTH_SEAT_TYPES))
+        seated = bool(positions)
+        self.seats.set_available_positions(positions, business="9" in codes)
         self.berths.set_sleeper_available(sleeper)
         # Keep both pages reachable so users can clear preferences left over
         # from another seat type. Validation can otherwise fail on a hidden,
         # disabled page with no way to repair the configuration.
         self.tabs.setTabEnabled(0, True)
         self.tabs.setTabEnabled(1, True)
-        self.tabs.setTabToolTip(0, "当前席别包含座席时生效" if not seated else "选择同一订单中的相对座位")
-        self.tabs.setTabToolTip(1, "当前席别包含卧铺时生效" if not sleeper else "设置下、中、上铺数量")
+        self.tabs.setTabText(0, "座位偏好" if seated else "座位偏好（未启用）")
+        self.tabs.setTabText(1, "铺位偏好" if sleeper else "铺位偏好（未启用）")
+        self.tabs.setTabToolTip(0, "未启用；已保存偏好不会提交" if not seated else "选择同一订单中的相对座位")
+        self.tabs.setTabToolTip(1, "未启用；已保存偏好不会提交" if not sleeper else "设置下、中、上铺数量")
         if sleeper and not seated:
             self.tabs.setCurrentIndex(1)
         elif seated and not sleeper and not any(self.berths.values().values()):

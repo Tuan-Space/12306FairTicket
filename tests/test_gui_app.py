@@ -87,20 +87,16 @@ def _png_bytes() -> bytes:
 
 
 def _click_seat(main_window: gui_app.MainWindow, qtbot, label: str) -> None:
-    seat_list = main_window.seat_types.list
-    main_window._focus_seat_types()
-    for row in range(seat_list.count()):
-        item = seat_list.item(row)
-        if item.data(Qt.ItemDataRole.UserRole) == label:
-            qtbot.mouseClick(seat_list.viewport(), Qt.MouseButton.LeftButton,
-                             pos=seat_list.visualItemRect(item).center())
-            return
-    raise AssertionError(f"Missing seat type: {label}")
+    main_window.seat_types.adapt_to_trains("all")
+    checkbox = main_window.seat_types.checkboxes[label]
+    main_window.basic_scroll.ensureWidgetVisible(checkbox)
+    QApplication.processEvents()
+    qtbot.mouseClick(checkbox, Qt.MouseButton.LeftButton)
 
 
 @pytest.mark.parametrize("sleeper", ["硬卧", "软卧", "高级软卧"])
 @pytest.mark.parametrize("mixed", [False, True])
-def test_real_sleeper_selection_repairs_berth_error_and_removal_restores_guidance(
+def test_real_sleeper_selection_activates_draft_and_removal_preserves_it(
     main_window: gui_app.MainWindow, qtbot, sleeper: str, mixed: bool
 ) -> None:
     main_window.show()
@@ -109,10 +105,9 @@ def test_real_sleeper_selection_repairs_berth_error_and_removal_restores_guidanc
     main_window.seat_types.set_values(["二等座"] if mixed else [])
     berths = main_window.position_preferences.berths
     main_window.position_preferences.tabs.setCurrentIndex(1)
-    berths.plus_buttons["lower"].click()
-    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    berths.set_values({"lower": 1})
+    assert "berth_preference" not in main_window._validate_all()
     assert not berths.seat_type_hint.isHidden()
-    assert "席别优先级" in main_window.field_messages["berth_preference"].text()
 
     _click_seat(main_window, qtbot, sleeper)
     qtbot.waitUntil(lambda: "berth_preference" not in main_window._last_validation_errors)
@@ -124,7 +119,7 @@ def test_real_sleeper_selection_repairs_berth_error_and_removal_restores_guidanc
 
     main_window.position_preferences.tabs.setCurrentIndex(1)
     _click_seat(main_window, qtbot, sleeper)
-    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    assert "berth_preference" not in main_window._validate_all()
     assert not berths.seat_type_hint.isHidden()
     assert main_window.position_preferences.tabs.currentIndex() == 1
     assert berths.values() == {"lower": 1, "middle": 0, "upper": 0}
@@ -140,15 +135,15 @@ def test_berth_guidance_navigates_to_seats_and_clear_keeps_seat_selection(
     original_seats = main_window.seat_types.values()
     main_window.position_preferences.tabs.setCurrentIndex(1)
     main_window.basic_scroll.ensureWidgetVisible(berths)
-    berths.plus_buttons["lower"].click()
-    qtbot.waitUntil(lambda: "berth_preference" in main_window._last_validation_errors)
+    berths.set_values({"lower": 1})
+    assert "berth_preference" not in main_window._validate_all()
     berths.select_seat_types_button.click()
     assert main_window.config_tabs.currentIndex() == 0
-    assert QApplication.focusWidget() is main_window.seat_types.list
+    target = main_window.seat_types.checkboxes["硬卧"]
+    qtbot.waitUntil(lambda: QApplication.focusWidget() is target)
     assert main_window.basic_scroll.viewport().rect().intersects(
-        main_window.seat_types.list.rect().translated(
-            main_window.seat_types.list.mapTo(main_window.basic_scroll.viewport(),
-                                            main_window.seat_types.list.rect().topLeft())
+        target.rect().translated(
+            target.mapTo(main_window.basic_scroll.viewport(), target.rect().topLeft())
         )
     )
     assert main_window.seat_types.values() == original_seats
@@ -163,6 +158,7 @@ def test_berth_guidance_navigates_to_seats_and_clear_keeps_seat_selection(
 def test_multi_value_form_collects_and_validates_the_same_lists(
     main_window: gui_app.MainWindow, separator: str
 ) -> None:
+    main_window.seat_types.set_values(["二等座"])
     main_window.passengers.setText(separator + separator.join([" 张三 ", "李四", "Mary Jane"]) + separator)
     main_window.preferred_trains.setText(separator.join(["g79", " D123 ", "k45"]))
     values = main_window._collect_mapping()
@@ -224,6 +220,7 @@ def test_live_validation_marks_only_touched_field_and_direct_dependencies(
 
 
 def test_train_checkbox_precedes_its_error_and_uses_one_error_boundary(main_window: gui_app.MainWindow, qtbot) -> None:
+    main_window._apply_mapping({**main_window._collect_mapping(), "only_preferred_trains": True})
     main_window.show()
     main_window._validate_all()
     qtbot.wait(20)
@@ -295,6 +292,7 @@ def test_save_and_import_buttons_round_trip_every_editable_setting(
     tmp_path: Path,
 ) -> None:
     target = tmp_path / "all-settings.json"
+    main_window.seat_types.set_values(["二等座"])
     main_window.passengers.setText("张三")
     main_window.preferred_trains.setText("G79")
     main_window.from_station.setText("北京西")
@@ -306,7 +304,7 @@ def test_save_and_import_buttons_round_trip_every_editable_setting(
     main_window._save_settings()
 
     document = json.loads(target.read_text(encoding="utf-8"))
-    assert document["version"] == 2
+    assert document["version"] == 3
     assert document["settings"]["query_interval_seconds"] == 1.25
     serialized = target.read_text(encoding="utf-8").lower()
     assert "session_file" not in serialized
@@ -375,13 +373,145 @@ def test_unknown_station_is_marked_and_clears_after_correction(main_window: gui_
     assert main_window.field_messages["from_station"].isHidden()
 
 
-def test_all_ten_seat_types_are_expanded_without_internal_scrolling(main_window: gui_app.MainWindow) -> None:
+def test_all_ten_seat_types_remain_available_and_selected_order_is_visible(main_window: gui_app.MainWindow) -> None:
     seat_list = main_window.seat_types.list
 
-    assert seat_list.count() == 10
+    assert len(main_window.seat_types.checkboxes) == 10
+    assert seat_list.count() == len(main_window.seat_types.values())
     assert seat_list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    expected_rows = (seat_list.count() + main_window.seat_types.COLUMNS - 1) // main_window.seat_types.COLUMNS
-    assert seat_list.height() >= expected_rows * main_window.seat_types.CELL_HEIGHT
+
+
+def test_new_draft_has_no_seats_and_empty_trains_allow_all_types(main_window):
+    main_window.passengers.setText("张三")
+    assert not hasattr(main_window, "empty_train_scope")
+    assert "empty_train_scope" not in main_window.field_widgets
+    assert main_window.seat_types.values() == []
+    assert main_window.seat_types.list.count() == 0
+    assert all(not checkbox.isChecked() for checkbox in main_window.seat_types.checkboxes.values())
+    assert main_window.position_preferences.seats.positions() == []
+    assert main_window.position_preferences.berths.values() == {"lower": 0, "middle": 0, "upper": 0}
+    assert not main_window.only_preferred.isChecked()
+    assert not main_window.only_preferred.isEnabled()
+    assert main_window._validate_all() == {"seat_types": "请至少选择一种席别"}
+    main_window.seat_types.set_values(["硬卧", "二等座"])
+    assert main_window._validate_all() == {}
+    assert main_window._build_current_config().empty_train_scope == "all"
+    assert "不限类型" in main_window.range_summary.text()
+    main_window.preferred_trains.setText("G123")
+    assert main_window.only_preferred.isEnabled()
+    assert "含其他类型列车" in main_window.range_summary.text()
+    main_window.only_preferred.setChecked(True)
+    assert "仅 G123" in main_window.range_summary.text()
+    main_window.preferred_trains.clear()
+    assert not main_window.only_preferred.isChecked()
+    assert not main_window.only_preferred.isEnabled()
+    assert main_window._collect_mapping()["empty_train_scope"] == "all"
+
+
+def test_auto_guidance_preserves_selection_order_and_both_preference_drafts(main_window):
+    main_window.passengers.setText("张三")
+    main_window.seat_types.set_values(["硬卧", "二等座", "硬座", "无座"])
+    main_window.position_preferences.seats.set_positions(["1A"])
+    main_window.position_preferences.berths.set_values({"lower": 1})
+    original = main_window._collect_mapping()
+    main_window.seat_types.groups["seated"].setChecked(False)
+    main_window.seat_types.groups["sleeper"].setChecked(True)
+    for trains in ("G123；D45", "K123、1461", "G123，K45", "G", "G123;;bad"):
+        main_window.preferred_trains.setText(trains)
+        assert not main_window.seat_types.groups["seated"].isChecked()
+        assert main_window.seat_types.groups["sleeper"].isChecked()
+        current = main_window._collect_mapping()
+        for key in ("seat_types", "seat_position_preferences", "berth_preference"):
+            assert current[key] == original[key]
+    assert "preferred_trains" in main_window._validate_all()
+    assert "修正车次格式" in main_window.range_summary.text()
+
+
+def test_priority_preview_changes_strategy_and_config_round_trips(main_window, tmp_path):
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("G123，G125")
+    main_window.only_preferred.setChecked(True)
+    main_window.seat_types.set_values(["二等座", "一等座"])
+    assert "G123 二等座 → G123 一等座 → G125 二等座" in main_window.order_preview.text()
+    main_window.priority_strategy.setCurrentIndex(main_window.priority_strategy.findData("seat_first"))
+    assert "G123 二等座 → G125 二等座 → G123 一等座" in main_window.order_preview.text()
+    assert main_window._build_current_config().priority_strategy == "seat_first"
+    target = tmp_path / "strategy.json"
+    main_window.config_store.save_file(target, main_window._collect_mapping())
+    assert json.loads(target.read_text(encoding="utf-8"))["version"] == 3
+    main_window.priority_strategy.setCurrentIndex(0)
+    errors, _ = main_window._apply_mapping(main_window.config_store.import_file(target))
+    assert not errors
+    assert main_window._validate_all() == {}
+    assert main_window.priority_strategy.currentData() == "seat_first"
+
+
+def test_imported_empty_exact_scope_is_not_silently_broadened(main_window):
+    main_window._apply_mapping({**main_window._collect_mapping(), "only_preferred_trains": True, "empty_train_scope": "all"})
+    assert main_window.only_preferred.isChecked()
+    assert main_window.only_preferred.isEnabled()  # one explicit uncheck repairs the imported draft
+    assert "preferred_trains" in main_window._validate_all()
+    main_window.only_preferred.click()
+    assert not main_window.only_preferred.isChecked()
+    assert not main_window.only_preferred.isEnabled()
+    assert "preferred_trains" not in main_window._validate_all()
+
+
+@pytest.mark.parametrize("scope", [None, "high_speed", "conventional", "future"])
+@pytest.mark.parametrize("preferred", [[], ["G1"]])
+def test_old_scope_import_is_normalized_and_explained(main_window, monkeypatch, tmp_path, scope, preferred):
+    path = tmp_path / "old-preview.json"
+    settings = {**main_window._collect_mapping(), "passenger_names": ["张三"], "seat_types": ["硬卧", "二等座"],
+                "preferred_trains": preferred, "empty_train_scope": scope}
+    path.write_text(json.dumps({"version": 3, "settings": settings}), encoding="utf-8")
+    monkeypatch.setattr(gui_app.QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
+    notices = []
+    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda _parent, _title, message: notices.append(message))
+    main_window._import_settings()
+    assert len(notices) == 1
+    assert "旧设置已转换为不限类型" in notices[0]
+    assert main_window.seat_types.values() == ["硬卧", "二等座"]
+    assert main_window._validate_all() == {}
+    assert main_window._build_current_config().empty_train_scope == "all"
+    assert "empty_train_scope" not in main_window.field_widgets
+    main_window.config_store.save_file(path, main_window._collect_mapping())
+    assert json.loads(path.read_text(encoding="utf-8"))["settings"]["empty_train_scope"] == "all"
+
+
+def test_empty_seat_validation_focuses_an_actionable_checkbox(main_window, qtbot):
+    main_window.show()
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("G123")
+    main_window.seat_types.set_values([])
+    assert "seat_types" in main_window._validate_all(focus_first=True)
+    target = main_window.seat_types.checkboxes["二等座"]
+    qtbot.waitUntil(lambda: QApplication.focusWidget() is target)
+    qtbot.keyClick(target, Qt.Key.Key_Space)
+    assert main_window.seat_types.values() == ["二等座"]
+    assert main_window._validate_all() == {}
+
+
+def test_inactive_preference_counts_do_not_block_until_reactivated(main_window):
+    main_window.passengers.setText("张三")
+    main_window.preferred_trains.setText("K123")
+    main_window.seat_types.set_values(["硬座"])
+    main_window.position_preferences.seats.set_positions(["1A", "1F"])
+    main_window.position_preferences.berths.set_values({"lower": 2})
+    assert main_window._validate_all() == {}
+    main_window._build_current_config()
+    main_window.seat_types.set_values(["二等座", "硬卧"])
+    errors = main_window._validate_all()
+    assert "seat_position_preferences" in errors
+    assert "berth_preference" in errors
+
+
+def test_new_policy_controls_are_locked_during_a_task(main_window):
+    main_window._set_forms_enabled(False)
+    assert not main_window.priority_strategy.isEnabled()
+    assert not main_window.seat_types.isEnabled()
+    main_window._set_forms_enabled(True)
+    assert main_window.priority_strategy.isEnabled()
+    assert not main_window.only_preferred.isEnabled()
 
 
 def test_station_update_is_disabled_and_not_started_while_task_runs(

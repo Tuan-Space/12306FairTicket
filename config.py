@@ -22,9 +22,14 @@ PASSENGER_NAMES = ["XXX"]
 SEAT_TYPES = ["二等座", "无座", "一等座"]
 
 
-# 车次设置。为空表示不限制车次。
+# 车次设置。可用 ,，、;；换行或制表符分隔，也可保留列表写法。
+# ONLY_PREFERRED_TRAINS=True 时清单不能为空；False 时其他类型车次也可备选。
 PREFERRED_TRAINS = ["G1561"]
 ONLY_PREFERRED_TRAINS = True
+# 仅在清单为空时生效：high_speed=高铁/动车，conventional=普通列车，all=不限类型。
+EMPTY_TRAIN_SCOPE = "all"
+# train_first=先车次再席别（兼容默认）；seat_first=先席别再车次。
+PRIORITY_STRATEGY = "train_first"
 
 
 # 定时设置。留空表示立即开始或不自动停止。
@@ -51,11 +56,13 @@ AUTO_SUBMIT = True
 # 座位位置偏好（不是具体排号）。每个乘车人选择一个关系格子，例如两人同排靠窗
 # 可填写 ["1A", "1F"]；可用字母会在下单时按席别和实际车型能力校验。
 # 12306 无法满足时会自动分配其他位置。留空表示不指定。
+# 未选择支持 ABCDF 的席别时，已保存的座位关系保留但不启用。
 SEAT_POSITION_PREFERENCES = []
 
 
 # 铺位数量偏好，顺序含义为下/中/上。三项之和应等于乘车人数；全 0 表示不指定。
 # 部分卧铺车型没有中铺，程序会依据 12306 实时返回的能力自动回退为系统分配。
+# 未选择卧铺席别时，已保存的数量保留但不启用。
 BERTH_PREFERENCE = {"lower": 0, "middle": 0, "upper": 0}
 
 

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Tuple
 import json5
 
 from .configuration import MONTH_NAMES, SEAT_SPECS, WEEKDAY_NAMES
+from .train_policy import HIGH_SPEED_PREFIXES
 
 
 def _display_stock(value: str) -> str:
@@ -13,7 +14,7 @@ def _display_stock(value: str) -> str:
 
 
 def _stock_available(value: str) -> bool:
-    return value not in {"", "--", "无", "*"}
+    return value not in {"", "--", "无", "*", "0"}
 
 
 def _is_terminal_order_failure(message: Any) -> bool:
@@ -36,7 +37,7 @@ def _resolve_submit_seat_code(seat_label: str, ticket: Dict[str, Any]) -> str:
     if seat_label != "无座":
         return SEAT_SPECS[seat_label].submit_code
     train_code = ticket["station_train_code"].upper()
-    return "O" if train_code.startswith(("G", "D", "C")) else "1"
+    return "O" if train_code.startswith(HIGH_SPEED_PREFIXES) else "1"
 
 
 def _format_queue_date(train_date: str) -> str:

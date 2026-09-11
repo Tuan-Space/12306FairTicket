@@ -9,10 +9,12 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 from .input_parsing import split_multi_value_text
 from .preferences import (
     BERTH_SEAT_TYPES,
+    SEATED_SEAT_TYPES,
     BerthPreference,
     SeatRelationPreference,
     seat_layout_positions,
 )
+from .train_policy import normalize_train_codes, validate_train_policy
 
 
 BASE_URL = "https://kyfw.12306.cn"
@@ -59,6 +61,13 @@ SEAT_SPECS: Dict[str, SeatSpec] = {
     "无座": SeatSpec("wz", ""),
 }
 
+
+def preference_capabilities(seat_types: Iterable[str]) -> tuple[bool, bool]:
+    """Return whether any selected seat supports seat relations or berths."""
+
+    codes = {SEAT_SPECS[label].submit_code for label in seat_types if label in SEAT_SPECS}
+    return bool(codes & SEATED_SEAT_TYPES), bool(codes & BERTH_SEAT_TYPES)
+
 WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -98,6 +107,8 @@ class AppConfig:
     log_level: str
     perf_log: bool
     config_path: Path
+    priority_strategy: str = "train_first"
+    empty_train_scope: str | None = "all"
 
     @property
     def seat_position_preferences(self) -> SeatRelationPreference:
@@ -168,7 +179,7 @@ class AppConfig:
             train_date=str(value("TRAIN_DATE", "")).strip(),
             passenger_names=_as_list(value("PASSENGER_NAMES", [])),
             seat_types=_as_list(value("SEAT_TYPES", [])),
-            preferred_trains=[item.upper() for item in _as_list(value("PREFERRED_TRAINS", []))],
+            preferred_trains=normalize_train_codes(value("PREFERRED_TRAINS", [])),
             only_preferred_trains=_as_bool(value("ONLY_PREFERRED_TRAINS", True), "ONLY_PREFERRED_TRAINS"),
             start_at=str(value("START_AT", "")).strip(),
             stop_at=str(value("STOP_AT", "")).strip(),
@@ -196,6 +207,8 @@ class AppConfig:
             log_level=str(value("LOG_LEVEL", "INFO")).upper(),
             perf_log=_as_bool(value("PERF_LOG", True), "PERF_LOG"),
             config_path=config_path,
+            priority_strategy=str(value("PRIORITY_STRATEGY", "train_first")),
+            empty_train_scope=value("EMPTY_TRAIN_SCOPE", "all"),
         )
         cfg.validate()
         return cfg
@@ -211,6 +224,8 @@ class AppConfig:
             "SEAT_TYPES": list(self.seat_types),
             "PREFERRED_TRAINS": list(self.preferred_trains),
             "ONLY_PREFERRED_TRAINS": self.only_preferred_trains,
+            "PRIORITY_STRATEGY": self.priority_strategy,
+            "EMPTY_TRAIN_SCOPE": self.empty_train_scope,
             "START_AT": self.start_at,
             "STOP_AT": self.stop_at,
             "PRE_QUERY_SECONDS": self.pre_query_seconds,
@@ -266,7 +281,14 @@ class AppConfig:
         if unsupported:
             supported = "、".join(SEAT_SPECS.keys())
             raise AppError(f"不支持的座席: {unsupported}；支持: {supported}")
-        if self.seat_relation_preference.enabled:
+        policy_errors = validate_train_policy(
+            self.preferred_trains, self.only_preferred_trains,
+            self.empty_train_scope, self.priority_strategy,
+        )
+        if policy_errors:
+            raise AppError(next(iter(policy_errors.values())))
+        has_seats, has_berths = preference_capabilities(self.seat_types)
+        if self.seat_relation_preference.enabled and has_seats:
             if not passenger_count:
                 raise AppError("设置座位位置偏好时必须填写 PASSENGER_NAMES")
             try:
@@ -282,16 +304,13 @@ class AppConfig:
                 if seat_layout_positions(code, None)
             ):
                 raise AppError("座位位置偏好与所选 SEAT_TYPES 的 ABCDF 布局均不兼容")
-        if self.berth_preference.enabled:
+        if self.berth_preference.enabled and has_berths:
             if not passenger_count:
                 raise AppError("设置铺位偏好时必须填写 PASSENGER_NAMES")
             try:
                 self.berth_preference.validate(passenger_count)
             except ValueError as exc:
                 raise AppError(str(exc)) from exc
-            configured_codes = {SEAT_SPECS[label].submit_code for label in self.seat_types}
-            if not configured_codes.intersection(BERTH_SEAT_TYPES):
-                raise AppError("BERTH_PREFERENCE 需要至少选择一种卧铺席别")
         if self.query_interval_seconds <= 0:
             raise AppError("QUERY_INTERVAL_SECONDS 必须大于 0")
         if self.pre_query_seconds < 0:

@@ -1,4 +1,4 @@
-"""Mouse and keyboard regressions for the two-column seat selector."""
+"""Mouse and keyboard regressions for the three-column seat selector."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def _point(editor, row: int, target: str) -> QPoint:
 
 
 @pytest.mark.parametrize("width", [500, 860])
-def test_all_seat_cells_remain_clickable_in_two_columns(seat_editor, qtbot, width):
+def test_all_seat_cells_remain_clickable_in_three_columns(seat_editor, qtbot, width):
     editor = seat_editor
     editor.resize(width, 240)
     QApplication.processEvents()
@@ -57,13 +57,17 @@ def test_all_seat_cells_remain_clickable_in_two_columns(seat_editor, qtbot, widt
     for row, rect in enumerate(rectangles):
         assert rect.width() >= editor.list.gridSize().width() - 2
         assert editor.list.indexAt(rect.center()).row() == row
-        if row % 2:
+        assert rect.right() < editor.list.viewport().width()
+        if row % 3:
             assert rect.top() == rectangles[row - 1].top()
             assert rect.left() >= rectangles[row - 1].right()
+        elif row:
+            assert rect.left() == rectangles[0].left()
+            assert rect.top() > rectangles[row - 1].bottom()
     assert rectangles[-1].bottom() < editor.list.viewport().height()
 
 
-@pytest.mark.parametrize("row", [0, 1, 8, 9])
+@pytest.mark.parametrize("row", range(10))
 @pytest.mark.parametrize("target", ["indicator", "label", "trailing_space"])
 def test_each_click_toggles_once_and_emits_once(seat_editor, qtbot, row, target):
     editor = seat_editor

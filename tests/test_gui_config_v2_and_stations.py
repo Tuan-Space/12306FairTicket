@@ -20,7 +20,7 @@ from ticket_app.gui.compat import (
 from ticket_app.gui.station_worker import StationRefreshWorker, refresh_station_cache
 
 
-def test_v2_round_trip_contains_all_editable_settings_and_no_sensitive_values(tmp_path: Path) -> None:
+def test_v3_round_trip_contains_all_editable_settings_and_no_sensitive_values(tmp_path: Path) -> None:
     target = tmp_path / "travel.json"
     values = {
         **DEFAULT_VALUES,
@@ -52,6 +52,49 @@ def test_v2_round_trip_contains_all_editable_settings_and_no_sensitive_values(tm
     assert restored["request_timeout_seconds"] == 13.5
     assert restored["persist_session"] is False
     assert restored["session_file"] == DEFAULT_VALUES["session_file"]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_migration_preserves_order_preferences_and_compatibility_defaults(tmp_path: Path, version: int) -> None:
+    legacy = tmp_path / "legacy.json"
+    settings = {
+        "passenger_names": ["测试甲", "Mary Ann"],
+        "preferred_trains": ["D9", "K1"],
+        "seat_types": ["软卧", "二等座", "硬座"],
+        "only_preferred_trains": False,
+        "seat_position_preferences": ["1A", "1F"],
+        "berth_preference": {"lower": 2, "middle": 0, "upper": 0},
+    }
+    legacy.write_text(json.dumps({"version": version, "values" if version == 1 else "settings": settings}), encoding="utf-8")
+    loaded = load_gui_settings(legacy)
+    for key, value in settings.items():
+        assert loaded[key] == value
+    assert loaded["empty_train_scope"] == "all"
+    assert loaded["priority_strategy"] == "train_first"
+    new_file = tmp_path / "migrated.json"
+    save_gui_settings(new_file, loaded)
+    assert json.loads(new_file.read_text(encoding="utf-8"))["version"] == 3
+    assert load_gui_settings(new_file) == loaded
+
+
+@pytest.mark.parametrize("scope", [None, "high_speed", "conventional", "all"])
+def test_v3_save_normalizes_removed_scope_and_keeps_priority_strategy(tmp_path: Path, scope: str | None) -> None:
+    path = tmp_path / "draft.json"
+    save_gui_settings(path, {**DEFAULT_VALUES, "empty_train_scope": scope, "priority_strategy": "seat_first"})
+    restored = load_gui_settings(path)
+    assert restored["empty_train_scope"] == "all"
+    assert restored["priority_strategy"] == "seat_first"
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("empty_train_scope", []), ("empty_train_scope", {}), ("empty_train_scope", True),
+    ("priority_strategy", []), ("priority_strategy", {}), ("priority_strategy", None),
+])
+def test_v3_policy_rejects_malformed_types_without_partial_import(tmp_path: Path, key: str, value) -> None:
+    path = tmp_path / "malformed-policy.json"
+    path.write_text(json.dumps({"version": 3, "settings": {key: value}}), encoding="utf-8")
+    with pytest.raises(AppError, match="字段类型无效"):
+        load_gui_settings(path)
 
 
 def test_v1_export_imports_and_unknown_v2_keys_are_ignored(tmp_path: Path) -> None:

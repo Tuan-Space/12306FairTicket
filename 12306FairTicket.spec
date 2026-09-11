@@ -13,10 +13,11 @@ from ticket_app import __version__
 project_root = Path(SPECPATH).resolve()
 entry_script = project_root / "gui.py"
 assets_dir = project_root / "assets"
-version_tuple = tuple(int(part) for part in __version__.split(".")) + (0,)
+version_tuple = tuple(int(part) for part in __version__.split(".")[:3]) + (0,)
 version_info = VSVersionInfo(
     ffi=FixedFileInfo(filevers=version_tuple, prodvers=version_tuple,
-                     mask=0x3F, flags=0, OS=0x40004, fileType=1, subtype=0, date=(0, 0)),
+                     mask=0x3F, flags=0x2 if ".dev" in __version__ else 0,
+                     OS=0x40004, fileType=1, subtype=0, date=(0, 0)),
     kids=[
         StringFileInfo([StringTable("040904B0", [
             StringStruct("CompanyName", "Tuan-Space"),

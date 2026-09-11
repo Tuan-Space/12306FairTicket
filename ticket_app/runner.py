@@ -1,7 +1,7 @@
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -12,6 +12,7 @@ from .helpers import _build_passenger_strings, _is_terminal_order_failure, _reso
 from .preferences import OrderPreferencePayload, build_order_preference_payload
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
 from .stations import StationStore
+from .train_policy import priority_preview, priority_sort_key, scope_summary, train_in_scope
 
 
 class TicketRunner:
@@ -72,6 +73,15 @@ class TicketRunner:
             self.cfg.train_date,
             ",".join(self.cfg.seat_types),
         )
+        logging.info("%s", scope_summary(
+            getattr(self.cfg, "preferred_trains", []), getattr(self.cfg, "only_preferred_trains", False),
+            getattr(self.cfg, "empty_train_scope", "all"),
+        ))
+        logging.info("尝试顺序示例：%s", priority_preview(
+            getattr(self.cfg, "preferred_trains", []), self.cfg.seat_types,
+            getattr(self.cfg, "priority_strategy", "train_first"),
+            getattr(self.cfg, "only_preferred_trains", False), getattr(self.cfg, "empty_train_scope", "all"),
+        ))
         first_query_perf = time.perf_counter()
         for attempt in range(1, self.cfg.max_retries + 1):
             self.cancel_token.checkpoint()
@@ -221,18 +231,13 @@ class TicketRunner:
         return self.cfg.query_interval_seconds
 
     def _find_candidates(self, tickets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        def sort_key(ticket: Dict[str, Any]) -> Tuple[int, int, str]:
-            train = ticket["station_train_code"].upper()
-            if not self.preferred_order:
-                return (0, 0, train)
-            if train in self.preferred_order:
-                return (0, self.preferred_order[train], train)
-            return (1, len(self.preferred_order), train)
-
         candidates: List[Dict[str, Any]] = []
-        for ticket in sorted(tickets, key=sort_key):
+        for ticket in tickets:
             train_code = ticket["station_train_code"].upper()
-            if self.cfg.preferred_trains and self.cfg.only_preferred_trains and train_code not in self.preferred_order:
+            if not train_in_scope(
+                train_code, self.cfg.preferred_trains, self.cfg.only_preferred_trains,
+                getattr(self.cfg, "empty_train_scope", "all"),
+            ):
                 continue
             if not ticket["can_buy"]:
                 continue
@@ -248,6 +253,12 @@ class TicketRunner:
                         "stock": stock,
                     }
                 )
+        seat_labels = [label for label, _spec in self.seat_sequence]
+        candidates.sort(key=lambda candidate: priority_sort_key(
+            candidate["ticket"]["station_train_code"], candidate["seat_label"],
+            self.cfg.preferred_trains, seat_labels,
+            getattr(self.cfg, "priority_strategy", "train_first"),
+        ))
         return candidates
 
     def _book_ticket(self, candidate: Dict[str, Any], prepared_passengers: Dict[str, PreparedPassengerSet]) -> bool:

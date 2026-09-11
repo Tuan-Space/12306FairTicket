@@ -114,12 +114,13 @@ def test_unfocused_clean_spin_boxes_ignore_wheel_changes(qtbot) -> None:
     assert not event.isAccepted()
 
 
-def test_priority_list_is_two_column_and_shows_selected_priority_rank(qtbot) -> None:
+def test_priority_list_is_three_column_and_shows_selected_priority_rank(qtbot) -> None:
     editor = PriorityListEditor([f"席别 {index}" for index in range(10)])
     qtbot.addWidget(editor)
     editor.set_values(["席别 4", "席别 2", "席别 4", "已废弃席别"])
 
     assert editor.list.count() == 10
+    assert editor.COLUMNS == 3
     assert editor.list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert editor.list.viewMode() == editor.list.ViewMode.IconMode
     assert editor.list.flow() == editor.list.Flow.LeftToRight

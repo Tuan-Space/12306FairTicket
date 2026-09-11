@@ -359,10 +359,10 @@ def build_order_preference_payload(
     seat_detail_type = "000"
     warnings = []
 
-    if seat_preference.enabled:
-        if seat_type not in SEATED_SEAT_TYPES:
-            warnings.append("座位位置偏好不适用于当前席别，已改为系统分配")
-        elif not capabilities.can_choose_seats:
+    # Retained preferences for another seat family are inactive, not a runtime
+    # downgrade. Only warn if an applicable preference is actually unavailable.
+    if seat_preference.enabled and seat_type in SEATED_SEAT_TYPES:
+        if not capabilities.can_choose_seats:
             warnings.append("12306未开放本次选座，已改为系统分配")
         elif seat_type not in capabilities.allowed_seat_types:
             warnings.append("12306未开放当前席别选座，已改为系统分配")
@@ -372,10 +372,8 @@ def build_order_preference_payload(
             except ValueError as exc:
                 warnings.append("%s；已改为系统分配" % exc)
 
-    if berth_preference.enabled:
-        if seat_type not in BERTH_SEAT_TYPES:
-            warnings.append("铺位偏好不适用于当前席别，已改为系统分配")
-        elif not capabilities.can_choose_beds:
+    if berth_preference.enabled and seat_type in BERTH_SEAT_TYPES:
+        if not capabilities.can_choose_beds:
             warnings.append(capabilities.berth_unavailable_message() + "，已改为系统分配")
         elif berth_preference.middle and not capabilities.can_choose_middle:
             warnings.append("当前列车/席别不支持中铺偏好，已改为系统分配")

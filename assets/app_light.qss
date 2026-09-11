@@ -110,6 +110,10 @@ QComboBox QAbstractItemView {
     selection-color: #184f8f;
 }
 
+QComboBox#priorityStrategy::down-arrow {
+    image: url(assets/chevron-down-light.svg);
+}
+
 QCalendarWidget#dateCalendar QWidget#qt_calendar_navigationbar {
     background: #edf1f5;
     border: 0;

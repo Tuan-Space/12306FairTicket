@@ -59,14 +59,14 @@ def test_supported_separators_are_shared_by_config_validation_and_json(
         assert config.passenger_names == canonical["passenger_names"]
         assert config.preferred_trains == canonical["preferred_trains"]
 
-    # Exercise import of raw text fields, then save the normalized v2 schema.
+    # Exercise legacy import of raw text fields, then save the normalized v3 schema.
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"version": 2, "settings": values}), encoding="utf-8")
     imported = load_gui_settings(path)
     assert validate(imported) == {}
     save_gui_settings(path, imported)
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["version"] == 2
+    assert document["version"] == 3
     assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS
     assert document["settings"]["passenger_names"] == canonical["passenger_names"]
     assert document["settings"]["preferred_trains"] == canonical["preferred_trains"]
@@ -172,4 +172,3 @@ def test_shared_text_parser_does_not_relax_existing_config_type_checks(
     values = valid_values(passenger_names="张三、李四", preferred_trains="g79；D123", **{key: value})
     with pytest.raises(AppError, match="配置字段类型无效"):
         save_gui_settings(tmp_path / "invalid-type.json", values)
-

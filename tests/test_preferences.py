@@ -48,6 +48,7 @@ def base_config_mapping(**updates):
         "PASSENGER_NAMES": ["甲"],
         "SEAT_TYPES": ["二等座"],
         "AUTO_SUBMIT": True,
+        "ONLY_PREFERRED_TRAINS": False,
     }
     mapping.update(updates)
     return mapping
@@ -148,7 +149,7 @@ class PreferenceModelTests(unittest.TestCase):
         self.assertEqual(payload.seat_detail_type, "000")
         self.assertTrue(payload.warnings)
 
-    def test_preferences_warn_when_candidate_seat_type_is_inapplicable(self):
+    def test_preferences_are_inactive_when_candidate_seat_type_is_inapplicable(self):
         payload = build_order_preference_payload(
             SeatRelationPreference.from_value(["1A"]),
             BerthPreference(lower=1),
@@ -158,8 +159,7 @@ class PreferenceModelTests(unittest.TestCase):
         )
         self.assertEqual(payload.choose_seats, "")
         self.assertEqual(payload.seat_detail_type, "000")
-        self.assertTrue(any("座位位置偏好不适用" in item for item in payload.warnings))
-        self.assertTrue(any("铺位偏好不适用" in item for item in payload.warnings))
+        self.assertEqual(payload.warnings, ())
 
     def test_passenger_count_is_limited_to_one_through_five(self):
         preference = SeatRelationPreference()
@@ -225,7 +225,7 @@ class AppConfigPreferenceTests(unittest.TestCase):
                 base_config_mapping(PASSENGER_NAMES=[str(index) for index in range(6)])
             )
 
-    def test_berth_preference_requires_matching_count_and_sleeper_type(self):
+    def test_berth_preference_requires_matching_count_only_for_sleeper_type(self):
         with self.assertRaisesRegex(AppError, "必须等于乘车人数"):
             AppConfig.from_mapping(
                 base_config_mapping(
@@ -234,10 +234,8 @@ class AppConfigPreferenceTests(unittest.TestCase):
                     BERTH_PREFERENCE={"lower": 1, "middle": 0, "upper": 0},
                 )
             )
-        with self.assertRaisesRegex(AppError, "卧铺席别"):
-            AppConfig.from_mapping(
-                base_config_mapping(BERTH_PREFERENCE={"lower": 1})
-            )
+        cfg = AppConfig.from_mapping(base_config_mapping(BERTH_PREFERENCE={"lower": 2}))
+        self.assertEqual(cfg.berth_preference.lower, 2)
 
 
 class RailwayClientPreferenceTests(unittest.TestCase):

@@ -32,7 +32,7 @@ else:
 RUNTIME_DIR = LOCAL_DATA_DIR
 PROFILE_FILE = RUNTIME_DIR / "gui_profiles.json"
 LEGACY_CONFIG_FILE = PROJECT_ROOT / "config.py"
-GUI_CONFIG_VERSION = 2
+GUI_CONFIG_VERSION = 3
 GUI_CONFIG_MAX_BYTES = 1_000_000
 STATION_CACHE_FILE = LOCAL_DATA_DIR / "stations.json"
 STATION_SNAPSHOT_FILE = PROJECT_ROOT / "assets" / "stations_snapshot.json"
@@ -78,6 +78,8 @@ CONFIG_KEY_MAP: Dict[str, str] = {
     "SEAT_TYPES": "seat_types",
     "PREFERRED_TRAINS": "preferred_trains",
     "ONLY_PREFERRED_TRAINS": "only_preferred_trains",
+    "PRIORITY_STRATEGY": "priority_strategy",
+    "EMPTY_TRAIN_SCOPE": "empty_train_scope",
     "START_AT": "start_at",
     "STOP_AT": "stop_at",
     "QUERY_INTERVAL_SECONDS": "query_interval_seconds",
@@ -117,6 +119,8 @@ DEFAULT_VALUES: Dict[str, Any] = {
     "seat_types": ["二等座", "无座", "一等座"],
     "preferred_trains": [],
     "only_preferred_trains": True,
+    "priority_strategy": "train_first",
+    "empty_train_scope": "all",
     "start_at": "10:00:00",
     "stop_at": "10:05:00",
     "query_interval_seconds": 0.6,
@@ -155,6 +159,7 @@ EDITABLE_SETTINGS_KEYS = frozenset(
     {
         "from_station", "to_station", "train_date", "passenger_names",
         "seat_types", "preferred_trains", "only_preferred_trains",
+        "priority_strategy", "empty_train_scope",
         "start_at", "stop_at", "query_interval_seconds", "max_retries",
         "pre_query_seconds", "hot_query_interval_seconds", "hot_window_seconds",
         "auto_submit", "seat_position_preferences", "berth_preference",
@@ -327,6 +332,7 @@ def build_app_config(values: Mapping[str, Any], config_path: Optional[Path] = No
     # Desktop policy: every process starts with a fresh QR login.  Runtime
     # state and diagnostics live under the user's local application-data path.
     canonical["persist_session"] = False
+    canonical["empty_train_scope"] = "all"
     canonical["session_file"] = str(RUNTIME_DIR / "session.cookies")
     canonical["station_cache_file"] = str(RUNTIME_DIR / "stations.json")
     canonical["qr_code_file"] = str(RUNTIME_DIR / "login_qr.png")
@@ -379,11 +385,11 @@ def profile_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
-    """Produce the complete, privacy-safe version 2 settings mapping.
+    """Produce the complete, privacy-safe version 3 settings mapping.
 
     Defaults are filled in intentionally: saving an unfinished form is valid,
-    and an imported v1 document receives the advanced settings introduced by
-    version 2.  Only the allow-listed keys can reach disk.
+    and imported v1/v2 documents receive compatibility defaults. Only the
+    allow-listed keys can reach disk.
     """
 
     canonical = canonical_mapping(values)
@@ -419,6 +425,10 @@ def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
         for key in boolean_keys:
             if not isinstance(payload[key], bool):
                 raise ValueError("必须是布尔值")
+        if not isinstance(payload["priority_strategy"], str):
+            raise ValueError("priority_strategy 必须是字符串")
+        if payload["empty_train_scope"] is not None and not isinstance(payload["empty_train_scope"], str):
+            raise ValueError("empty_train_scope 必须是字符串或 null")
     except (TypeError, ValueError, OverflowError) as exc:
         raise AppError(f"配置字段类型无效: {exc}") from exc
     return payload
@@ -472,16 +482,18 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
 
 
 def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
-    """Save all editable GUI settings as a version 2 document atomically."""
+    """Save all editable GUI settings as a version 3 document atomically."""
 
+    canonical = canonical_mapping(values)
+    canonical["empty_train_scope"] = "all"
     _atomic_write_json(
         path,
-        {"version": GUI_CONFIG_VERSION, "settings": editable_settings_payload(values)},
+        {"version": GUI_CONFIG_VERSION, "settings": editable_settings_payload(canonical)},
     )
 
 
 def load_gui_settings(path: Path) -> Dict[str, Any]:
-    """Import a version 2 document or a safe subset of the legacy version 1.
+    """Import version 3, version 2, or a safe subset of legacy version 1.
 
     Version 1 exports used ``values`` and contain only the former profile
     fields.  Old named-profile database documents are intentionally not
@@ -493,10 +505,10 @@ def load_gui_settings(path: Path) -> Dict[str, Any]:
     version = document.get("version")
     if type(version) is not int:
         raise AppError("配置 JSON 缺少整数 version")
-    if version == GUI_CONFIG_VERSION:
+    if version in (2, GUI_CONFIG_VERSION):
         settings = document.get("settings")
         if not isinstance(settings, Mapping):
-            raise AppError("version 2 配置的 settings 必须是对象")
+            raise AppError(f"version {version} 配置的 settings 必须是对象")
         return canonical_mapping(editable_settings_payload(settings))
     if version == 1:
         settings = document.get("values")

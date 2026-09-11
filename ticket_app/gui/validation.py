@@ -11,21 +11,18 @@ import re
 from datetime import date, datetime
 from typing import Any, Iterable, Mapping
 
-from ticket_app.configuration import SEAT_SPECS
+from ticket_app.configuration import SEAT_SPECS, preference_capabilities
 from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.preferences import (
-    BERTH_SEAT_TYPES,
     BerthPreference,
     SeatRelationPreference,
     seat_layout_positions,
 )
 
 from .compat import DEFAULT_VALUES
+from ticket_app.train_policy import TRAIN_CODE_PATTERN, validate_train_policy
 
 
-# Passenger train identifiers are normally one prefix letter plus digits, but
-# conventional services may be shown as digits only (for example 1461).
-TRAIN_CODE_PATTERN = re.compile(r"^(?:[A-Z][0-9]{1,5}|[0-9]{1,5})$")
 VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
@@ -142,11 +139,10 @@ def validate_gui_mapping(
         errors["passenger_names"] = "乘车人不能重复"
 
     preferred = _string_list(_field_value(values, "preferred_trains"))
-    invalid_train = next((train for train in preferred if not TRAIN_CODE_PATTERN.fullmatch(train.upper())), None)
-    if invalid_train:
-        errors["preferred_trains"] = f"车次“{invalid_train}”格式不正确，例如 G123"
-    elif bool(_field_value(values, "only_preferred_trains")) and not preferred:
-        errors["preferred_trains"] = "已选择“只尝试上述车次”，请至少填写一个车次"
+    errors.update(validate_train_policy(
+        preferred, bool(_field_value(values, "only_preferred_trains")),
+        "all", _field_value(values, "priority_strategy"),
+    ))
 
     seat_types = _string_list(_field_value(values, "seat_types"))
     invalid_seats = [seat for seat in seat_types if seat not in SEAT_SPECS]
@@ -154,6 +150,7 @@ def validate_gui_mapping(
         errors["seat_types"] = "请至少选择一种席别"
     elif invalid_seats:
         errors["seat_types"] = f"不支持的席别：{'、'.join(invalid_seats)}"
+    has_seats, has_berths = preference_capabilities(seat_types)
 
     if "seat_position_preferences" in values:
         raw_positions = values["seat_position_preferences"]
@@ -166,7 +163,7 @@ def validate_gui_mapping(
     except ValueError as exc:
         errors["seat_position_preferences"] = str(exc)
     else:
-        if positions.enabled:
+        if positions.enabled and has_seats:
             if not 1 <= passenger_count <= 5:
                 errors["seat_position_preferences"] = "设置座位关系前，请填写 1 到 5 位乘车人"
             else:
@@ -189,7 +186,7 @@ def validate_gui_mapping(
     except ValueError as exc:
         errors["berth_preference"] = str(exc)
     else:
-        if berths.enabled:
+        if berths.enabled and has_berths:
             if not 1 <= passenger_count <= 5:
                 errors["berth_preference"] = "设置铺位偏好前，请填写 1 到 5 位乘车人"
             else:
@@ -197,10 +194,6 @@ def validate_gui_mapping(
                     berths.validate(passenger_count)
                 except ValueError as exc:
                     errors["berth_preference"] = str(exc)
-                else:
-                    configured_codes = {SEAT_SPECS[label].submit_code for label in seat_types if label in SEAT_SPECS}
-                    if not configured_codes.intersection(BERTH_SEAT_TYPES):
-                        errors["berth_preference"] = "请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。"
 
     for key, label, minimum, maximum, inclusive, integer in (
         ("query_interval_seconds", "查询间隔", 0, 60, False, False),

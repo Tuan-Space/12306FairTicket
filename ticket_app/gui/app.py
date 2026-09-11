@@ -44,6 +44,8 @@ from PySide6.QtWidgets import (
 from ticket_app import __version__
 from ticket_app.configuration import AppConfig, AppError, SEAT_SPECS
 from ticket_app.input_parsing import split_multi_value_text
+from ticket_app.preferences import BERTH_SEAT_TYPES, SEATED_SEAT_TYPES
+from ticket_app.train_policy import classify_train_codes, priority_preview, scope_summary
 
 from .compat import (
     DEFAULT_VALUES,
@@ -67,7 +69,7 @@ from .widgets import (
     HelpLabel,
     LogView,
     PositionPreferences,
-    PriorityListEditor,
+    GroupedSeatEditor,
     TimeFieldsWidget,
     set_validation_state,
 )
@@ -196,7 +198,7 @@ class MainWindow(QMainWindow):
         title_box = QVBoxLayout()
         title = QLabel("12306 Fair Ticket")
         title.setObjectName("appTitle")
-        subtitle = QLabel("校时、热身、偏好选座，所有运行状态一目了然")
+        subtitle = QLabel(f"v{__version__} · 车次范围、席别顺序与位置偏好")
         subtitle.setObjectName("muted")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -236,13 +238,13 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         self.save_settings_button = QPushButton("保存为…")
         self.save_settings_button.setToolTip(
-            "保存全部可编辑参数为 version 2 JSON；允许保存未完成草稿。"
+            "保存全部可编辑参数为 version 3 JSON；允许保存未完成草稿。"
             "不会保存 Cookie、Token、二维码、证件、手机号或本机路径。"
         )
         self.save_settings_button.clicked.connect(self._save_settings)
         self.import_settings_button = QPushButton("导入…")
         self.import_settings_button.setToolTip(
-            "仅导入 JSON，兼容 version 1 和 version 2；导入后会立即检查并标出问题字段。"
+            "仅导入 JSON，兼容 version 1、version 2 和 version 3；导入后会立即检查并标出问题字段。"
         )
         self.import_settings_button.clicked.connect(self._import_settings)
         layout.addWidget(self.save_settings_button)
@@ -320,7 +322,7 @@ class MainWindow(QMainWindow):
         scroll, _page, layout = _scroll_page()
         self.basic_scroll = scroll
 
-        trip = Card("行程与时间", "站名需与 12306 显示完全一致。")
+        trip = Card("行程与乘车人", "站名需与 12306 显示完全一致；乘车人只填写姓名。")
         trip_grid = QGridLayout()
         trip_grid.setHorizontalSpacing(8)
         trip_grid.setVerticalSpacing(10)
@@ -386,12 +388,6 @@ class MainWindow(QMainWindow):
         trip.body.addLayout(trip_grid)
         layout.addWidget(trip)
 
-        people = Card("乘车人与抢票顺序", "只保存常用乘车人姓名，不存储身份证号和手机号。")
-        people_grid = QGridLayout()
-        people_grid.setHorizontalSpacing(10)
-        people_grid.setVerticalSpacing(10)
-        people_grid.setColumnStretch(0, 1)
-        people_grid.setColumnStretch(1, 1)
         self.passengers = QLineEdit()
         self.passengers.setPlaceholderText("张三，李四（最多 5 人）")
         self.passengers.setClearButtonEnabled(True)
@@ -399,24 +395,17 @@ class MainWindow(QMainWindow):
             "自动提交时填写 1–5 个已在当前 12306 账户中的姓名；仅监控可留空。"
             "多个姓名可用中英文逗号、顿号、中英文分号、换行或制表符分隔。"
         )
+        trip.body.addWidget(self._field_block("passenger_names", "乘车人", self.passengers))
+        people = Card("车次范围", "车次留空时不限类型，按已选席别查询；实际尝试范围以下方说明为准。")
         self.preferred_trains = QLineEdit()
         self.preferred_trains.setPlaceholderText("G79, G95（从左到右优先）")
         self.preferred_trains.setClearButtonEnabled(True)
         self.preferred_trains.setToolTip(
             "多个车次可用中英文逗号、顿号、中英文分号、换行或制表符分隔，"
-            "程序按填写顺序优先尝试。"
+            "车次优先时先按填写顺序尝试；席别优先时，在同一席别内按填写顺序尝试。"
         )
         self.only_preferred = QCheckBox("只尝试上述车次")
         self.only_preferred.setToolTip("勾选后不会尝试优先车次输入框以外的其他车次。")
-        people_grid.addWidget(
-            self._field_block(
-                "passenger_names",
-                "乘车人",
-                self.passengers,
-            ),
-            0,
-            0,
-        )
         train_editor = QWidget()
         train_layout = QVBoxLayout(train_editor)
         train_layout.setContentsMargins(0, 0, 0, 0)
@@ -429,9 +418,15 @@ class MainWindow(QMainWindow):
             train_editor,
         )
         self.field_widgets["preferred_trains"] = self.preferred_trains
-        people_grid.addWidget(train_block, 0, 1)
-        people.body.addLayout(people_grid)
-        self.seat_types = PriorityListEditor(SEAT_SPECS.keys())
+        people.body.addWidget(train_block)
+        self.range_summary = QLabel()
+        self.range_summary.setWordWrap(True)
+        self.range_summary.setObjectName("muted")
+        people.body.addWidget(self.range_summary)
+        layout.addWidget(people)
+
+        seating = Card("席别与优先顺序", "勾选可接受的席别，再排列顺序；切换车次不会更改已选席别。")
+        self.seat_types = GroupedSeatEditor(SEAT_SPECS.keys())
         self.seat_types.changed.connect(self._seat_types_changed)
         seat_block = self._field_block(
             "seat_types",
@@ -439,12 +434,21 @@ class MainWindow(QMainWindow):
             self.seat_types,
         )
         self.field_widgets["seat_types"] = self.seat_types.list
-        people.body.addWidget(seat_block)
-        layout.addWidget(people)
+        seating.body.addWidget(seat_block)
+        self.priority_strategy = QComboBox()
+        self.priority_strategy.setObjectName("priorityStrategy")
+        self.priority_strategy.addItem("车次优先：先选车次，再选席别", "train_first")
+        self.priority_strategy.addItem("席别优先：先选席别，再选车次", "seat_first")
+        seating.body.addWidget(self._field_block("priority_strategy", "尝试策略", self.priority_strategy))
+        self.order_preview = QLabel()
+        self.order_preview.setWordWrap(True)
+        self.order_preview.setObjectName("muted")
+        seating.body.addWidget(self.order_preview)
+        layout.addWidget(seating)
 
         position = Card("座位与铺位偏好", "偏好只提交一次；若 12306 未开放或无法满足，订单仍保留并由系统分配其他位置。")
         self.position_preferences = PositionPreferences()
-        self.position_preferences.berths.select_seat_types_requested.connect(self._focus_seat_types)
+        self.position_preferences.berths.select_seat_types_requested.connect(self._focus_sleeper_seats)
         position_block = self._field_block(
             "seat_position_preferences",
             "",
@@ -481,8 +485,9 @@ class MainWindow(QMainWindow):
         self.passengers.textChanged.connect(
             lambda: self._schedule_validation("passenger_names", "seat_position_preferences", "berth_preference")
         )
-        self.preferred_trains.textChanged.connect(lambda: self._schedule_validation("preferred_trains"))
-        self.only_preferred.toggled.connect(lambda: self._schedule_validation("preferred_trains"))
+        self.preferred_trains.textChanged.connect(self._train_inputs_changed)
+        self.only_preferred.toggled.connect(self._train_inputs_changed)
+        self.priority_strategy.currentIndexChanged.connect(self._strategy_changed)
         self.seat_types.changed.connect(
             lambda: self._schedule_validation("seat_types", "seat_position_preferences", "berth_preference")
         )
@@ -700,7 +705,9 @@ class MainWindow(QMainWindow):
 
     # ----- JSON settings and configuration -------------------------------
     def _load_initial_values(self) -> None:
-        self._apply_mapping(DEFAULT_VALUES)
+        self._apply_mapping({**DEFAULT_VALUES, "seat_types": [], "seat_position_preferences": [],
+                             "berth_preference": {"lower": 0, "middle": 0, "upper": 0},
+                             "empty_train_scope": "all", "only_preferred_trains": False})
 
     def _save_settings(self) -> None:
         name, _filter = QFileDialog.getSaveFileName(
@@ -719,7 +726,7 @@ class MainWindow(QMainWindow):
         except (AppError, OSError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        logging.info("已保存 version 2 JSON 配置: %s", path)
+        logging.info("已保存 version 3 JSON 配置: %s", path)
         QMessageBox.information(self, "保存成功", "已保存全部可编辑参数；文件不包含登录态或身份信息。")
 
     def _import_settings(self) -> None:
@@ -736,11 +743,12 @@ class MainWindow(QMainWindow):
         logging.info("已导入 JSON 配置: %s", name)
         if warnings:
             logging.warning("；".join(warnings))
+        migration_note = "\n\n" + "\n".join(warnings) if warnings else ""
         if errors:
             self._focus_first_error(errors)
-            QMessageBox.warning(self, "配置已导入", f"已导入，但有 {len(errors)} 项需要修改；已标出第一个问题。")
+            QMessageBox.warning(self, "配置已导入", f"已导入，但有 {len(errors)} 项需要修改；已标出第一个问题。" + migration_note)
         else:
-            QMessageBox.information(self, "导入成功", "全部可编辑参数已载入并通过字段检查。")
+            QMessageBox.information(self, "导入成功", "全部可编辑参数已载入并通过字段检查。" + migration_note)
 
     def _collect_mapping(self) -> Dict[str, Any]:
         values: Dict[str, Any] = {
@@ -751,6 +759,8 @@ class MainWindow(QMainWindow):
             "seat_types": self.seat_types.values(),
             "preferred_trains": [item.upper() for item in _split_names(self.preferred_trains.text())],
             "only_preferred_trains": self.only_preferred.isChecked(),
+            "empty_train_scope": "all",
+            "priority_strategy": self.priority_strategy.currentData(),
             "start_at": self.start_at.text().strip(),
             "stop_at": self.stop_at.text().strip(),
             "auto_submit": self.auto_submit.isChecked(),
@@ -779,6 +789,8 @@ class MainWindow(QMainWindow):
         values = canonical_mapping(raw_values)
         import_errors: Dict[str, str] = {}
         warnings: list[str] = []
+        if values.get("empty_train_scope") != "all":
+            warnings.append("已移除“未指定车次时的范围”：旧设置已转换为不限类型，车次留空时按已选席别查询所有列车。")
         self._applying_values = True
         try:
             self.from_station.setText(str(values["from_station"]))
@@ -791,6 +803,14 @@ class MainWindow(QMainWindow):
             self.passengers.setText("，".join(values["passenger_names"]))
             self.preferred_trains.setText(", ".join(values["preferred_trains"]))
             self.only_preferred.setChecked(bool(values["only_preferred_trains"]))
+            for key, combo in (("priority_strategy", self.priority_strategy),):
+                index = combo.findData(values.get(key))
+                if index < 0:
+                    # Retain invalid imported values as an explicit item so a
+                    # later validation cannot silently accept a different rule.
+                    combo.addItem(f"无效设置：{values.get(key)}", values.get(key))
+                    index = combo.count() - 1
+                combo.setCurrentIndex(index)
             for key, editor in (("start_at", self.start_at), ("stop_at", self.stop_at)):
                 raw_time = str(values[key] or "").strip()
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw_time):
@@ -829,6 +849,7 @@ class MainWindow(QMainWindow):
                 elif isinstance(widget, QCheckBox):
                     widget.setChecked(bool(value))
             self._seat_types_changed()
+            self._refresh_train_guidance()
             self._target_edited()
         finally:
             self._applying_values = False
@@ -929,6 +950,12 @@ class MainWindow(QMainWindow):
         elif key == "berth_preference":
             self.position_preferences.tabs.setCurrentIndex(1)
             focus_target = self.position_preferences.berths.spins["lower"]
+        elif key == "seat_types" and not self.seat_types.values():
+            classification = classify_train_codes(_split_names(self.preferred_trains.text()))
+            ordinary = classification == "conventional"
+            self.seat_types.groups["sleeper" if ordinary else "seated"].setChecked(True)
+            focus_target = self.seat_types.checkboxes["硬卧" if ordinary else "二等座"]
+            scroll.ensureWidgetVisible(focus_target, 24, 24)
         elif isinstance(widget, TimeFieldsWidget):
             focus_target = widget.parts[0]
         else:
@@ -975,16 +1002,21 @@ class MainWindow(QMainWindow):
 
         seat_positions = self.position_preferences.seats.positions()
         berths = self.position_preferences.berths.values()
-        position_text = "无指定"
-        if seat_positions:
-            position_text = "座位关系 " + "/".join(seat_positions)
-        elif sum(berths.values()):
-            position_text = f"下/中/上铺 {berths['lower']}/{berths['middle']}/{berths['upper']}"
+        codes = {SEAT_SPECS[label].submit_code for label in cfg.seat_types}
+        position_parts = []
+        if seat_positions and codes.intersection(SEATED_SEAT_TYPES):
+            position_parts.append("座位关系 " + "/".join(seat_positions))
+        if sum(berths.values()) and codes.intersection(BERTH_SEAT_TYPES):
+            position_parts.append(f"下/中/上铺 {berths['lower']}/{berths['middle']}/{berths['upper']}")
+        position_text = "；".join(position_parts) or "无启用的偏好"
         summary = (
             f"{cfg.from_station} → {cfg.to_station}   {cfg.train_date}\n"
             f"乘车人：{'、'.join(cfg.passenger_names) or '仅监控'}\n"
-            f"车次：{', '.join(cfg.preferred_trains) or '不限'}\n"
+            f"优先车次：{', '.join(cfg.preferred_trains) or '未指定'}\n"
+            f"{scope_summary(cfg.preferred_trains, cfg.only_preferred_trains, cfg.empty_train_scope)}\n"
             f"席别：{' → '.join(cfg.seat_types)}\n"
+            f"策略：{'席别优先' if cfg.priority_strategy == 'seat_first' else '车次优先'}\n"
+            f"尝试顺序示例：{priority_preview(cfg.preferred_trains, cfg.seat_types, cfg.priority_strategy, cfg.only_preferred_trains, cfg.empty_train_scope)}\n"
             f"位置：{position_text}（无法满足时自动分配）\n"
             f"模式：{'自动提交' if cfg.auto_submit else '仅监控'}"
         )
@@ -1372,11 +1404,52 @@ class MainWindow(QMainWindow):
 
     def _seat_types_changed(self) -> None:
         self.position_preferences.adapt_to_seats(self.seat_types.values())
+        self._refresh_order_preview()
+
+    def _train_inputs_changed(self, *_args: object) -> None:
+        if self._applying_values:
+            return
+        if self.sender() is self.preferred_trains and not _split_names(self.preferred_trains.text()):
+            self.only_preferred.setChecked(False)
+        self._refresh_train_guidance()
+        self._schedule_validation("preferred_trains")
+
+    def _strategy_changed(self, *_args: object) -> None:
+        if not self._applying_values:
+            self._refresh_order_preview()
+            self._schedule_validation("priority_strategy")
+
+    def _refresh_train_guidance(self) -> None:
+        preferred = _split_names(self.preferred_trains.text())
+        # An invalid legacy checked/empty configuration stays repairable: the
+        # user may uncheck it, but cannot check it again without entering trains.
+        self.only_preferred.setEnabled(bool(preferred) or self.only_preferred.isChecked())
+        classification = classify_train_codes(preferred)
+        labels = {"high_speed": "高铁/动车", "conventional": "普通列车", "all": "高铁/动车与普通列车"}
+        detected = f"已识别：{labels[classification]}\n" if classification in labels else ""
+        self.range_summary.setText(detected + scope_summary(preferred, self.only_preferred.isChecked(), "all"))
+        self._refresh_order_preview()
+
+    def _refresh_order_preview(self) -> None:
+        self.order_preview.setText(
+            "尝试顺序示例\n" + priority_preview(
+                _split_names(self.preferred_trains.text()), self.seat_types.values(),
+                self.priority_strategy.currentData(), self.only_preferred.isChecked(),
+                "all",
+            )
+        )
 
     def _focus_seat_types(self) -> None:
         self.config_tabs.setCurrentIndex(0)
         self.basic_scroll.ensureWidgetVisible(self.field_blocks["seat_types"], 24, 24)
         self.seat_types.list.setFocus()
+
+    def _focus_sleeper_seats(self) -> None:
+        self.config_tabs.setCurrentIndex(0)
+        self.seat_types.focus_sleeper_group()
+        target = self.seat_types.checkboxes["硬卧"]
+        self.basic_scroll.ensureWidgetVisible(target, 24, 24)
+        QTimer.singleShot(0, target.setFocus)
 
     def _swap_stations(self) -> None:
         left, right = self.from_station.text(), self.to_station.text()
@@ -1393,6 +1466,7 @@ class MainWindow(QMainWindow):
             self.passengers,
             self.preferred_trains,
             self.only_preferred,
+            self.priority_strategy,
             self.start_at,
             self.stop_at,
             self.seat_types,
@@ -1400,7 +1474,7 @@ class MainWindow(QMainWindow):
             self.auto_submit,
             self.save_settings_button,
             self.import_settings_button,
-        ):
+    ):
             widget.setEnabled(enabled)
         for widget in self.advanced.values():
             widget.setEnabled(enabled)
@@ -1408,6 +1482,8 @@ class MainWindow(QMainWindow):
             enabled and not bool(self.station_refresh_worker and self.station_refresh_worker.is_alive())
         )
         self.reset_advanced_button.setEnabled(enabled)
+        if enabled:
+            self._refresh_train_guidance()
 
     def _open_order_page(self) -> None:
         QDesktopServices.openUrl(QUrl(ORDER_URL))
@@ -1444,15 +1520,17 @@ def _load_stylesheet(application: QApplication, dark_override: Optional[bool] = 
         else dark_override
     )
     try:
-        check_icon = (ASSET_DIR / "check.svg").as_posix()
-        base = APP_QSS.read_text(encoding="utf-8").replace(
-            "url(assets/check.svg)", f'url("{check_icon}")'
-        )
+        def with_asset_paths(stylesheet: str) -> str:
+            for name in ("check.svg", "chevron-down-dark.svg", "chevron-down-light.svg"):
+                stylesheet = stylesheet.replace(
+                    f"url(assets/{name})", f'url("{(ASSET_DIR / name).as_posix()}")'
+                )
+            return stylesheet
+
+        base = with_asset_paths(APP_QSS.read_text(encoding="utf-8"))
         if is_dark:
             return base
-        light = (ASSET_DIR / "app_light.qss").read_text(encoding="utf-8").replace(
-            "url(assets/check.svg)", f'url("{check_icon}")'
-        )
+        light = with_asset_paths((ASSET_DIR / "app_light.qss").read_text(encoding="utf-8"))
         return base + "\n" + light
     except OSError:
         return ""

@@ -126,6 +126,45 @@ def test_no_seat_never_reuses_the_o_code_as_a_physical_seat_preference():
 
     assert runner._book_ticket(candidate("无座", "O"), {"O": passengers()}) is True
     assert client.preference_payload.choose_seats == ""
+    assert not any(event.kind == "preference_fallback" for event in runner.events)
+
+
+@pytest.mark.parametrize(("train", "label", "code", "seat_detail", "choose_seats"), [
+    ("G1", "二等座", "O", "000", "1A1F"),
+    ("D1", "硬卧", "3", "200", ""),
+    ("D1", "软卧", "4", "200", ""),
+    ("K1", "高级软卧", "6", "200", ""),
+    ("K1", "硬座", "1", "000", ""),
+    ("K1", "软座", "2", "000", ""),
+    ("G1", "无座", "O", "000", ""),
+])
+def test_mixed_preferences_apply_only_to_each_actual_candidate(train, label, code, seat_detail, choose_seats):
+    capabilities = OrderCapabilities.from_mapping(
+        {"canChooseSeats": "Y", "choose_Seats": "O", "canChooseBeds": "Y", "isCanChooseMid": "N"}
+    )
+    client = FakeBookingClient(capabilities)
+    runner = make_runner(client, seat=SeatRelationPreference.from_value(["1A", "1F"]), berth=BerthPreference(lower=2))
+    selected = candidate(label, code)
+    selected["ticket"]["station_train_code"] = train
+    assert runner._book_ticket(selected, {code: passengers()}) is True
+    assert client.preference_payload.choose_seats == choose_seats
+    assert client.preference_payload.seat_detail_type == seat_detail
+    assert client.preference_payload.warnings == ()
+    assert not any(event.kind == "preference_fallback" for event in runner.events)
+
+
+@pytest.mark.parametrize(("label", "code", "expected_warning"), [
+    ("二等座", "O", "未开放本次选座"),
+    ("软卧", "4", "未开放在线选铺"),
+])
+def test_applicable_runtime_capability_denial_keeps_fallback_warning(label, code, expected_warning):
+    client = FakeBookingClient(OrderCapabilities())
+    runner = make_runner(client, seat=SeatRelationPreference.from_value(["1A", "1F"]), berth=BerthPreference(lower=2))
+    assert runner._book_ticket(candidate(label, code), {code: passengers()}) is True
+    assert client.preference_payload.choose_seats == ""
+    assert client.preference_payload.seat_detail_type == "000"
+    assert len(client.preference_payload.warnings) == 1
+    assert expected_warning in client.preference_payload.warnings[0]
     assert any(event.kind == "preference_fallback" for event in runner.events)
 
 

@@ -186,6 +186,23 @@ QComboBox::drop-down, QDateEdit::drop-down {
     width: 24px;
 }
 
+QComboBox#priorityStrategy {
+    padding-right: 32px;
+}
+
+QComboBox#priorityStrategy::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 24px;
+    border: 0;
+}
+
+QComboBox#priorityStrategy::down-arrow {
+    image: url(assets/chevron-down-dark.svg);
+    width: 10px;
+    height: 6px;
+}
+
 /* Keep the calendar navigation neutral; selection may still use the accent. */
 QCalendarWidget#dateCalendar QWidget#qt_calendar_navigationbar {
     background: #171f2d;
