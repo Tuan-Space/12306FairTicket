@@ -1060,8 +1060,8 @@ class MainWindow(QMainWindow):
         self._pending_query_payload = None
         self.query_ui_timer.stop()
         self.qr_image.setPixmap(QPixmap())
-        self.qr_image.setText("正在准备登录…")
-        self.qr_status.setText("等待生成二维码")
+        self.qr_image.setText("正在检查登录状态…")
+        self.qr_status.setText("登录失效时将显示二维码")
         self.qr_countdown.setText("有效期 --:--")
         self.refresh_qr_button.setEnabled(False)
         self.query_metric.value_label.setText("0")  # type: ignore[attr-defined]
@@ -1173,9 +1173,14 @@ class MainWindow(QMainWindow):
             if status in {"confirmed", "success", "logged_in"}:
                 self._qr_deadline = 0.0
                 self.qr_image.setPixmap(QPixmap())
-                self.qr_image.setText("✓\n登录成功")
-                self.qr_countdown.setText("已确认")
-                self._notify("登录成功", "扫码已确认，任务继续运行")
+                self.refresh_qr_button.setEnabled(False)
+                if status == "logged_in":
+                    self.qr_image.setText("✓\n已登录\n无需重新扫码")
+                    self.qr_countdown.setText("会话有效")
+                else:
+                    self.qr_image.setText("✓\n登录成功")
+                    self.qr_countdown.setText("已确认")
+                    self._notify("登录成功", "扫码已确认，任务继续运行")
             elif status == "scanned":
                 QApplication.beep()
             elif status in {"expired", "timeout"}:

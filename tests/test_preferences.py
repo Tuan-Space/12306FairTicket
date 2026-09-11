@@ -20,6 +20,7 @@ from ticket_app.preferences import (
     build_order_preference_payload,
     seat_layout_letters,
 )
+from ticket_app.runtime import CancellationToken, RunCancelled
 
 
 class FakeResponse:
@@ -451,6 +452,47 @@ class RailwayClientPreferenceTests(unittest.TestCase):
             client.load_cookies()
             client.save_cookies()
         cookie_jar.assert_not_called()
+
+    def test_valid_session_emits_logged_in_without_creating_another_qr(self):
+        events = []
+        cfg = SimpleNamespace(persist_session=False, request_timeout_seconds=5)
+        client = RailwayClient(cfg, event_sink=events.append)
+        client.session.post = Mock(return_value=FakeResponse({"data": {"flag": True}}))
+        client._prefetch_login_cookies = Mock()
+        client._create_qr_code = Mock()
+
+        client.ensure_login()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "qr_status")
+        self.assertEqual(events[0].data["status"], "logged_in")
+        self.assertEqual(events[0].message, "当前登录会话仍然有效，无需重新扫码")
+        self.assertTrue(client.session.post.call_args.args[0].endswith("/otn/login/checkUser"))
+        client._prefetch_login_cookies.assert_not_called()
+        client._create_qr_code.assert_not_called()
+
+    def test_stopping_during_session_check_does_not_publish_login_or_request_qr(self):
+        for session_valid in (True, False):
+            with self.subTest(session_valid=session_valid):
+                events = []
+                token = CancellationToken()
+                cfg = SimpleNamespace(persist_session=False, request_timeout_seconds=5)
+                client = RailwayClient(cfg, event_sink=events.append, cancel_token=token)
+
+                def response_after_stop(*_args, **_kwargs):
+                    token.cancel()
+                    return FakeResponse({"data": {"flag": session_valid}})
+
+                client.session.post = Mock(side_effect=response_after_stop)
+                client._prefetch_login_cookies = Mock()
+                client._create_qr_code = Mock()
+
+                with self.assertRaises(RunCancelled):
+                    client.ensure_login()
+
+                self.assertEqual(events, [])
+                client._prefetch_login_cookies.assert_not_called()
+                client._create_qr_code.assert_not_called()
 
     def test_persist_session_false_does_not_write_qr_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -93,8 +93,16 @@ class RailwayClient:
 
     def ensure_login(self) -> None:
         self.cancel_token.checkpoint()
-        if self.check_session():
+        session_valid = self.check_session()
+        self.cancel_token.checkpoint()
+        if session_valid:
             logging.info("当前登录会话仍然有效")
+            emit_event(
+                self.event_sink,
+                "qr_status",
+                "当前登录会话仍然有效，无需重新扫码",
+                status="logged_in",
+            )
             return
         logging.info("需要扫码登录 12306")
         self._prefetch_login_cookies()

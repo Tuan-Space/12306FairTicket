@@ -27,6 +27,9 @@ from ticket_app.gui.worker import TicketWorker  # noqa: E402
 from ticket_app.runtime import RuntimeEvent  # noqa: E402
 
 
+_REAL_CLIENT_INIT = client_module.RailwayClient.__init__
+
+
 @pytest.fixture
 def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[gui_app.MainWindow]:
     root_level = logging.getLogger().level
@@ -759,6 +762,143 @@ def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
     main_window.thread = None
     main_window._restart_for_qr()
     assert restarts == [True]
+
+
+def test_reused_login_clears_old_qr_without_notifying_about_a_new_scan(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notifications = []
+    monkeypatch.setattr(main_window, "_notify", lambda *args, **kwargs: notifications.append(args))
+    main_window._on_runtime_event(
+        "qr_ready",
+        {"image_bytes": _png_bytes(), "expires_at": gui_app.time.time() + 60},
+    )
+    # An old expired QR may have left its refresh button enabled.
+    main_window.refresh_qr_button.setEnabled(True)
+
+    main_window._on_runtime_event(
+        "qr_status",
+        {"status": "logged_in", "message": "当前登录会话仍然有效，无需重新扫码"},
+    )
+    main_window._update_countdowns()
+
+    assert main_window.qr_image.pixmap().isNull()
+    assert main_window.qr_image.text() == "✓\n已登录\n无需重新扫码"
+    assert main_window.qr_status.text() == "当前登录会话仍然有效，无需重新扫码"
+    assert main_window.qr_countdown.text() == "会话有效"
+    assert main_window._qr_deadline == 0.0
+    assert not main_window.refresh_qr_button.isEnabled()
+    assert notifications == []
+
+
+def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
+    main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch, qtbot
+) -> None:
+    """Run real workers and Qt event delivery with only network inputs replaced."""
+    from ticket_app.clock import ServerClock
+    from ticket_app.runner import TicketRunner
+    from ticket_app.stations import StationStore
+
+    # Restore real client construction for this integration path. The fixture's
+    # requests.Session.request guard remains active to reject accidental I/O.
+    monkeypatch.setattr(client_module.RailwayClient, "__init__", _REAL_CLIENT_INIT)
+    monkeypatch.setattr(ServerClock, "sync", lambda *args: None)
+    monkeypatch.setattr(StationStore, "load", lambda *args: None)
+    monkeypatch.setattr(StationStore, "code", lambda _store, station: station)
+    monkeypatch.setattr(TicketRunner, "_resolve_target_start", lambda _runner: None)
+    monkeypatch.setattr(client_module.RailwayClient, "_prefetch_login_cookies", lambda _client: None)
+    monkeypatch.setattr(gui_app.QMessageBox, "question", lambda *args: gui_app.QMessageBox.StandardButton.Yes)
+    failures = []
+    for name in ("warning", "critical", "information"):
+        monkeypatch.setattr(gui_app.QMessageBox, name, lambda *args: failures.append(args[1:]))
+    notifications = []
+    monkeypatch.setattr(main_window, "_notify", lambda *args, **kwargs: notifications.append(args))
+    shared_session = main_window.shared_session
+    checked_sessions = []
+    generated_qrs = []
+    queried_configs = []
+    image_bytes = _png_bytes()
+
+    def check_session_response(url, **kwargs):
+        assert url.endswith("/otn/login/checkUser")
+        checked_sessions.append(shared_session.cookies.get("test_login") == "valid")
+        return SimpleNamespace(json=lambda: {"data": {"flag": checked_sessions[-1]}})
+
+    def create_qr(client):
+        assert client.session is shared_session
+        generated_qrs.append(client.cfg.preferred_trains)
+        return image_bytes, f"test-qr-{len(generated_qrs)}"
+
+    def check_qr(client, _uuid):
+        if len(generated_qrs) == 1:
+            return "2", "confirmed"
+        # After the stored session expires, leave the new QR awaiting a scan.
+        client.cancel_token.wait(30)
+        raise AssertionError("test must stop the task while the replacement QR is displayed")
+
+    def complete_login(client):
+        client.session.cookies.set("test_login", "valid")
+        return True, "OK"
+
+    def query_until_stopped(client, _from_code, _to_code):
+        queried_configs.append(client.cfg)
+        client.cancel_token.wait(30)
+        raise AssertionError("test must stop the running query")
+
+    monkeypatch.setattr(shared_session, "post", check_session_response)
+    monkeypatch.setattr(client_module.RailwayClient, "_create_qr_code", create_qr)
+    monkeypatch.setattr(client_module.RailwayClient, "_check_qr_status", check_qr)
+    monkeypatch.setattr(client_module.RailwayClient, "_complete_login", complete_login)
+    monkeypatch.setattr(client_module.RailwayClient, "query_tickets", query_until_stopped)
+
+    main_window.show()
+    main_window.from_station.setText("北京西")
+    main_window.to_station.setText("郑州东")
+    main_window.auto_submit.setChecked(False)
+    main_window.preferred_trains.setText("G79")
+    main_window.seat_types.set_values(["二等座"])
+    assert main_window._validate_all() == {}
+
+    def stop_and_wait():
+        if main_window.thread is not None:
+            main_window._stop_task()
+            qtbot.waitUntil(lambda: main_window.thread is None, timeout=3000)
+
+    try:
+        main_window._start_task()
+        assert main_window.qr_image.text() == "正在检查登录状态…"
+        assert main_window.qr_status.text() == "登录失效时将显示二维码"
+        qtbot.waitUntil(lambda: len(queried_configs) == 1 and "登录成功" in main_window.qr_image.text())
+        assert notifications == [("登录成功", "扫码已确认，任务继续运行")]
+        stop_and_wait()
+        assert shared_session.cookies.get("test_login") == "valid"
+        assert main_window.preferred_trains.isEnabled()
+
+        main_window.preferred_trains.setText("K123")
+        main_window.seat_types.set_values(["硬卧"])
+        main_window._start_task()
+        qtbot.waitUntil(lambda: len(queried_configs) == 2 and "无需重新扫码" in main_window.qr_image.text())
+        assert queried_configs[1].preferred_trains == ["K123"]
+        assert queried_configs[1].seat_types == ["硬卧"]
+        assert main_window.qr_countdown.text() == "会话有效"
+        assert not main_window.refresh_qr_button.isEnabled()
+        assert checked_sessions == [False, True]
+        assert len(generated_qrs) == 1
+        assert notifications == [("登录成功", "扫码已确认，任务继续运行")]
+        stop_and_wait()
+
+        shared_session.cookies.clear()
+        main_window._start_task()
+        qtbot.waitUntil(lambda: main_window.qr_status.text() == "等待扫码")
+        assert not main_window.qr_image.pixmap().isNull()
+        assert main_window._qr_deadline > gui_app.time.time()
+        assert checked_sessions == [False, True, False]
+        assert len(generated_qrs) == 2
+        assert len(queried_configs) == 2
+        assert main_window._test_network_calls == []
+        assert failures == []
+    finally:
+        stop_and_wait()
 
 
 def test_refresh_while_running_requests_cancel_before_restart(main_window: gui_app.MainWindow) -> None:
