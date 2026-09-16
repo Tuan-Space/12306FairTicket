@@ -12,6 +12,7 @@ from .helpers import _build_passenger_strings, _is_terminal_order_failure, _reso
 from .preferences import OrderPreferencePayload, build_order_preference_payload
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
 from .stations import StationStore
+from .configuration import SHARED_BERTH_CODES
 from .train_policy import priority_preview, priority_sort_key, scope_summary, train_in_scope
 
 
@@ -36,6 +37,7 @@ class TicketRunner:
         self.stations = StationStore(self.client.session, cfg)
         self.preferred_order = {train: index for index, train in enumerate(cfg.preferred_trains)}
         self.seat_sequence = [(seat_label, SEAT_SPECS[seat_label]) for seat_label in cfg.seat_types]
+        self._ambiguous_berth_warnings: set[tuple[str, str]] = set()
 
     def run(self) -> int:
         try:
@@ -245,6 +247,19 @@ class TicketRunner:
                 stock = ticket["seats"].get(spec.stock_key, "--")
                 if not _stock_available(stock):
                     continue
+                if spec.stock_key in SHARED_BERTH_CODES:
+                    raw_codes = ticket.get("seat_types")
+                    codes = set(raw_codes.strip()) if isinstance(raw_codes, str) else set()
+                    matching = codes & SHARED_BERTH_CODES[spec.stock_key]
+                    if not codes or len(matching) > 1:
+                        warning_key = (ticket.get("train_no") or train_code, spec.stock_key)
+                        if warning_key not in self._ambiguous_berth_warnings:
+                            self._ambiguous_berth_warnings.add(warning_key)
+                            labels = "软卧／一等卧" if spec.stock_key == "rw" else "硬卧／二等卧"
+                            logging.warning("%s 的%s余票无法区分实际席别，已跳过；请核对 12306 官方余票", train_code, labels)
+                        continue
+                    if spec.submit_code not in matching:
+                        continue
                 candidates.append(
                     {
                         "ticket": ticket,

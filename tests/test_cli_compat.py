@@ -1,10 +1,13 @@
 from datetime import date, timedelta
 
+import pytest
+
 import main as cli
 from ticket_app.configuration import AppError
 
 
-def test_cli_validate_config_keeps_the_original_entry_point(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seat", ["二等座", "一等卧", "二等卧"])
+def test_cli_validate_config_keeps_the_original_entry_point(tmp_path, monkeypatch, seat):
     future_date = (date.today() + timedelta(days=1)).isoformat()
     config_path = tmp_path / "config.py"
     config_path.write_text(
@@ -14,7 +17,7 @@ def test_cli_validate_config_keeps_the_original_entry_point(tmp_path, monkeypatc
                 'TO_STATION = "上海虹桥"',
                 f'TRAIN_DATE = "{future_date}"',
                 'PASSENGER_NAMES = ["张三"]',
-                'SEAT_TYPES = ["二等座"]',
+                f'SEAT_TYPES = ["{seat}"]',
                 'PREFERRED_TRAINS = []',
                 'ONLY_PREFERRED_TRAINS = False',
                 'START_AT = ""',

@@ -56,10 +56,15 @@ SEAT_SPECS: Dict[str, SeatSpec] = {
     "高级软卧": SeatSpec("gr", "6"),
     "软卧": SeatSpec("rw", "4"),
     "硬卧": SeatSpec("yw", "3"),
+    "一等卧": SeatSpec("rw", "I"),
+    "二等卧": SeatSpec("yw", "J"),
     "软座": SeatSpec("rz", "2"),
     "硬座": SeatSpec("yz", "1"),
     "无座": SeatSpec("wz", ""),
 }
+
+# Official query columns are shared, but these are distinct order seat codes.
+SHARED_BERTH_CODES = {"rw": frozenset({"4", "I"}), "yw": frozenset({"3", "J"})}
 
 
 def preference_capabilities(seat_types: Iterable[str]) -> tuple[bool, bool]:

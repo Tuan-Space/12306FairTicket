@@ -1109,7 +1109,6 @@ class MainWindow(QMainWindow):
                 message = f"任务已结束（退出码 {code}），本次未确认出票。"
             if not self._completion_prompt_shown:
                 self._completion_prompt_shown = True
-                self._notify("任务结束，未出票", message)
                 QMessageBox.information(self, "任务结束，未出票", message)
 
     def _on_worker_failed(self, message: str, details: str) -> None:
@@ -1117,7 +1116,6 @@ class MainWindow(QMainWindow):
         self.order_button.setEnabled(True)
         logging.error("任务异常: %s", message)
         logging.debug("%s", details)
-        self._notify("任务失败", message)
         QMessageBox.critical(self, "任务失败", message)
 
     def _on_thread_finished(self) -> None:
@@ -1180,9 +1178,6 @@ class MainWindow(QMainWindow):
                 else:
                     self.qr_image.setText("✓\n登录成功")
                     self.qr_countdown.setText("已确认")
-                    self._notify("登录成功", "扫码已确认，任务继续运行")
-            elif status == "scanned":
-                QApplication.beep()
             elif status in {"expired", "timeout"}:
                 self._qr_deadline = 0.0
                 self.qr_image.setPixmap(QPixmap())
@@ -1199,7 +1194,6 @@ class MainWindow(QMainWindow):
         elif kind == "candidate":
             self._set_phase("querying", message)
             self.phase_badge.setText(message or "发现候选票")
-            self._notify("发现票源", message or "发现符合偏好的候选票", sound=False)
         elif kind in {"order_wait", "queue", "queued"}:
             self._set_phase("queued", message)
         elif kind == "order_success":
@@ -1208,8 +1202,6 @@ class MainWindow(QMainWindow):
             self._order_id = str(payload.get("order_id", ""))
             self.order_button.setEnabled(True)
             self._set_phase("success", message or "抢票成功")
-            if first_success:
-                self._notify("出票成功", "请尽快前往 12306 完成支付")
             if first_success and not self._success_prompt_shown:
                 self._success_prompt_shown = True
                 details = "订单已提交，请尽快前往 12306 完成支付。"
@@ -1400,12 +1392,6 @@ class MainWindow(QMainWindow):
         self._validate_all(full=False)
         logging.info("站点列表已更新，共 %d 个站名", len(self.station_names))
         QMessageBox.information(self, "站点已更新", f"已载入 {len(self.station_names)} 个站名。")
-
-    def _notify(self, title: str, message: str, sound: bool = True) -> None:
-        if self.tray:
-            self.tray.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 7000)
-        if sound:
-            QApplication.beep()
 
     def _seat_types_changed(self) -> None:
         self.position_preferences.adapt_to_seats(self.seat_types.values())

@@ -133,6 +133,8 @@ def test_no_seat_never_reuses_the_o_code_as_a_physical_seat_preference():
     ("G1", "二等座", "O", "000", "1A1F"),
     ("D1", "硬卧", "3", "200", ""),
     ("D1", "软卧", "4", "200", ""),
+    ("D1", "一等卧", "I", "200", ""),
+    ("D1", "二等卧", "J", "200", ""),
     ("K1", "高级软卧", "6", "200", ""),
     ("K1", "硬座", "1", "000", ""),
     ("K1", "软座", "2", "000", ""),
@@ -156,6 +158,8 @@ def test_mixed_preferences_apply_only_to_each_actual_candidate(train, label, cod
 @pytest.mark.parametrize(("label", "code", "expected_warning"), [
     ("二等座", "O", "未开放本次选座"),
     ("软卧", "4", "未开放在线选铺"),
+    ("一等卧", "I", "未开放在线选铺"),
+    ("二等卧", "J", "未开放在线选铺"),
 ])
 def test_applicable_runtime_capability_denial_keeps_fallback_warning(label, code, expected_warning):
     client = FakeBookingClient(OrderCapabilities())

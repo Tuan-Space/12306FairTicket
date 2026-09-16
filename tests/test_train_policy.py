@@ -121,10 +121,10 @@ def make_candidates(strategy, preferred=("G2", "G1"), only=False, scope="all"):
     )
     runner.seat_sequence = [(label, SEAT_SPECS[label]) for label in ["二等座", "硬卧", "无座"]]
     tickets = [
-        {"station_train_code": "K3", "can_buy": True, "seats": {"yw": "有", "wz": "2"}},
-        {"station_train_code": "G1", "can_buy": True, "seats": {"edz": "有", "wz": "1"}},
-        {"station_train_code": "G2", "can_buy": True, "seats": {"edz": "无", "yw": "1", "wz": "有"}},
-        {"station_train_code": "1461", "can_buy": True, "seats": {"yw": "1", "wz": "0"}},
+        {"station_train_code": "K3", "can_buy": True, "seat_types": "3O1", "seats": {"yw": "有", "wz": "2"}},
+        {"station_train_code": "G1", "can_buy": True, "seat_types": "3O1", "seats": {"edz": "有", "wz": "1"}},
+        {"station_train_code": "G2", "can_buy": True, "seat_types": "3O1", "seats": {"edz": "无", "yw": "1", "wz": "有"}},
+        {"station_train_code": "1461", "can_buy": True, "seat_types": "3O1", "seats": {"yw": "1", "wz": "0"}},
         {"station_train_code": "D8", "can_buy": False, "seats": {"yw": "有"}},
     ]
     return runner._find_candidates(tickets)

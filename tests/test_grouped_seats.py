@@ -45,7 +45,7 @@ def test_every_group_cell_toggles_once(editor, qtbot, width, target):
         assert name in editor.values()
         qtbot.mouseClick(checkbox, Qt.MouseButton.LeftButton, pos=point)
         assert name not in editor.values()
-    assert changes.count() == 20
+    assert changes.count() == 2 * len(SEAT_SPECS)
 
 
 @pytest.mark.parametrize("width", [500, 860])
@@ -53,7 +53,7 @@ def test_two_expanded_groups_and_selected_list_have_three_columns(editor, width)
     editor.resize(width, 720)
     expected_groups = {
         "seated": ["商务座", "特等座", "一等座", "二等座", "软座", "硬座", "无座"],
-        "sleeper": ["高级软卧", "软卧", "硬卧"],
+        "sleeper": ["高级软卧", "软卧", "硬卧", "一等卧", "二等卧"],
     }
     assert list(editor.groups) == list(expected_groups)
     assert [header.text() for header in editor.groups.values()] == ["坐席", "卧铺"]
@@ -77,7 +77,7 @@ def test_two_expanded_groups_and_selected_list_have_three_columns(editor, width)
                 assert checkbox.x() > previous.right()
             elif index:
                 assert checkbox.y() > editor.checkboxes[names[index - 1]].geometry().bottom()
-    rectangles = [editor.list.visualItemRect(editor.list.item(row)) for row in range(10)]
+    rectangles = [editor.list.visualItemRect(editor.list.item(row)) for row in range(len(SEAT_SPECS))]
     for index, rect in enumerate(rectangles):
         assert rect.left() == rectangles[index % 3].left()
         assert rect.top() == rectangles[index // 3 * 3].top()
@@ -136,7 +136,7 @@ def test_group_checkbox_and_selected_row_keep_one_shared_selection(editor, qtbot
     assert changes.count() == 6
 
 
-@pytest.mark.parametrize("source_row,target_row,after", [(0, 9, True), (9, 0, False), (2, 6, True)])
+@pytest.mark.parametrize("source_row,target_row,after", [(0, 11, True), (11, 0, False), (2, 6, True)])
 def test_grouped_selected_drag_keeps_every_choice_and_emits_once(
     editor, qtbot, monkeypatch, source_row, target_row, after
 ):
@@ -176,7 +176,7 @@ def test_grouped_selected_drag_keeps_every_choice_and_emits_once(
     destination = target_row + int(after) - int(source_row < target_row)
     expected.insert(destination, value)
     assert editor.values() == expected
-    assert view.count() == 10
+    assert view.count() == len(SEAT_SPECS)
     assert all(checkbox.isChecked() for checkbox in editor.checkboxes.values())
     assert changes.count() == 1
 

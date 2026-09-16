@@ -78,6 +78,13 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
         QApplication.sendPostedEvents(window, QEvent.Type.DeferredDelete)
 
 
+def _system_alert_spy(window, monkeypatch):
+    calls = []
+    window.tray = SimpleNamespace(showMessage=lambda *args: calls.append(args), hide=lambda: None)
+    monkeypatch.setattr(QApplication, "beep", lambda: calls.append("beep"))
+    return calls
+
+
 def _png_bytes() -> bytes:
     image = QImage(12, 12, QImage.Format.Format_RGB32)
     image.fill(Qt.GlobalColor.white)
@@ -97,7 +104,7 @@ def _click_seat(main_window: gui_app.MainWindow, qtbot, label: str) -> None:
     qtbot.mouseClick(checkbox, Qt.MouseButton.LeftButton)
 
 
-@pytest.mark.parametrize("sleeper", ["硬卧", "软卧", "高级软卧"])
+@pytest.mark.parametrize("sleeper", ["硬卧", "软卧", "高级软卧", "一等卧", "二等卧"])
 @pytest.mark.parametrize("mixed", [False, True])
 def test_real_sleeper_selection_activates_draft_and_removal_preserves_it(
     main_window: gui_app.MainWindow, qtbot, sleeper: str, mixed: bool
@@ -379,7 +386,7 @@ def test_unknown_station_is_marked_and_clears_after_correction(main_window: gui_
 def test_all_ten_seat_types_remain_available_and_selected_order_is_visible(main_window: gui_app.MainWindow) -> None:
     seat_list = main_window.seat_types.list
 
-    assert len(main_window.seat_types.checkboxes) == 10
+    assert len(main_window.seat_types.checkboxes) == 12
     assert seat_list.count() == len(main_window.seat_types.values())
     assert seat_list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
@@ -629,16 +636,11 @@ def test_start_is_a_noop_while_an_existing_task_is_running(
     assert main_window._test_network_calls == []  # type: ignore[attr-defined]
 
 
-def test_worker_completion_without_ticket_notifies_and_shows_one_information_dialog(
+def test_worker_completion_is_quiet_and_shows_one_information_dialog(
     main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    notifications: list[tuple[str, str]] = []
     dialogs: list[tuple[object, str, str]] = []
-    monkeypatch.setattr(
-        main_window,
-        "_notify",
-        lambda title, message, sound=True: notifications.append((title, message)),
-    )
+    notifications = _system_alert_spy(main_window, monkeypatch)
     monkeypatch.setattr(
         gui_app.QMessageBox,
         "information",
@@ -651,7 +653,7 @@ def test_worker_completion_without_ticket_notifies_and_shows_one_information_dia
 
     assert main_window._last_phase == "no_ticket"
     assert "未确认出票" in main_window.phase_badge.text()
-    assert notifications == [("任务结束，未出票", "已达停止时间或最大查询轮数，本次未出票。")]
+    assert notifications == []
     assert dialogs == [
         (main_window, "任务结束，未出票", "已达停止时间或最大查询轮数，本次未出票。")
     ]
@@ -715,13 +717,8 @@ def test_runtime_event_relay_preserves_message_data_and_timestamp(qtbot) -> None
 def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
     main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    notifications: list[tuple[str, str]] = []
     beeps: list[bool] = []
-    monkeypatch.setattr(
-        main_window,
-        "_notify",
-        lambda title, message, sound=True: notifications.append((title, message)),
-    )
+    notifications = _system_alert_spy(main_window, monkeypatch)
     monkeypatch.setattr(QApplication, "beep", lambda: beeps.append(True))
 
     deadline = gui_app.time.time() + 60.0
@@ -739,13 +736,13 @@ def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
 
     main_window._on_runtime_event("qr_status", {"status": "scanned", "message": "已扫描，请确认"})
     assert main_window.qr_status.text() == "已扫描，请确认"
-    assert beeps == [True]
+    assert beeps == []
 
     main_window._on_runtime_event("qr_status", {"status": "confirmed", "message": "登录成功"})
     assert main_window._qr_deadline == 0.0
     assert "登录成功" in main_window.qr_image.text()
     assert main_window.qr_countdown.text() == "已确认"
-    assert notifications == [("登录成功", "扫码已确认，任务继续运行")]
+    assert notifications == []
 
     main_window._on_runtime_event(
         "qr_ready",
@@ -767,8 +764,7 @@ def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
 def test_reused_login_clears_old_qr_without_notifying_about_a_new_scan(
     main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    notifications = []
-    monkeypatch.setattr(main_window, "_notify", lambda *args, **kwargs: notifications.append(args))
+    notifications = _system_alert_spy(main_window, monkeypatch)
     main_window._on_runtime_event(
         "qr_ready",
         {"image_bytes": _png_bytes(), "expires_at": gui_app.time.time() + 60},
@@ -811,8 +807,7 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
     failures = []
     for name in ("warning", "critical", "information"):
         monkeypatch.setattr(gui_app.QMessageBox, name, lambda *args: failures.append(args[1:]))
-    notifications = []
-    monkeypatch.setattr(main_window, "_notify", lambda *args, **kwargs: notifications.append(args))
+    notifications = _system_alert_spy(main_window, monkeypatch)
     shared_session = main_window.shared_session
     checked_sessions = []
     generated_qrs = []
@@ -869,7 +864,7 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
         assert main_window.qr_image.text() == "正在检查登录状态…"
         assert main_window.qr_status.text() == "登录失效时将显示二维码"
         qtbot.waitUntil(lambda: len(queried_configs) == 1 and "登录成功" in main_window.qr_image.text())
-        assert notifications == [("登录成功", "扫码已确认，任务继续运行")]
+        assert notifications == []
         stop_and_wait()
         assert shared_session.cookies.get("test_login") == "valid"
         assert main_window.preferred_trains.isEnabled()
@@ -884,7 +879,7 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
         assert not main_window.refresh_qr_button.isEnabled()
         assert checked_sessions == [False, True]
         assert len(generated_qrs) == 1
-        assert notifications == [("登录成功", "扫码已确认，任务继续运行")]
+        assert notifications == []
         stop_and_wait()
 
         shared_session.cookies.clear()
@@ -973,3 +968,21 @@ def test_gui_smoke_mode_exits_offline_and_uses_temporary_local_appdata(tmp_path:
     assert result.returncode == 0, result.stdout + result.stderr
     assert not list(local_appdata.rglob("*.cookies"))
     assert not list(local_appdata.rglob("login_qr.png"))
+
+
+def test_runtime_events_never_send_system_alerts_but_keep_dialogs(main_window, monkeypatch):
+    alerts = _system_alert_spy(main_window, monkeypatch)
+    dialogs = []
+    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda *args: dialogs.append(args[1]))
+    monkeypatch.setattr(gui_app.QMessageBox, "critical", lambda *args: dialogs.append(args[1]))
+    for _ in range(20):
+        main_window._on_runtime_event("candidate", {"message": "发现二等卧票源"})
+    assert main_window.phase_badge.text() == "发现二等卧票源"
+    for status in ("waiting", "scanned", "confirmed", "logged_in", "expired"):
+        main_window._on_runtime_event("qr_status", {"status": status})
+    main_window._on_worker_failed("模拟失败", "测试")
+    main_window._on_runtime_event("order_success", {"order_id": "test-order"})
+    main_window._on_runtime_event("order_success", {"order_id": "test-order"})
+    assert main_window.order_button.isEnabled()
+    assert dialogs == ["任务失败", "出票成功"]
+    assert alerts == []

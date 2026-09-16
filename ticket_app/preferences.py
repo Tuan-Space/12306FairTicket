@@ -28,7 +28,7 @@ SEAT_LAYOUT_LETTERS = {
 }
 SEATED_SEAT_TYPES = frozenset(SEAT_LAYOUT_LETTERS) | frozenset({"9"})
 CHOOSABLE_SEAT_TYPES = frozenset({"Q", "M", "D", "O", "P", "9"})
-BERTH_SEAT_TYPES = frozenset({"3", "4", "6", "A", "F"})
+BERTH_SEAT_TYPES = frozenset({"3", "4", "6", "A", "F", "I", "J"})
 
 
 def _validate_passenger_count(passenger_count: int) -> None:

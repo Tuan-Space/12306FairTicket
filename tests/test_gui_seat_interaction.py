@@ -53,7 +53,7 @@ def test_all_seat_cells_remain_clickable_in_three_columns(seat_editor, qtbot, wi
     editor = seat_editor
     editor.resize(width, 240)
     QApplication.processEvents()
-    rectangles = [editor.list.visualItemRect(editor.list.item(row)) for row in range(10)]
+    rectangles = [editor.list.visualItemRect(editor.list.item(row)) for row in range(len(SEAT_SPECS))]
     for row, rect in enumerate(rectangles):
         assert rect.width() >= editor.list.gridSize().width() - 2
         assert editor.list.indexAt(rect.center()).row() == row
@@ -67,7 +67,7 @@ def test_all_seat_cells_remain_clickable_in_three_columns(seat_editor, qtbot, wi
     assert rectangles[-1].bottom() < editor.list.viewport().height()
 
 
-@pytest.mark.parametrize("row", range(10))
+@pytest.mark.parametrize("row", range(len(SEAT_SPECS)))
 @pytest.mark.parametrize("target", ["indicator", "label", "trailing_space"])
 def test_each_click_toggles_once_and_emits_once(seat_editor, qtbot, row, target):
     editor = seat_editor
@@ -157,7 +157,7 @@ def test_drag_completion_reorders_without_removing_or_toggling_items(seat_editor
     QApplication.processEvents()
 
     assert completed == [True]
-    assert view.count() == 10
+    assert view.count() == len(SEAT_SPECS)
     assert {view.item(row).data(Qt.ItemDataRole.UserRole) for row in range(view.count())} == original_items
     expected = ["软卧", "二等座", "硬卧"] if source_row == 0 else ["硬卧", "软卧", "二等座"]
     assert editor.values() == expected
@@ -185,4 +185,4 @@ def test_canceled_drag_does_not_toggle_on_release(seat_editor, qtbot, monkeypatc
     QApplication.sendEvent(view.viewport(), event)
     qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=origin)
     assert editor.values() == ["硬卧"]
-    assert view.count() == 10
+    assert view.count() == len(SEAT_SPECS)

@@ -331,6 +331,7 @@ class RailwayClient:
                     "to_station": station_map.get(item(7), item(7)),
                     "location_code": item(15),
                     "left_ticket": item(12),
+                    "seat_types": item(35),
                     "seats": seats,
                 }
             )

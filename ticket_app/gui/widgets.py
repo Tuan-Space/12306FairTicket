@@ -655,7 +655,7 @@ class GroupedSeatEditor(PriorityListEditor):
 
     GROUPS = (
         ("seated", "坐席", ("商务座", "特等座", "一等座", "二等座", "软座", "硬座", "无座")),
-        ("sleeper", "卧铺", ("高级软卧", "软卧", "硬卧")),
+        ("sleeper", "卧铺", ("高级软卧", "软卧", "硬卧", "一等卧", "二等卧")),
     )
 
     def __init__(self, all_values: Iterable[str] = SEAT_SPECS, parent: Optional[QWidget] = None) -> None:
@@ -935,7 +935,7 @@ class BerthCountWidget(QWidget):
         hint_layout = QVBoxLayout(self.seat_type_hint)
         hint_layout.setContentsMargins(0, 0, 0, 0)
         hint_layout.setSpacing(6)
-        self.seat_type_message = QLabel("请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。")
+        self.seat_type_message = QLabel("请先在上方‘席别优先级’勾选至少一种卧铺席别（含一等卧、二等卧）。")
         self.seat_type_message.setObjectName("muted")
         self.seat_type_message.setWordWrap(True)
         hint_layout.addWidget(self.seat_type_message)
@@ -998,7 +998,7 @@ class BerthCountWidget(QWidget):
     def set_sleeper_available(self, available: bool) -> None:
         self.seat_type_hint.setVisible(not available)
         self.seat_type_message.setText(
-            "铺位偏好未启用：请先在上方‘席别优先级’勾选硬卧、软卧或高级软卧。已填写数量会保留。"
+            "铺位偏好未启用：请先在上方‘席别优先级’勾选至少一种卧铺席别（含一等卧、二等卧）。已填写数量会保留。"
         )
         for key, spin in self.spins.items():
             spin.setEnabled(available)
