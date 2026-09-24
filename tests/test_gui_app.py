@@ -254,24 +254,58 @@ def test_basic_page_has_no_help_icons_and_status_panel_has_no_scroll_area(main_w
     assert not main_window.status_panel.findChildren(gui_app.QScrollArea)
 
 
-def test_status_controls_remain_visible_at_minimum_window_size(main_window: gui_app.MainWindow, qtbot) -> None:
-    main_window.resize(1200, 720)
-    main_window.show()
-    qtbot.wait(30)
+@pytest.mark.parametrize("dark_theme", [False, True], ids=["light", "dark"])
+@pytest.mark.parametrize("window_size", [(1200, 720), (1260, 850)])
+def test_status_text_and_controls_remain_visible_when_log_panel_expands(
+    main_window: gui_app.MainWindow, qtbot, qapp, dark_theme: bool, window_size: tuple[int, int]
+) -> None:
+    previous_style = qapp.styleSheet()
+    try:
+        qapp.setStyleSheet(gui_app._load_stylesheet(qapp, dark_theme))
+        main_window.clock_timer.stop()
+        main_window.sale_countdown.setText("02:38:06.9")
+        main_window.rtt_metric.value_label.setText("71ms")
+        main_window.offset_metric.value_label.setText("-0.326s")
+        main_window._on_runtime_event(
+            "qr_status", {"status": "logged_in", "message": "当前登录会话仍然有效，无需重新扫码"}
+        )
+        main_window.resize(*window_size)
+        main_window.show()
+        qtbot.wait(30)
 
-    panel_rect = main_window.status_panel.rect()
-    for widget in (
-        main_window.qr_image,
-        main_window.timeline,
-        main_window.validate_button,
-        main_window.start_button,
-        main_window.stop_button,
-        main_window.order_button,
-    ):
-        top_left = widget.mapTo(main_window.status_panel, widget.rect().topLeft())
-        bottom_right = widget.mapTo(main_window.status_panel, widget.rect().bottomRight())
-        assert panel_rect.contains(top_left)
-        assert panel_rect.contains(bottom_right)
+        vertical = next(
+            splitter for splitter in main_window.findChildren(gui_app.QSplitter)
+            if splitter.orientation() == Qt.Orientation.Vertical
+        )
+        labels = [main_window.sale_countdown, main_window.sale_caption, main_window.qr_countdown]
+        for metric in (main_window.query_metric, main_window.rtt_metric, main_window.offset_metric):
+            labels.extend(metric.findChildren(gui_app.QLabel))
+
+        # Check the initial layout and the smallest upper pane the log splitter
+        # permits. Widget containment alone does not catch clipped label text.
+        for expand_log in (False, True):
+            if expand_log:
+                vertical.setSizes([1, 10000])
+                qtbot.wait(30)
+            panel_rect = main_window.status_panel.rect()
+            for widget in (
+                *labels,
+                main_window.qr_image,
+                main_window.timeline,
+                main_window.validate_button,
+                main_window.start_button,
+                main_window.stop_button,
+                main_window.order_button,
+            ):
+                top_left = widget.mapTo(main_window.status_panel, widget.rect().topLeft())
+                bottom_right = widget.mapTo(main_window.status_panel, widget.rect().bottomRight())
+                assert panel_rect.contains(top_left)
+                assert panel_rect.contains(bottom_right)
+            for label in labels:
+                assert label.height() >= label.minimumSizeHint().height(), label.objectName()
+                assert label.width() >= label.minimumSizeHint().width(), label.objectName()
+    finally:
+        qapp.setStyleSheet(previous_style)
 
 
 def test_log_transport_batch_updates_log_view_once(main_window: gui_app.MainWindow, monkeypatch: pytest.MonkeyPatch) -> None:

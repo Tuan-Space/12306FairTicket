@@ -110,7 +110,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("12306 Fair Ticket")
         self.resize(1260, 850)
-        self.setMinimumSize(1200, 720)
+        # Let the layout determine the minimum height from the styled content.
+        self.setMinimumWidth(1200)
         if APP_ICON.exists():
             self.setWindowIcon(QIcon(str(APP_ICON)))
 
@@ -213,7 +214,7 @@ class MainWindow(QMainWindow):
         horizontal = QSplitter(Qt.Orientation.Horizontal)
         horizontal.addWidget(self._build_config_tabs())
         horizontal.addWidget(self._build_status_panel())
-        horizontal.setMinimumHeight(360)
+        # Keep the content-derived minimum when the log pane is expanded.
         horizontal.setStretchFactor(0, 46)
         horizontal.setStretchFactor(1, 54)
         horizontal.setSizes([530, 620])
@@ -611,7 +612,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         status = Card("运行状态与扫码登录")
-        status.setMinimumHeight(205)
         status.body.setContentsMargins(16, 12, 16, 12)
         status.body.setSpacing(8)
         overview = QHBoxLayout()
