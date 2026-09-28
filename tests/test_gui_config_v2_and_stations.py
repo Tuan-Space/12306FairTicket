@@ -54,7 +54,7 @@ def test_v3_round_trip_contains_all_editable_settings_and_no_sensitive_values(tm
     assert restored["session_file"] == DEFAULT_VALUES["session_file"]
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_legacy_migration_preserves_order_preferences_and_compatibility_defaults(tmp_path: Path, version: int) -> None:
     legacy = tmp_path / "legacy.json"
     settings = {
@@ -73,7 +73,7 @@ def test_legacy_migration_preserves_order_preferences_and_compatibility_defaults
     assert loaded["priority_strategy"] == "train_first"
     new_file = tmp_path / "migrated.json"
     save_gui_settings(new_file, loaded)
-    assert json.loads(new_file.read_text(encoding="utf-8"))["version"] == 3
+    assert json.loads(new_file.read_text(encoding="utf-8"))["version"] == 4
     assert load_gui_settings(new_file) == loaded
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import logging
 import re
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 import requests
-from PySide6.QtCore import QDate, QEvent, QObject, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtCore import QDate, QEvent, QObject, QThread, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,17 +33,16 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
-    QSplitter,
     QStyle,
     QSystemTrayIcon,
-    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from ticket_app import __version__
-from ticket_app.configuration import AppConfig, AppError, SEAT_SPECS
+from ticket_app.clock import ServerClock
+from ticket_app.configuration import AppConfig, AppError, ConnectionConfig, SEAT_SPECS
 from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.preferences import BERTH_SEAT_TYPES, SEATED_SEAT_TYPES
 from ticket_app.train_policy import classify_train_codes, priority_preview, scope_summary
@@ -59,6 +59,8 @@ from .compat import (
     canonical_mapping,
 )
 from .station_worker import StationRefreshWorker
+from .passenger_widgets import PassengerTicketEditor
+from .wizard import WizardFlow
 from .validation import validate_gui_mapping
 from .widgets import (
     Card,
@@ -73,7 +75,8 @@ from .widgets import (
     TimeFieldsWidget,
     set_validation_state,
 )
-from .worker import EventRelay, GuiCancelToken, LogBridge, TicketWorker, create_async_log_pipeline
+from .worker import (GuiCancelToken, LogBridge, OperationRequest, OperationOutcome,
+                     OperationWorker, create_async_log_pipeline)
 
 
 ASSET_DIR = PROJECT_ROOT / "assets"
@@ -105,13 +108,23 @@ class StationRefreshRelay(QObject):
     completed = Signal(object, object)
 
 
-class MainWindow(QMainWindow):
+class MainWindow(WizardFlow, QMainWindow):
+    submit_operation = Signal(object)
+    retire_executor = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("12306 Fair Ticket")
-        self.resize(1260, 850)
-        # Let the layout determine the minimum height from the styled content.
-        self.setMinimumWidth(1200)
+        self.resize(750, 880)
+        # Qt reports logical screen pixels; fit the first window at high DPI.
+        self.setMinimumSize(640, 480)
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            available = screen.availableGeometry()
+            self.setMinimumSize(min(640, max(480, available.width() - 40)),
+                                min(480, max(360, available.height() - 60)))
+            self.resize(min(750, max(480, available.width() - 40)),
+                        min(880, max(360, available.height() - 60)))
         if APP_ICON.exists():
             self.setWindowIcon(QIcon(str(APP_ICON)))
 
@@ -130,11 +143,32 @@ class MainWindow(QMainWindow):
         # Kept only in memory. Sequential tasks in this application process can
         # reuse a confirmed login without ever writing cookies to disk.
         self.shared_session = requests.Session()
-        self.thread: Optional[QThread] = None
-        self.worker: Optional[TicketWorker] = None
-        self.event_relay: Optional[EventRelay] = None
+        # Construction reads the local clock only. Network synchronization and
+        # settings changes belong exclusively to the active worker thread.
+        self.shared_clock = ServerClock(
+            self.shared_session, ConnectionConfig.from_mapping(DEFAULT_VALUES, base_dir=LOCAL_DATA_DIR),
+        )
+        # The executor is window-owned and remains alive between operations.
+        self._background_thread: Optional[QThread] = None
+        self._executor: Optional[OperationWorker] = None
+        self._active_operation: Optional[OperationRequest] = None
+        self.worker: Optional[OperationWorker] = None
+        self._closing_executor = False
+        self._session_closed = False
+        self._last_run_config: Optional[AppConfig] = None
+        self._last_run_stop_deadline: Optional[datetime] = None
+        self._restart_allowed = False
+        self._order_state = "safe"
+        self._return_after_stop = False
         self.cancel_token: Optional[GuiCancelToken] = None
         self._pending_restart = False
+        self._operation_mode: Optional[str] = None
+        self._operation_generation = 0
+        self._qr_operation = "login"
+        self._pending_contacts: Optional[list[dict[str, str]]] = None
+        self._maintenance_enabled = False
+        self._maintenance_busy = False
+        self._login_required = False
         self._close_when_finished = False
         self._qr_deadline = 0.0
         self._target_timestamp: Optional[float] = None
@@ -156,7 +190,7 @@ class MainWindow(QMainWindow):
         self.query_ui_timer.timeout.connect(self._flush_query_event)
         self._pending_query_payload: Optional[Dict[str, Any]] = None
 
-        self.log_bridge = LogBridge()
+        self.log_bridge = LogBridge(self)
         self.log_pipeline = create_async_log_pipeline(self.log_bridge, batch_interval=0.1)
 
         self._build_ui()
@@ -195,75 +229,44 @@ class MainWindow(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(2, 0, 2, 0)
         logo = QLabel("◈")
+        self._header_logo = logo
         logo.setObjectName("logoMark")
         title_box = QVBoxLayout()
         title = QLabel("12306 Fair Ticket")
         title.setObjectName("appTitle")
-        subtitle = QLabel(f"v{__version__} · 车次范围、席别顺序与位置偏好")
+        subtitle = QLabel(f"v{__version__} · 设置行程 → 登录与乘车人 → 确认开始 → 等待结果")
+        self._header_subtitle = subtitle
         subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header_layout.addWidget(logo)
-        header_layout.addLayout(title_box)
-        header_layout.addStretch(1)
+        header_layout.addLayout(title_box, 1)
+        header_layout.addWidget(self._build_profile_bar())
         root.addWidget(header)
 
-        root.addWidget(self._build_profile_bar())
-
-        vertical = QSplitter(Qt.Orientation.Vertical)
-        horizontal = QSplitter(Qt.Orientation.Horizontal)
-        horizontal.addWidget(self._build_config_tabs())
-        horizontal.addWidget(self._build_status_panel())
-        # Keep the content-derived minimum when the log pane is expanded.
-        horizontal.setStretchFactor(0, 46)
-        horizontal.setStretchFactor(1, 54)
-        horizontal.setSizes([530, 620])
-        vertical.addWidget(horizontal)
-
-        log_card = Card("运行日志 · 自动脱敏")
-        log_card.body.setContentsMargins(16, 12, 16, 12)
-        log_card.body.setSpacing(8)
-        self.log_view = LogView()
-        log_card.body.addWidget(self.log_view)
-        vertical.addWidget(log_card)
-        vertical.setStretchFactor(0, 4)
-        vertical.setStretchFactor(1, 1)
-        vertical.setSizes([650, 150])
-        root.addWidget(vertical, 1)
+        self._build_wizard(root)
 
     def _build_profile_bar(self) -> QWidget:
         bar = QFrame()
-        bar.setObjectName("profileBar")
+        bar.setObjectName("headerActions")
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         self.save_settings_button = QPushButton("保存为…")
         self.save_settings_button.setToolTip(
-            "保存全部可编辑参数为 version 3 JSON；允许保存未完成草稿。"
+            "保存全部可编辑参数为 version 4 JSON；允许保存未完成草稿。"
             "不会保存 Cookie、Token、二维码、证件、手机号或本机路径。"
         )
         self.save_settings_button.clicked.connect(self._save_settings)
         self.import_settings_button = QPushButton("导入…")
         self.import_settings_button.setToolTip(
-            "仅导入 JSON，兼容 version 1、version 2 和 version 3；导入后会立即检查并标出问题字段。"
+            "仅导入 JSON，兼容 version 1、version 2、version 3 和 version 4；导入后会立即检查并标出问题字段。"
         )
         self.import_settings_button.clicked.connect(self._import_settings)
         layout.addWidget(self.save_settings_button)
         layout.addWidget(self.import_settings_button)
-        note = QLabel("仅 JSON · 保存可编辑参数 · 不含登录态和身份信息")
-        note.setObjectName("muted")
-        note.setToolTip("配置不包含 Cookie、Token、二维码、证件、手机号、缓存内容或本机路径。")
-        layout.addWidget(note)
-        layout.addStretch(1)
         return bar
-
-    def _build_config_tabs(self) -> QWidget:
-        self.config_tabs = QTabWidget()
-        self.config_tabs.setObjectName("configTabs")
-        self.config_tabs.setMinimumWidth(500)
-        self.config_tabs.addTab(self._build_basic_page(), "基础参数")
-        self.config_tabs.addTab(self._build_advanced_page(), "高级参数")
-        return self.config_tabs
 
     def _field_block(
         self,
@@ -323,7 +326,7 @@ class MainWindow(QMainWindow):
         scroll, _page, layout = _scroll_page()
         self.basic_scroll = scroll
 
-        trip = Card("行程与乘车人", "站名需与 12306 显示完全一致；乘车人只填写姓名。")
+        trip = Card("设置行程", "先确定去哪、何时出发和接受哪些席别；下一步再登录并选择乘车人。")
         trip_grid = QGridLayout()
         trip_grid.setHorizontalSpacing(8)
         trip_grid.setVerticalSpacing(10)
@@ -387,6 +390,13 @@ class MainWindow(QMainWindow):
             4,
         )
         trip.body.addLayout(trip_grid)
+        self.prep_sync_clock_button = QPushButton("校准时间")
+        self.prep_sync_clock_button.clicked.connect(lambda: self._start_connection_operation("sync_clock"))
+        trip.body.addWidget(self.prep_sync_clock_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.prep_clock_status = QLabel("校时状态：尚未校准")
+        self.prep_clock_status.setObjectName("muted")
+        self.prep_clock_status.setWordWrap(True)
+        trip.body.addWidget(self.prep_clock_status)
         layout.addWidget(trip)
 
         self.passengers = QLineEdit()
@@ -396,7 +406,15 @@ class MainWindow(QMainWindow):
             "自动提交时填写 1–5 个已在当前 12306 账户中的姓名；仅监控可留空。"
             "多个姓名可用中英文逗号、顿号、中英文分号、换行或制表符分隔。"
         )
-        trip.body.addWidget(self._field_block("passenger_names", "乘车人", self.passengers))
+        manual_block = self._field_block("passenger_names", "手动填写姓名", self.passengers, page_index=1)
+        self.passenger_card.body.addWidget(manual_block)
+        manual_block.hide()
+        self.manual_toggle.toggled.connect(manual_block.setVisible)
+        # Compatibility attribute: it now only refreshes contacts and cannot start QR login.
+        self.select_passengers_button = self.refresh_contacts_button
+        self.passenger_ticket_types = PassengerTicketEditor()
+        self.passenger_card.body.addWidget(self._field_block("passenger_ticket_types", "选择购买的车票类型", self.passenger_ticket_types, page_index=1))
+        self.passenger_ticket_types.changed.connect(lambda: self._schedule_validation("passenger_ticket_types"))
         people = Card("车次范围", "车次留空时不限类型，按已选席别查询；实际尝试范围以下方说明为准。")
         self.preferred_trains = QLineEdit()
         self.preferred_trains.setPlaceholderText("G79, G95（从左到右优先）")
@@ -454,12 +472,24 @@ class MainWindow(QMainWindow):
             "seat_position_preferences",
             "",
             self.position_preferences,
+            page_index=2,
             show_label=False,
         )
         self.field_widgets["seat_position_preferences"] = self.position_preferences.seats
-        self._add_field_alias("berth_preference", self.position_preferences.berths, position_block, 0)
+        self._add_field_alias("berth_preference", self.position_preferences.berths, position_block, 2)
         position.body.addWidget(position_block)
-        layout.addWidget(position)
+        self.quiet_carriage = QCheckBox("优先分配静音车厢（适用于全部乘车人）")
+        self.quiet_carriage.setToolTip("仅在列车提供静音服务且当前候选为二等座时提交偏好；不保证分配成功。")
+        position.body.addWidget(self._field_block("quiet_carriage_preference", "", self.quiet_carriage, page_index=2, show_label=False))
+        quiet_notice = QLabel(
+            "勾选即表示已告知全部乘车人并愿意遵守静音要求：保持安静、设备静音且不外放、"
+            "通话或交谈时离开静音车厢、照看好儿童。携婴幼儿者不建议选择。"
+            "无静音服务或无法满足时仍接受系统分配。"
+        )
+        quiet_notice.setObjectName("muted")
+        quiet_notice.setWordWrap(True)
+        position.body.addWidget(quiet_notice)
+        self.confirm_layout.addWidget(position)
 
         action = Card("任务模式")
         self.auto_submit = QCheckBox("发现符合条件的票后自动提交订单")
@@ -483,10 +513,8 @@ class MainWindow(QMainWindow):
         self.start_at.changed.connect(self._target_edited)
         self.start_at.changed.connect(lambda: self._schedule_validation("start_at"))
         self.stop_at.changed.connect(lambda: self._schedule_validation("stop_at"))
-        self.passengers.textChanged.connect(
-            lambda: self._schedule_validation("passenger_names", "seat_position_preferences", "berth_preference")
-        )
-        self.preferred_trains.textChanged.connect(self._train_inputs_changed)
+        self.passengers.textChanged.connect(self._passenger_names_changed)
+        self.preferred_trains.textChanged.connect(self._preferred_trains_edited)
         self.only_preferred.toggled.connect(self._train_inputs_changed)
         self.priority_strategy.currentIndexChanged.connect(self._strategy_changed)
         self.seat_types.changed.connect(
@@ -496,6 +524,7 @@ class MainWindow(QMainWindow):
             lambda: self._schedule_validation("seat_position_preferences", "berth_preference")
         )
         self.auto_submit.toggled.connect(lambda: self._schedule_validation("passenger_names"))
+        self.quiet_carriage.toggled.connect(lambda: self._schedule_validation("quiet_carriage_preference"))
         layout.addStretch(1)
         return scroll
 
@@ -608,84 +637,96 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         self.status_panel = panel
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(8, 0, 2, 0)
-        layout.setSpacing(10)
-
-        status = Card("运行状态与扫码登录")
-        status.body.setContentsMargins(16, 12, 16, 12)
-        status.body.setSpacing(8)
-        overview = QHBoxLayout()
-        overview.setSpacing(12)
-        status_column = QVBoxLayout()
-        status_column.setSpacing(6)
-        self.phase_badge = QLabel("就绪")
+        layout.setContentsMargins(0, 0, 0, 0)
+        status = Card("等待结果", "任务启动后自动等待开售、查询和提交；订单成功后请前往 12306 支付。")
+        self.phase_badge = QLabel("任务未开始")
         self.phase_badge.setObjectName("phaseBadge")
+        self.phase_badge.setWordWrap(True)
+        status.body.addWidget(self.phase_badge)
         self.sale_countdown = QLabel("--:--:--.-")
         self.sale_countdown.setObjectName("saleCountdown")
         self.sale_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sale_caption = QLabel("设置开始时间后显示倒计时")
         self.sale_caption.setObjectName("muted")
         self.sale_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        status_column.addWidget(self.phase_badge, alignment=Qt.AlignmentFlag.AlignLeft)
-        status_column.addWidget(self.sale_countdown)
-        status_column.addWidget(self.sale_caption)
+        status.body.addWidget(self.sale_countdown)
+        status.body.addWidget(self.sale_caption)
         metrics = QHBoxLayout()
-        metrics.setSpacing(6)
         self.query_metric = self._metric("查询", "0")
         self.rtt_metric = self._metric("RTT", "--")
         self.offset_metric = self._metric("时钟偏移", "--")
-        metrics.addWidget(self.query_metric)
-        metrics.addWidget(self.rtt_metric)
-        metrics.addWidget(self.offset_metric)
-        status_column.addLayout(metrics)
+        for metric in (self.query_metric, self.rtt_metric, self.offset_metric):
+            metrics.addWidget(metric)
+        status.body.addLayout(metrics)
+        self.timeline = CurrentPhaseWidget()
+        status.body.addWidget(self.timeline)
+        layout.addWidget(status)
 
-        self.qr_status = QLabel("未请求二维码")
-        self.qr_status.setObjectName("fieldLabel")
-        self.qr_status.setWordWrap(True)
-        status_column.addWidget(self.qr_status)
-        qr_state = QHBoxLayout()
-        qr_state.setSpacing(6)
-        self.qr_countdown = QLabel("有效期 --:--")
-        self.qr_countdown.setObjectName("qrCountdown")
-        self.refresh_qr_button = QPushButton("重新扫码")
-        self.refresh_qr_button.setEnabled(False)
-        self.refresh_qr_button.clicked.connect(self._restart_for_qr)
-        qr_state.addWidget(self.qr_countdown)
-        qr_state.addStretch(1)
-        qr_state.addWidget(self.refresh_qr_button)
-        status_column.addLayout(qr_state)
-
-        self.qr_image = QLabel("开始任务后\n在此显示二维码")
+        self.recovery_card = Card("恢复当前任务", "当前任务等待重新登录，扫码后自动继续；无需再次点击开始任务。")
+        self.recovery_layout = self.recovery_card.body
+        layout.addWidget(self.recovery_card)
+        self.authentication_panel = QWidget()
+        authentication = QHBoxLayout(self.authentication_panel)
+        authentication.setContentsMargins(0, 0, 0, 0)
+        self.qr_image = QLabel("点击下方扫码登录\n在此显示二维码")
         self.qr_image.setObjectName("qrImage")
         self.qr_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr_image.setFixedSize(160, 160)
-        overview.addLayout(status_column, 1)
-        overview.addWidget(self.qr_image, 0, Qt.AlignmentFlag.AlignTop)
-        status.body.addLayout(overview)
-        layout.addWidget(status)
+        authentication.addWidget(self.qr_image)
+        qr_text = QVBoxLayout()
+        self.qr_status = QLabel("扫码登录不会开始订票")
+        self.qr_status.setWordWrap(True)
+        self.qr_countdown = QLabel("有效期 --:--")
+        self.qr_countdown.setObjectName("qrCountdown")
+        self.refresh_qr_button = QPushButton("重新扫码")
+        self.refresh_qr_button.clicked.connect(self._restart_for_qr)
+        qr_text.addWidget(self.qr_status)
+        qr_text.addWidget(self.qr_countdown)
+        qr_text.addWidget(self.refresh_qr_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        authentication.addLayout(qr_text, 1)
+        self.account_card.body.addWidget(self.authentication_panel)
 
-        self.timeline = CurrentPhaseWidget()
-        layout.addWidget(self.timeline)
-        layout.addStretch(1)
-
+        self.login_button = QPushButton("扫码登录 12306")
+        self.login_button.setObjectName("primaryButton")
+        self.login_button.clicked.connect(lambda: self._start_connection_operation("login"))
+        self.check_login_button = QPushButton("检查登录状态", self)
+        self.check_login_button.clicked.connect(lambda: self._start_connection_operation("check_login"))
+        self.account_actions.addWidget(self.login_button)
+        self.account_actions.addStretch(1)
+        self.check_login_button.hide()
+        self.session_check_status = QLabel("登录状态：尚未检查")
+        self.session_check_status.setWordWrap(True)
+        self.session_check_status.setObjectName("muted")
+        self.session_check_status.setParent(self.account_card)
+        self.session_check_status.hide()
+        auxiliary = Card("账号与时间", "检查登录和校准时间在等待阶段串行执行，不会新建任务。")
         controls = QHBoxLayout()
-        self.validate_button = QPushButton("检查配置")
-        self.validate_button.clicked.connect(self._validate_clicked)
+        self.run_check_login_button = QPushButton("检查登录状态")
+        self.run_check_login_button.clicked.connect(lambda: self._start_connection_operation("check_login"))
+        self.sync_clock_button = QPushButton("校准时间")
+        self.sync_clock_button.clicked.connect(lambda: self._start_connection_operation("sync_clock"))
+        controls.addWidget(self.run_check_login_button)
+        controls.addWidget(self.sync_clock_button)
+        controls.addStretch(1)
+        auxiliary.body.addLayout(controls)
+        self.run_session_status = QLabel()
+        self.clock_check_status = QLabel("校时状态：尚未校准")
+        for label in (self.run_session_status, self.clock_check_status):
+            label.setWordWrap(True)
+            label.setObjectName("muted")
+            auxiliary.body.addWidget(label)
+        layout.addWidget(auxiliary)
+        self.validate_button = QPushButton("检查配置", self)
+        self.validate_button.hide()
         self.start_button = QPushButton("开始任务")
         self.start_button.setObjectName("primaryButton")
         self.start_button.clicked.connect(self._start_task)
-        self.stop_button = QPushButton("停止")
+        self.stop_button = QPushButton("停止任务")
         self.stop_button.setObjectName("dangerButton")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self._stop_task)
-        self.order_button = QPushButton("打开 12306 订单")
+        self.stop_button.clicked.connect(self._stop_or_continue)
+        self.order_button = QPushButton("前往 12306 支付")
         self.order_button.setEnabled(False)
         self.order_button.clicked.connect(self._open_order_page)
-        controls.addWidget(self.validate_button)
-        controls.addWidget(self.start_button)
-        controls.addWidget(self.stop_button)
-        controls.addWidget(self.order_button)
-        layout.addLayout(controls)
         return panel
 
     def _metric(self, name: str, value: str) -> QFrame:
@@ -726,7 +767,7 @@ class MainWindow(QMainWindow):
         except (AppError, OSError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        logging.info("已保存 version 3 JSON 配置: %s", path)
+        logging.info("已保存 version 4 JSON 配置: %s", path)
         QMessageBox.information(self, "保存成功", "已保存全部可编辑参数；文件不包含登录态或身份信息。")
 
     def _import_settings(self) -> None:
@@ -756,6 +797,8 @@ class MainWindow(QMainWindow):
             "to_station": self.to_station.text().strip(),
             "train_date": self.train_date.date().toString("yyyy-MM-dd"),
             "passenger_names": _split_names(self.passengers.text()),
+            "passenger_ticket_types": self.passenger_ticket_types.values(),
+            "quiet_carriage_preference": self.quiet_carriage.isChecked(),
             "seat_types": self.seat_types.values(),
             "preferred_trains": [item.upper() for item in _split_names(self.preferred_trains.text())],
             "only_preferred_trains": self.only_preferred.isChecked(),
@@ -801,6 +844,11 @@ class MainWindow(QMainWindow):
                 import_errors["train_date"] = "导入的乘车日期无效或已经过去，请重新选择"
             self.train_date.setDate(parsed if parsed.isValid() and parsed >= QDate.currentDate() else QDate.currentDate())
             self.passengers.setText("，".join(values["passenger_names"]))
+            overrides = values["passenger_ticket_types"]
+            if set(overrides) - set(values["passenger_names"]):
+                import_errors["passenger_ticket_types"] = "导入票种包含未选择的乘车人，请核对并重新设置"
+            self.passenger_ticket_types.set_names(values["passenger_names"], overrides)
+            self.quiet_carriage.setChecked(values["quiet_carriage_preference"])
             self.preferred_trains.setText(", ".join(values["preferred_trains"]))
             self.only_preferred.setChecked(bool(values["only_preferred_trains"]))
             for key, combo in (("priority_strategy", self.priority_strategy),):
@@ -853,6 +901,10 @@ class MainWindow(QMainWindow):
             self._target_edited()
         finally:
             self._applying_values = False
+        self.contact_selector.set_selected_names(_split_names(self.passengers.text()))
+        self.manual_toggle.setChecked(bool(self.passengers.text().strip()))
+        self._render_workflow()
+        self.passenger_ticket_types.set_contact_types({row["name"]: row.get("passenger_type", "") for row in self._contacts})
         return import_errors, warnings
 
     def _reset_advanced(self) -> None:
@@ -897,6 +949,7 @@ class MainWindow(QMainWindow):
         full: bool = True,
     ) -> Dict[str, str]:
         errors = validate_gui_mapping(self._collect_mapping(), self.station_names)
+        errors.update(self._contact_errors())
         if extra_errors:
             errors.update({str(key): str(value) for key, value in extra_errors.items()})
         if full:
@@ -939,9 +992,13 @@ class MainWindow(QMainWindow):
         if not key:
             return
         page_index = self.field_pages.get(key, 0)
-        self.config_tabs.setCurrentIndex(page_index)
+        self._go_to_step(page_index)
+        if key in self.advanced:
+            self.advanced_toggle.setChecked(True)
+        if key == "passenger_names":
+            self.manual_toggle.setChecked(True)
         block = self.field_blocks[key]
-        scroll = self.basic_scroll if page_index == 0 else self.advanced_scroll
+        scroll = (self.basic_scroll, self.passenger_scroll, self.confirm_scroll)[page_index]
         scroll.ensureWidgetVisible(block, 24, 24)
         widget = self.field_widgets[key]
         if key == "seat_position_preferences":
@@ -965,6 +1022,170 @@ class MainWindow(QMainWindow):
     def _build_current_config(self) -> AppConfig:
         return build_app_config(self._collect_mapping(), LEGACY_CONFIG_FILE)
 
+    def _passenger_names_changed(self) -> None:
+        if self._applying_values:
+            return
+        self.passenger_ticket_types.set_names(_split_names(self.passengers.text()))
+        self.contact_selector.set_selected_names(_split_names(self.passengers.text()))
+        self._render_workflow()
+        self._schedule_validation("passenger_names", "passenger_ticket_types", "seat_position_preferences", "berth_preference")
+
+    def _connection_config(self) -> ConnectionConfig:
+        keys = (
+            "request_timeout_seconds", "login_qr_timeout_seconds", "login_qr_poll_seconds",
+            "time_sync_samples", "time_sync_max_rtt_seconds",
+        )
+        values = {key: self.advanced[key].value() for key in keys}
+        values["persist_session"] = False
+        return ConnectionConfig.from_mapping(values, base_dir=LOCAL_DATA_DIR)
+
+    def _start_connection_operation(self, mode: str, *, force_login: bool = False) -> None:
+        if self._active_operation is not None:
+            if (self._operation_mode == "task" and mode in {"login", "check_login", "sync_clock"}
+                    and self._maintenance_enabled and not self._maintenance_busy and self.cancel_token):
+                if self.cancel_token.request_action(mode):
+                    self._maintenance_busy = True
+                    self._update_connection_controls()
+            return
+        try:
+            cfg = self._connection_config()
+        except (AppError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "连接参数需要修改", str(exc))
+            return
+        self.flow_error.clear()
+        self.flow_error.hide()
+        self._operation_mode = mode
+        self._operation_generation += 1
+        if mode == "login":
+            self._qr_operation = "login"
+            self._qr_deadline = 0.0
+            self.qr_image.setPixmap(QPixmap())
+            self.qr_image.setText("正在准备扫码登录…" if mode == "login" else "正在检查账号登录…")
+            self.qr_status.setText("本次只登录并读取乘车人" if mode == "contacts" else "本次只登录，不启动订票")
+        self.start_button.setEnabled(False)
+        self.validate_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self._set_forms_enabled(False)
+        self._set_phase("syncing" if mode == "sync_clock" else "login", {
+            "login": "扫码登录", "contacts": "读取账号乘车人", "sync_clock": "正在重新校时", "check_login": "正在检查登录",
+        }[mode])
+        self._dispatch_operation(mode, cfg, force_login=force_login)
+
+    def _ensure_executor(self) -> None:
+        if self._executor is not None:
+            return
+        self._background_thread = QThread(self)
+        self._executor = OperationWorker()
+        self._executor.moveToThread(self._background_thread)
+        self.submit_operation.connect(self._executor.execute, Qt.ConnectionType.QueuedConnection)
+        self.retire_executor.connect(self._executor.retire_to_thread, Qt.ConnectionType.QueuedConnection)
+        self._executor.runtime_event.connect(self._receive_runtime_event, Qt.ConnectionType.QueuedConnection)
+        self._executor.finished.connect(self._receive_operation_outcome, Qt.ConnectionType.QueuedConnection)
+        self._background_thread.start()
+
+    def _dispatch_operation(self, mode: str, cfg: object, *, force_login: bool = False) -> None:
+        if self._active_operation is not None or self._closing_executor:
+            return
+        self._ensure_executor()
+        self.cancel_token = GuiCancelToken()
+        request = OperationRequest(self._operation_generation, mode, cfg, self.cancel_token,
+                                   self.shared_session, self.shared_clock, force_login)
+        self._active_operation = request
+        self.worker = self._executor
+        self._update_connection_controls()
+        self.submit_operation.emit(request)
+
+    @Slot(int, str, object)
+    def _receive_runtime_event(self, generation: int, kind: str, payload: object) -> None:
+        self._on_runtime_event(kind, payload, generation=generation)
+
+    @Slot(int, object)
+    def _receive_operation_outcome(self, generation: int, outcome: OperationOutcome) -> None:
+        if not self._accept_operation_callback(generation, allow_cancelled=True):
+            return
+        if outcome.mode == "task":
+            self._order_state = outcome.order_state
+            self._restart_allowed = (bool(self.cancel_token and self.cancel_token.is_cancelled)
+                                     and outcome.safe_to_restart and not outcome.error)
+            if outcome.error:
+                self._on_worker_failed(outcome.error, outcome.details, generation=generation)
+            else:
+                self._on_worker_completed(int(outcome.result), generation=generation)
+            if outcome.order_state != "safe":
+                self.order_button.setEnabled(True)
+                if outcome.order_state != "success":
+                    self._show_flow_error("订单可能已提交，请先到 12306 核对。停止不会撤销订单。")
+        elif outcome.error:
+            self._on_connection_failed(outcome.error, outcome.details, generation=generation)
+        else:
+            self._on_connection_completed(outcome.mode, outcome.result, generation=generation)
+        self._release_operation(generation=generation)
+
+    def _on_connection_completed(self, mode: str, result: object, *, generation: Optional[int] = None) -> None:
+        if not self._accept_operation_callback(generation, allow_cancelled=result is None):
+            return
+        if mode in {"login", "contacts"} and isinstance(result, Mapping):
+            if result.get("authenticated") is True:
+                self.account_state = "valid"
+                self._login_required = False
+                contacts = result.get("contacts")
+                if isinstance(contacts, list):
+                    self._contacts = contacts
+                    self._contacts_loaded = True
+                    self.contact_selector.set_contacts(contacts, _split_names(self.passengers.text()))
+                self._contacts_error = str(result.get("contacts_error") or "")
+                if self._contacts_error:
+                    self._contacts = []
+                    self._contacts_loaded = False
+                    self.contact_selector.set_contacts([])
+                    self.manual_toggle.setChecked(True)
+            elif result.get("authenticated") is False:
+                self.account_state = "expired"
+                self._login_required = True
+                self._contacts = []
+                self._contacts_loaded = False
+                self.contact_selector.set_contacts([])
+                self._show_flow_error("登录已失效，请点击“扫码登录 12306”，登录后重新读取联系人。")
+        elif mode == "check_login":
+            if result is True:
+                self.account_state = "valid"
+            elif result is False:
+                self.account_state = "expired"
+        self._operation_message = "操作已停止" if result is None else "操作完成"
+        self.passenger_ticket_types.set_contact_types({row["name"]: row.get("passenger_type", "") for row in self._contacts})
+        self._render_workflow()
+
+    def _on_connection_failed(self, message: str, details: str, *, generation: Optional[int] = None) -> None:
+        if not self._accept_operation_callback(generation):
+            return
+        self._operation_message = "操作未完成，可重试"
+        self._show_flow_error(message)
+        logging.error("连接操作失败: %s", message)
+        logging.debug("%s", details)
+        self._render_workflow()
+
+    def _choose_account_passengers(self, contacts: list[dict[str, str]], generation: Optional[int] = None) -> None:
+        if generation is not None and generation != self._operation_generation:
+            return
+        self._contacts = contacts
+        self._contacts_loaded = True
+        self.contact_selector.set_contacts(contacts, _split_names(self.passengers.text()))
+        self.passenger_ticket_types.set_contact_types({row["name"]: row.get("passenger_type", "") for row in contacts})
+
+    def _update_connection_controls(self) -> None:
+        active = self._active_operation is not None
+        waiting = active and self._operation_mode == "task" and self._maintenance_enabled and not self._maintenance_busy
+        allowed = not active or waiting
+        self.check_login_button.setEnabled(allowed)
+        self.sync_clock_button.setEnabled(allowed)
+        self.refresh_qr_button.setEnabled(allowed and self._qr_deadline <= 0 and (self._login_required or self.qr_countdown.text() == "已过期"))
+        self._render_workflow()
+
+    def _accept_operation_callback(self, generation: Optional[int] = None, *, allow_cancelled: bool = False) -> bool:
+        if generation is not None and generation != self._operation_generation:
+            return False
+        return allow_cancelled or self.cancel_token is None or not self.cancel_token.is_cancelled
+
     def _validate_clicked(self) -> None:
         errors = self._validate_all(focus_first=True)
         if errors:
@@ -984,7 +1205,13 @@ class MainWindow(QMainWindow):
 
     # ----- Task lifecycle --------------------------------------------------
     def _start_task(self) -> None:
-        if self.thread and self.thread.isRunning():
+        if self.current_step != 2:
+            return
+        if self.account_state != "valid":
+            self._go_to_step(1)
+            self._show_flow_error("请先登录 12306，再确认任务。")
+            return
+        if self._active_operation is not None:
             return
         if self.station_refresh_worker and self.station_refresh_worker.is_alive():
             QMessageBox.information(self, "站点正在更新", "请等待站点列表更新完成后再开始任务。")
@@ -1000,53 +1227,66 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法启动", str(exc))
             return
 
-        seat_positions = self.position_preferences.seats.positions()
-        berths = self.position_preferences.berths.values()
-        codes = {SEAT_SPECS[label].submit_code for label in cfg.seat_types}
-        position_parts = []
-        if seat_positions and codes.intersection(SEATED_SEAT_TYPES):
-            position_parts.append("座位关系 " + "/".join(seat_positions))
-        if sum(berths.values()) and codes.intersection(BERTH_SEAT_TYPES):
-            position_parts.append(f"下/中/上铺 {berths['lower']}/{berths['middle']}/{berths['upper']}")
-        position_text = "；".join(position_parts) or "无启用的偏好"
-        summary = (
-            f"{cfg.from_station} → {cfg.to_station}   {cfg.train_date}\n"
-            f"乘车人：{'、'.join(cfg.passenger_names) or '仅监控'}\n"
-            f"优先车次：{', '.join(cfg.preferred_trains) or '未指定'}\n"
-            f"{scope_summary(cfg.preferred_trains, cfg.only_preferred_trains, cfg.empty_train_scope)}\n"
-            f"席别：{' → '.join(cfg.seat_types)}\n"
-            f"策略：{'席别优先' if cfg.priority_strategy == 'seat_first' else '车次优先'}\n"
-            f"尝试顺序示例：{priority_preview(cfg.preferred_trains, cfg.seat_types, cfg.priority_strategy, cfg.only_preferred_trains, cfg.empty_train_scope)}\n"
-            f"位置：{position_text}（无法满足时自动分配）\n"
-            f"模式：{'自动提交' if cfg.auto_submit else '仅监控'}"
-        )
-        answer = QMessageBox.question(
-            self,
-            "确认启动任务",
-            summary,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Yes,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+        self._launch_task(cfg)
 
+    def _launch_task(self, cfg: AppConfig, *, restarting: bool = False) -> None:
+        if self._active_operation is not None or self._closing_executor:
+            return
+        if self._order_state != "safe":
+            self._go_to_step(3)
+            self._show_flow_error("请先到 12306 核对已有订单，当前不能再次提交。")
+            return
+        self._last_run_config = deepcopy(cfg)
+        if not restarting:
+            self._last_run_stop_deadline = None
+            if cfg.stop_at:
+                now = datetime.fromtimestamp(self._server_now_timestamp())
+                self._last_run_stop_deadline = (
+                    datetime.combine(now.date(), datetime.strptime(cfg.stop_at, "%H:%M:%S").time())
+                    if len(cfg.stop_at) == 8 else datetime.strptime(cfg.stop_at, "%Y-%m-%d %H:%M:%S"))
+        self._restart_allowed = False
+        self._return_after_stop = False
         self._prepare_for_run(cfg)
-        self.event_relay = EventRelay()
-        self.event_relay.runtime_event.connect(self._on_runtime_event)
-        self.cancel_token = GuiCancelToken()
-        self.thread = QThread(self)
-        self.worker = TicketWorker(cfg, self.event_relay, self.cancel_token, self.shared_session)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.completed.connect(self._on_worker_completed)
-        self.worker.failed.connect(self._on_worker_failed)
-        self.worker.done.connect(self.thread.quit)
-        self.worker.done.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self._on_thread_finished)
-        self.thread.finished.connect(self.thread.deleteLater)
-        self.thread.start()
+        self._dispatch_operation("task", cfg)
+
+    def _stop_or_continue(self) -> None:
+        if self._active_operation is not None:
+            self._stop_task()
+        else:
+            self._continue_task()
+
+    def _continue_task(self) -> None:
+        if (self._active_operation is not None or self.current_step != 3
+                or not self._restart_allowed or self._last_run_config is None):
+            return
+        cfg = deepcopy(self._last_run_config)
+        now = datetime.fromtimestamp(self._server_now_timestamp())
+        if datetime.strptime(cfg.train_date, "%Y-%m-%d").date() < now.date():
+            self._restart_allowed = False
+            self._focus_first_error({"train_date": "乘车日期已过，请修改行程"})
+            self._show_flow_error("乘车日期已过，请修改行程后重新开始。")
+            return
+        if cfg.stop_at:
+            stop = self._last_run_stop_deadline
+            if stop is None:
+                stop = (datetime.combine(now.date(), datetime.strptime(cfg.stop_at, "%H:%M:%S").time())
+                        if len(cfg.stop_at) == 8 else datetime.strptime(cfg.stop_at, "%Y-%m-%d %H:%M:%S"))
+            if now >= stop:
+                self._restart_allowed = False
+                self._focus_first_error({"stop_at": "停止时间已过，请修改"})
+                self._show_flow_error("原停止时间已过，请修改后重新开始。")
+                return
+        self._launch_task(cfg, restarting=True)
 
     def _prepare_for_run(self, cfg: AppConfig) -> None:
+        self._operation_generation += 1
+        self._operation_mode = "task"
+        self._task_state = "running"
+        self._go_to_step(3)
+        self._qr_operation = "login"
+        self._maintenance_enabled = False
+        self._maintenance_busy = False
+        self._login_required = False
         self.timeline.reset_timeline()
         self.timeline.set_phase("preparing", "正在启动")
         self._last_phase = "preparing"
@@ -1056,7 +1296,6 @@ class MainWindow(QMainWindow):
         self._completion_prompt_shown = False
         self._qr_deadline = 0.0
         self._target_timestamp = None
-        self._server_anchor = None
         self._pending_query_payload = None
         self.query_ui_timer.stop()
         self.qr_image.setPixmap(QPixmap())
@@ -1065,8 +1304,6 @@ class MainWindow(QMainWindow):
         self.qr_countdown.setText("有效期 --:--")
         self.refresh_qr_button.setEnabled(False)
         self.query_metric.value_label.setText("0")  # type: ignore[attr-defined]
-        self.rtt_metric.value_label.setText("--")  # type: ignore[attr-defined]
-        self.offset_metric.value_label.setText("--")  # type: ignore[attr-defined]
         self.phase_badge.setText("正在启动")
         self.start_button.setEnabled(False)
         self.validate_button.setEnabled(False)
@@ -1087,13 +1324,24 @@ class MainWindow(QMainWindow):
     def _stop_task(self) -> None:
         if not self.cancel_token:
             return
+        self._pending_query_payload = None
+        self.query_ui_timer.stop()
         self.cancel_token.cancel()
+        self._maintenance_enabled = False
+        self._maintenance_busy = True
+        self._update_connection_controls()
         self.stop_button.setEnabled(False)
-        self.phase_badge.setText("正在安全停止…")
-        self.timeline.set_phase("cancelled", "等待当前请求返回")
+        if self._operation_mode == "task":
+            self.phase_badge.setText("正在安全停止…")
+            self.timeline.set_phase("cancelled", "等待当前请求返回")
+        else:
+            self._operation_message = "正在取消当前操作…"
+        self._render_workflow()
         logging.warning("已发送停止请求，当前网络请求最多需等待超时时间")
 
-    def _on_worker_completed(self, code: int) -> None:
+    def _on_worker_completed(self, code: int, *, generation: Optional[int] = None) -> None:
+        if not self._accept_operation_callback(generation, allow_cancelled=code == 130):
+            return
         if self._order_succeeded:
             self._set_phase("success", "出票成功，请尽快支付")
         elif code == 130:
@@ -1111,64 +1359,133 @@ class MainWindow(QMainWindow):
                 self._completion_prompt_shown = True
                 QMessageBox.information(self, "任务结束，未出票", message)
 
-    def _on_worker_failed(self, message: str, details: str) -> None:
+    def _on_worker_failed(self, message: str, details: str, *, generation: Optional[int] = None) -> None:
+        if not self._accept_operation_callback(generation, allow_cancelled=True):
+            return
         self._set_phase("failed", message)
         self.order_button.setEnabled(True)
         logging.error("任务异常: %s", message)
         logging.debug("%s", details)
         QMessageBox.critical(self, "任务失败", message)
 
-    def _on_thread_finished(self) -> None:
-        self.start_button.setEnabled(True)
-        self.validate_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self._set_forms_enabled(True)
-        self.worker = None
-        self.thread = None
-        self.event_relay = None
-        self.cancel_token = None
-        if self._close_when_finished:
-            self._close_when_finished = False
-            self.close()
+    def _release_operation(self, *, generation: Optional[int] = None) -> None:
+        if not self._accept_operation_callback(generation, allow_cancelled=True):
             return
-        if self._pending_restart:
-            self._pending_restart = False
-            QTimer.singleShot(0, self._start_task)
+        was_cancelled = self.cancel_token is not None and self.cancel_token.is_cancelled
+        self._pending_query_payload = None
+        self.query_ui_timer.stop()
+        if was_cancelled and self.account_state != "valid":
+            self._qr_deadline = 0.0
+            self._login_required = True
+            self.qr_image.setPixmap(QPixmap())
+            self.qr_image.setText("扫码已取消")
+            self.qr_countdown.setText("已取消")
+        if was_cancelled and self._operation_mode == "task" and not self._order_succeeded and self._last_phase != "failed":
+            self._set_phase("cancelled", "任务已停止")
+        self._active_operation = None
+        self.worker = None
+        self.cancel_token = None
+        self._operation_generation += 1
+        self._operation_mode = None
+        self._maintenance_enabled = False
+        self._maintenance_busy = False
+        self._set_forms_enabled(True)
+        if self._return_after_stop:
+            self._return_after_stop = False
+            if self._order_state != "safe":
+                self._go_to_step(3)
+                self._show_flow_error("订单可能已提交，请先到 12306 核对。停止不会撤销订单。")
+            else:
+                self._restart_allowed = False
+        self._update_connection_controls()
+        if self._close_when_finished:
+            self.close()
 
     def _restart_for_qr(self) -> None:
-        if self.thread and self.thread.isRunning():
-            self._pending_restart = True
-            self._stop_task()
-        else:
-            self._start_task()
+        # Refreshing authentication never starts or restarts ticket ordering.
+        if self._operation_mode == "task":
+            self._start_connection_operation("login", force_login=True)
+            return
+        self._start_connection_operation(self._qr_operation, force_login=True)
 
     # ----- Runtime events, logs and clocks --------------------------------
-    def _on_runtime_event(self, kind: str, raw_payload: object) -> None:
+    def _on_runtime_event(self, kind: str, raw_payload: object, *, generation: Optional[int] = None) -> None:
         payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {"value": raw_payload}
         message = str(payload.get("message", ""))
         kind = str(kind).lower()
+        terminal = kind in {"order_success", "error", "finished"} or (
+            kind == "phase" and payload.get("phase") in {"cancelled", "failed", "success"}
+        )
+        if not self._accept_operation_callback(generation, allow_cancelled=terminal):
+            return
         if kind == "phase":
             self._set_phase(str(payload.get("phase", "preparing")), message)
+        elif kind == "maintenance_availability":
+            self._maintenance_enabled = bool(payload.get("enabled"))
+            self._maintenance_busy = bool(payload.get("busy"))
+            self._login_required = bool(payload.get("login_required"))
+            self._update_connection_controls()
+        elif kind == "session_checked":
+            state = str(payload.get("state", "failed"))
+            checked = self._format_checked_time(payload.get("checked_at"))
+            descriptions = {"valid": "检查时已登录", "expired": "已失效，请扫码", "failed": "检查失败，暂时无法确认"}
+            self.session_check_status.setText(f"登录状态：{descriptions.get(state, descriptions['failed'])} · {checked}")
+            if state == "expired":
+                self.account_state = "expired"
+                self._contacts = []
+                self._contacts_loaded = False
+                self.contact_selector.set_contacts([])
+                self.passenger_ticket_types.set_contact_types({})
+                self._login_required = True
+                self._qr_deadline = 0.0
+                self._qr_operation = "login"
+                self.qr_image.setPixmap(QPixmap())
+                self.qr_image.setText("登录已失效\n请扫码登录")
+                self.qr_status.setText("等待扫码恢复" if self._operation_mode == "task" else "点击“扫码登录”可重新登录，不会启动订票")
+            elif state == "valid":
+                self.account_state = "valid"
+                self._login_required = False
+                self._qr_deadline = 0.0
+                self.qr_image.setPixmap(QPixmap())
+                self.qr_image.setText("✓\n已登录\n无需重新扫码")
+                self.qr_countdown.setText("会话有效")
+                self.qr_status.setText("检查时登录会话有效，无需重新扫码")
+            self._update_connection_controls()
         elif kind == "clock_sync":
-            self._set_phase("syncing", message)
+            success = payload.get("success", True) is True
+            checked = self._format_checked_time(payload.get("checked_at"))
+            clock_state = "成功" if success else ("失败，保留上次校准" if self._server_anchor else "失败，使用本地时间")
+            self.clock_check_status.setText(f"校时状态：{clock_state} · {checked}")
+            if self._operation_mode == "task" and payload.get("source") == "manual":
+                self._set_phase("waiting", "等待热身查询窗口")
+            elif self._operation_mode not in {None, "check_login", "contacts", "login"}:
+                self._set_phase("syncing", message)
             offset = float(payload.get("offset_seconds", 0.0) or 0.0)
             rtt = payload.get("rtt_ms")
             server_timestamp = payload.get("server_timestamp")
             monotonic_timestamp = payload.get("monotonic_timestamp")
-            if server_timestamp is not None and monotonic_timestamp is not None:
+            if success and server_timestamp is not None and monotonic_timestamp is not None:
                 self._server_anchor = (float(server_timestamp), float(monotonic_timestamp))
-            self.offset_metric.value_label.setText(f"{offset:+.3f}s")  # type: ignore[attr-defined]
-            self.rtt_metric.value_label.setText("--" if rtt is None else f"{float(rtt):.0f}ms")  # type: ignore[attr-defined]
+            if success:
+                self.offset_metric.value_label.setText(f"{offset:+.3f}s")  # type: ignore[attr-defined]
+                self.rtt_metric.value_label.setText("--" if rtt is None else f"{float(rtt):.0f}ms")  # type: ignore[attr-defined]
         elif kind == "qr_ready":
+            self.account_state = "expired"
+            self._login_required = True
             self._set_phase("login", message)
             self._show_qr(payload.get("image_bytes") or payload.get("image"))
             self._qr_deadline = float(payload.get("expires_at", 0.0) or 0.0)
             self.qr_status.setText(message or "等待扫码")
             self.refresh_qr_button.setEnabled(False)
+            self._maintenance_busy = True
+            self._update_connection_controls()
         elif kind == "qr_status":
             status = str(payload.get("status", ""))
             self.qr_status.setText(message or status)
             if status in {"confirmed", "success", "logged_in"}:
+                self.account_state = "valid"
+                self._login_required = False
+                self.session_check_status.setText(f"登录状态：有效 · {self._format_checked_time(payload.get('checked_at'))}")
                 self._qr_deadline = 0.0
                 self.qr_image.setPixmap(QPixmap())
                 self.refresh_qr_button.setEnabled(False)
@@ -1179,11 +1496,14 @@ class MainWindow(QMainWindow):
                     self.qr_image.setText("✓\n登录成功")
                     self.qr_countdown.setText("已确认")
             elif status in {"expired", "timeout"}:
+                self._login_required = True
                 self._qr_deadline = 0.0
                 self.qr_image.setPixmap(QPixmap())
                 self.qr_image.setText("二维码已过期")
                 self.qr_countdown.setText("已过期")
                 self.refresh_qr_button.setEnabled(True)
+                if self._active_operation is not None:
+                    self._update_connection_controls()
         elif kind == "query":
             # Query events can arrive much faster than a screen can repaint.
             # Keep the newest metrics and render at most once per 100 ms;
@@ -1199,6 +1519,8 @@ class MainWindow(QMainWindow):
         elif kind == "order_success":
             first_success = not self._order_succeeded
             self._order_succeeded = True
+            self._order_state = "success"
+            self._restart_allowed = False
             self._order_id = str(payload.get("order_id", ""))
             self.order_button.setEnabled(True)
             self._set_phase("success", message or "抢票成功")
@@ -1213,9 +1535,18 @@ class MainWindow(QMainWindow):
         elif kind == "finished" and int(payload.get("exit_code", 1) or 0) == 130:
             self._set_phase("cancelled", message)
 
+        self._render_workflow()
         target = payload.get("target_timestamp")
         if target is not None:
             self._target_timestamp = float(target)
+
+    @staticmethod
+    def _format_checked_time(value: object) -> str:
+        try:
+            timestamp = float(value) if value is not None else time.time()
+            return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+        except (TypeError, ValueError, OverflowError, OSError):
+            return str(value)[:19]
 
     def _flush_query_event(self) -> None:
         payload = self._pending_query_payload
@@ -1245,9 +1576,18 @@ class MainWindow(QMainWindow):
         )
 
     def _set_phase(self, phase: str, message: str = "") -> None:
+        if self._operation_mode not in {None, "task"}:
+            self._operation_message = message
+            self._render_workflow()
+            return
+        if phase in {"cancelled", "failed", "success", "no_ticket"}:
+            self._pending_query_payload = None
+            self.query_ui_timer.stop()
         self._last_phase = phase
+        self._task_state = phase
         self.timeline.set_phase(phase, message)
         self.phase_badge.setText(message or phase)
+        self._render_workflow()
 
     def _on_log_batch(self, lines: object) -> None:
         if not isinstance(lines, Iterable) or isinstance(lines, (str, bytes, bytearray)):
@@ -1257,23 +1597,9 @@ class MainWindow(QMainWindow):
             if isinstance(item, (tuple, list)) and len(item) == 2:
                 batch.append((str(item[0]), str(item[1])))
         self.log_view.append_lines(batch)
-        for line, _level in batch:
-            self._update_phase_from_log(line)
 
     def _on_log_message(self, line: str, level: str) -> None:
         self.log_view.append_line(line, level)
-        self._update_phase_from_log(line)
-
-    def _update_phase_from_log(self, line: str) -> None:
-        # Compatibility fallback for older cores that only log text.
-        if "等待热身查询窗口" in line:
-            self._set_phase("waiting", "等待热身查询窗口")
-        elif "开始提交订单" in line:
-            self._set_phase("submitting", "正在提交订单")
-        elif "已提交排队" in line:
-            self._set_phase("queued", "等待出票")
-        elif "抢票成功" in line:
-            self._set_phase("success", "抢票成功")
 
     def _server_now_timestamp(self) -> float:
         if self._server_anchor:
@@ -1317,7 +1643,7 @@ class MainWindow(QMainWindow):
             if remaining <= 0:
                 self._qr_deadline = 0.0
                 self.qr_status.setText("二维码已过期")
-                self.refresh_qr_button.setEnabled(True)
+                self._update_connection_controls()
 
     @staticmethod
     def _format_remaining(seconds: float, tenths: bool = False) -> str:
@@ -1354,7 +1680,7 @@ class MainWindow(QMainWindow):
             field.setCompleter(completer)
 
     def _refresh_stations(self) -> None:
-        if self.thread and self.thread.isRunning():
+        if self._active_operation is not None:
             return
         if self.station_refresh_worker and self.station_refresh_worker.is_alive():
             return
@@ -1374,7 +1700,7 @@ class MainWindow(QMainWindow):
     def _on_station_refresh_finished(self, stations: object, error: object) -> None:
         self.station_refresh_worker = None
         self.update_stations_button.setText("更新站点")
-        task_running = bool(self.thread and self.thread.isRunning())
+        task_running = bool(self._active_operation is not None)
         self.update_stations_button.setEnabled(not task_running)
         self.start_button.setEnabled(not task_running)
         if error is not None:
@@ -1397,11 +1723,16 @@ class MainWindow(QMainWindow):
         self.position_preferences.adapt_to_seats(self.seat_types.values())
         self._refresh_order_preview()
 
+    def _preferred_trains_edited(self, *_args: object) -> None:
+        if self._applying_values:
+            return
+        if not _split_names(self.preferred_trains.text()):
+            self.only_preferred.setChecked(False)
+        self._train_inputs_changed()
+
     def _train_inputs_changed(self, *_args: object) -> None:
         if self._applying_values:
             return
-        if self.sender() is self.preferred_trains and not _split_names(self.preferred_trains.text()):
-            self.only_preferred.setChecked(False)
         self._refresh_train_guidance()
         self._schedule_validation("preferred_trains")
 
@@ -1431,12 +1762,12 @@ class MainWindow(QMainWindow):
         )
 
     def _focus_seat_types(self) -> None:
-        self.config_tabs.setCurrentIndex(0)
+        self._go_to_step(0)
         self.basic_scroll.ensureWidgetVisible(self.field_blocks["seat_types"], 24, 24)
         self.seat_types.list.setFocus()
 
     def _focus_sleeper_seats(self) -> None:
-        self.config_tabs.setCurrentIndex(0)
+        self._go_to_step(0)
         self.seat_types.focus_sleeper_group()
         target = self.seat_types.checkboxes["硬卧"]
         self.basic_scroll.ensureWidgetVisible(target, 24, 24)
@@ -1455,6 +1786,10 @@ class MainWindow(QMainWindow):
             self.swap_stations_button,
             self.train_date,
             self.passengers,
+            self.passenger_ticket_types,
+            self.contact_selector,
+            self.quiet_carriage,
+            self.select_passengers_button,
             self.preferred_trains,
             self.only_preferred,
             self.priority_strategy,
@@ -1479,28 +1814,71 @@ class MainWindow(QMainWindow):
     def _open_order_page(self) -> None:
         QDesktopServices.openUrl(QUrl(ORDER_URL))
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        if hasattr(self, "log_view"):
+            self.log_view.setFixedHeight(min(160, max(100, self.height() - 650)))
+            root = self.centralWidget().layout()
+            compact = self.height() < 650
+            root.setContentsMargins(12 if compact else 22, 8 if compact else 18,
+                                   12 if compact else 22, 8 if compact else 20)
+            root.setSpacing(8 if compact else 14)
+            short = self.height() < 500
+            if getattr(self, "_compact_chrome", None) != short:
+                self._compact_chrome = short
+                self._header_logo.setVisible(not short)
+                self._header_subtitle.setVisible(not short)
+                for button in self.step_buttons:
+                    button.setStyleSheet("padding: 4px 4px;" if short else "")
+                self.workflow_status.setStyleSheet("padding: 4px 12px;" if short else "")
+
+    def _poll_executor_shutdown(self) -> None:
+        thread = self._background_thread
+        if thread is not None and not thread.wait(0):
+            QTimer.singleShot(25, self._poll_executor_shutdown)
+            return
+        if thread is not None:
+            thread.deleteLater()
+        if self._executor is not None:
+            # The queued retirement slot moved this object back before quit.
+            # Joining first also ensures the final Python slot has returned.
+            self._executor.setParent(self)
+            self._executor.deleteLater()
+        self._background_thread = None
+        self._executor = None
+        self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
-        if self.thread and self.thread.isRunning():
-            answer = QMessageBox.question(
-                self,
-                "任务仍在运行",
-                "先安全停止任务再退出吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Yes,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
+        if self._active_operation is not None:
+            if not self._close_when_finished:
+                answer = QMessageBox.question(self, "操作仍在进行", "停止当前操作并退出吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes)
+                if answer != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
             self._close_when_finished = True
             self._stop_task()
             event.ignore()
             return
-        logging.getLogger().removeHandler(self.log_pipeline.handler)
-        self.log_pipeline.close()
-        if self.tray:
-            self.tray.hide()
-        self.shared_session.cookies.clear()
-        self.shared_session.close()
+        if self._background_thread is not None:
+            if not self._closing_executor:
+                self._closing_executor = True
+                if self._executor is not None:
+                    self.retire_executor.emit(self.thread())
+                else:
+                    self._background_thread.quit()
+                QTimer.singleShot(0, self._poll_executor_shutdown)
+            event.ignore()
+            return
+        if not self._session_closed:
+            self._session_closed = True
+            logging.getLogger().removeHandler(self.log_pipeline.handler)
+            self.log_pipeline.close()
+            if self.tray:
+                self.tray.hide()
+            self.shared_session.cookies.clear()
+            self.shared_session.close()
         event.accept()
 
 
@@ -1532,7 +1910,7 @@ def run_gui(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--screenshot")
-    parser.add_argument("--window-size", choices=("1200x720", "1260x850"))
+    parser.add_argument("--window-size", choices=("640x480", "900x700", "1000x800", "1200x720", "1260x850"))
     parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
     options, remaining = parser.parse_known_args(argv[1:])
     qt_argv = [argv[0], *remaining]

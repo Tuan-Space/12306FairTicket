@@ -463,10 +463,12 @@ class RailwayClientPreferenceTests(unittest.TestCase):
 
         client.ensure_login()
 
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].kind, "qr_status")
-        self.assertEqual(events[0].data["status"], "logged_in")
-        self.assertEqual(events[0].message, "当前登录会话仍然有效，无需重新扫码")
+        checked = [event for event in events if event.kind == "session_checked"]
+        self.assertEqual(checked[0].data["state"], "valid")
+        qr_events = [event for event in events if event.kind == "qr_status"]
+        self.assertEqual(len(qr_events), 1)
+        self.assertEqual(qr_events[0].data["status"], "logged_in")
+        self.assertEqual(qr_events[0].message, "当前登录会话仍然有效，无需重新扫码")
         self.assertTrue(client.session.post.call_args.args[0].endswith("/otn/login/checkUser"))
         client._prefetch_login_cookies.assert_not_called()
         client._create_qr_code.assert_not_called()

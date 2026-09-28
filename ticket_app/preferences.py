@@ -317,6 +317,7 @@ class OrderPreferencePayload:
     choose_seats: str = ""
     seat_detail_type: str = "000"
     warnings: Tuple[str, ...] = ()
+    is_jy: str = "N"
 
     def __post_init__(self) -> None:
         choose_seats = str(self.choose_seats or "").strip().upper()
@@ -325,6 +326,8 @@ class OrderPreferencePayload:
             raise ValueError("choose_seats 必须由 1A/2F 形式的关系格子连接组成")
         if not re.fullmatch(r"[0-5]{3}", seat_detail_type):
             raise ValueError("seatDetailType 必须是下/中/上三个 0-5 数字")
+        if not isinstance(self.is_jy, str) or self.is_jy not in {"Y", "N"}:
+            raise ValueError("is_jy 必须是 Y 或 N")
         object.__setattr__(self, "choose_seats", choose_seats)
         object.__setattr__(self, "seat_detail_type", seat_detail_type)
         object.__setattr__(self, "warnings", tuple(str(item) for item in self.warnings if str(item)))
@@ -334,7 +337,7 @@ class OrderPreferencePayload:
         return self.seat_detail_type
 
     def to_form_fields(self) -> Mapping[str, str]:
-        return {"choose_seats": self.choose_seats, "seatDetailType": self.seat_detail_type}
+        return {"choose_seats": self.choose_seats, "seatDetailType": self.seat_detail_type, "is_jy": self.is_jy}
 
 
 def build_order_preference_payload(
@@ -344,6 +347,8 @@ def build_order_preference_payload(
     seat_type: str,
     passenger_count: int,
     dw_flag: str = "",
+    quiet_carriage_preference: bool = False,
+    quiet_carriage_available: bool = False,
 ) -> OrderPreferencePayload:
     """Resolve configured preferences against the current order capabilities.
 
@@ -382,4 +387,13 @@ def build_order_preference_payload(
                 passenger_count, capabilities.can_choose_middle
             )
 
-    return OrderPreferencePayload(choose_seats, seat_detail_type, tuple(warnings))
+    # The official page only offers this for actual second-class seats.  The
+    # caller passes WZ for standing tickets, whose submission code also is O.
+    is_jy = "N"
+    if quiet_carriage_preference is True:
+        if seat_type == "O" and quiet_carriage_available is True:
+            is_jy = "Y"
+        else:
+            warnings.append("本次未启用静音车厢偏好，将由12306分配车厢")
+
+    return OrderPreferencePayload(choose_seats, seat_detail_type, tuple(warnings), is_jy)

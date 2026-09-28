@@ -94,7 +94,7 @@ def test_new_sleeper_candidates_preserve_both_priority_strategies(strategy, expe
 def test_parse_to_order_sends_exact_code_and_capability_checked_berths(
     monkeypatch, label, code, beds, middle, requested_middle, detail
 ):
-    cfg = AppConfig.from_mapping(settings(seat_types=[label], berth_preference={"lower": 1-requested_middle, "middle": requested_middle}))
+    cfg = AppConfig.from_mapping(settings(seat_types=[label], stop_at="", berth_preference={"lower": 1-requested_middle, "middle": requested_middle}))
     runner = TicketRunner(cfg)
     calls = {}
     def post(url, data, **kwargs):
@@ -127,7 +127,7 @@ def test_gui_json_and_cli_config_accept_exact_new_labels(tmp_path, seats):
     values = settings(seat_types=seats, berth_preference={"lower": 1})
     path = tmp_path / "settings.json"
     save_gui_settings(path, values)
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 3
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 4
     loaded = load_gui_settings(path)
     assert loaded["seat_types"] == seats
     assert build_app_config(loaded).seat_types == seats

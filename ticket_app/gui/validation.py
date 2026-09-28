@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping
 
 from ticket_app.configuration import SEAT_SPECS, preference_capabilities
 from ticket_app.input_parsing import split_multi_value_text
+from ticket_app.passengers import normalize_passenger_ticket_types
 from ticket_app.preferences import (
     BerthPreference,
     SeatRelationPreference,
@@ -137,6 +138,15 @@ def validate_gui_mapping(
         errors["passenger_names"] = "请填写 1 到 5 位乘车人"
     elif len(set(passengers)) != passenger_count:
         errors["passenger_names"] = "乘车人不能重复"
+    try:
+        ticket_types = normalize_passenger_ticket_types(_field_value(values, "passenger_ticket_types"))
+    except ValueError as exc:
+        errors["passenger_ticket_types"] = str(exc)
+    else:
+        if set(ticket_types) - set(passengers):
+            errors["passenger_ticket_types"] = "票种设置包含未选择的乘车人，请重新设置"
+    if not isinstance(_field_value(values, "quiet_carriage_preference"), bool):
+        errors["quiet_carriage_preference"] = "静音车厢偏好必须是开关值"
 
     preferred = _string_list(_field_value(values, "preferred_trains"))
     errors.update(validate_train_policy(

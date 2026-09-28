@@ -53,7 +53,8 @@ def _build_passenger_strings(passengers: List[Dict[str, Any]]) -> Tuple[str, str
     old_passenger_list = []
     for passenger in passengers:
         seat_type = passenger.get("seat_type")
-        ticket_type = passenger.get("passenger_type") or "1"
+        passenger_type = passenger.get("passenger_type") or "1"
+        ticket_type = passenger.get("ticket_type") or passenger_type
         name = passenger.get("passenger_name") or ""
         id_type = passenger.get("passenger_id_type_code") or ""
         id_no = passenger.get("passenger_id_no") or ""
@@ -63,7 +64,7 @@ def _build_passenger_strings(passengers: List[Dict[str, Any]]) -> Tuple[str, str
         if all_enc:
             fields.append(all_enc)
         passenger_ticket_list.append(",".join(str(item) for item in fields))
-        old_passenger_list.append(f"{name},{id_type},{id_no},{ticket_type}_")
+        old_passenger_list.append(f"{name},{id_type},{id_no},{passenger_type}_")
     return "_".join(passenger_ticket_list), "".join(old_passenger_list)
 
 

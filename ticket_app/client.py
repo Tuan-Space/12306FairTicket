@@ -23,6 +23,7 @@ from .preferences import (
     OrderPreferencePayload,
 )
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
+from .quiet_capability import extract_quiet_carriage_available
 
 
 _INIT_DC_SAFE_STOP = "尚未进入确认排队，本次任务已安全停止"
@@ -79,21 +80,46 @@ class RailwayClient:
         jar.save(ignore_discard=True, ignore_expires=True)
 
     def check_session(self) -> bool:
+        """Distinguish a confirmed expiry from a failed/ambiguous check."""
+
+        self.cancel_token.checkpoint()
         try:
             response = self.session.post(
                 f"{BASE_URL}/otn/login/checkUser",
                 data={"_json_att": ""},
                 timeout=self.cfg.request_timeout_seconds,
             )
+            self.cancel_token.checkpoint()
+            status = getattr(response, "status_code", 200)
+            if isinstance(status, int) and not 200 <= status < 300:
+                raise ValueError("HTTP error")
             payload = response.json()
-            return bool(payload.get("data", {}).get("flag"))
+            if not isinstance(payload, dict) or payload.get("status", True) is not True:
+                raise ValueError("invalid status")
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("flag"), bool):
+                raise ValueError("missing boolean flag")
+            valid = data["flag"]
+        except RunCancelled:
+            raise
         except Exception as exc:
-            logging.debug("检查登录状态失败: %s", exc)
-            return False
+            self.cancel_token.checkpoint()
+            if "response" in locals():
+                self._log_response_diagnostics(response, "checkUser")
+            logging.warning("登录状态检查失败（%s），未判定会话失效", type(exc).__name__)
+            emit_event(self.event_sink, "session_checked", "检查失败，无法确认登录状态；请稍后重试",
+                       state="failed", checked_at=time.time())
+            raise AppError("检查登录状态失败，无法确认会话是否有效；请稍后重试") from None
+        emit_event(self.event_sink, "session_checked",
+                   "检查时已登录" if valid else "未登录或登录已失效",
+                   state="valid" if valid else "expired", checked_at=time.time())
+        return valid
 
-    def ensure_login(self) -> None:
+    def ensure_login(self, *, check_first: bool = True) -> bool:
+        """Return whether a fresh QR login occurred, optionally skipping a known-expired check."""
+
         self.cancel_token.checkpoint()
-        session_valid = self.check_session()
+        session_valid = self.check_session() if check_first else False
         self.cancel_token.checkpoint()
         if session_valid:
             logging.info("当前登录会话仍然有效")
@@ -103,7 +129,7 @@ class RailwayClient:
                 "当前登录会话仍然有效，无需重新扫码",
                 status="logged_in",
             )
-            return
+            return False
         logging.info("需要扫码登录 12306")
         self._prefetch_login_cookies()
         image_bytes, uuid = self._create_qr_code()
@@ -155,7 +181,7 @@ class RailwayClient:
                     status="confirmed",
                     uuid=uuid,
                 )
-                return
+                return True
             elif code == "3":
                 emit_event(
                     self.event_sink,
@@ -338,26 +364,85 @@ class RailwayClient:
         return tickets
 
     def get_passengers(self) -> List[Dict[str, Any]]:
-        response = self.session.post(
-            f"{BASE_URL}/otn/confirmPassenger/getPassengerDTOs",
-            data={"_json_att": ""},
-            timeout=self.cfg.request_timeout_seconds,
-        )
-        payload = response.json()
-        passengers = payload.get("data", {}).get("normal_passengers")
-        if not passengers:
-            raise AppError(f"未获取到常用乘车人: {_message_from_payload(payload)}")
-        return passengers
+        self.cancel_token.checkpoint()
+        try:
+            response = self.session.post(
+                f"{BASE_URL}/otn/confirmPassenger/getPassengerDTOs",
+                data={"_json_att": ""},
+                timeout=self.cfg.request_timeout_seconds,
+            )
+            self.cancel_token.checkpoint()
+            status = getattr(response, "status_code", 200)
+            if isinstance(status, int) and not 200 <= status < 300:
+                raise ValueError("HTTP error")
+            payload = response.json()
+        except RunCancelled:
+            raise
+        except Exception:
+            self.cancel_token.checkpoint()
+            if "response" in locals():
+                self._log_response_diagnostics(response, "getPassengerDTOs")
+            raise AppError("读取账号乘车人失败，接口响应无法确认；请检查登录状态后重试") from None
+        if not isinstance(payload, dict) or payload.get("status", True) is not True:
+            raise AppError("读取账号乘车人失败；请检查登录状态后重试")
+        data = payload.get("data")
+        passengers = data.get("normal_passengers") if isinstance(data, dict) else None
+        if not isinstance(passengers, list):
+            raise AppError("12306 返回的乘车人列表格式无效，请稍后重试")
+        if any(not isinstance(item, dict) or not isinstance(item.get("passenger_name"), str)
+               or not item["passenger_name"].strip() for item in passengers):
+            raise AppError("12306 返回的乘车人资料缺少有效姓名，请到官方渠道核对后重试")
+        self.cancel_token.checkpoint()
+        return [item.copy() for item in passengers]
+
+    @staticmethod
+    def _log_response_diagnostics(response: Any, stage: str) -> None:
+        """Log shape/transport metadata only, never bodies, credentials or URL queries."""
+
+        status = getattr(response, "status_code", None)
+        status = status if isinstance(status, int) else None
+        headers = getattr(response, "headers", {})
+        raw_type = headers.get("Content-Type", "") if isinstance(headers, Mapping) else ""
+        content_type = str(raw_type).split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9.+/-]{0,80}", content_type):
+            content_type = "unknown"
+        raw_url = getattr(response, "url", "")
+        try:
+            path = urllib.parse.urlsplit(raw_url).path if isinstance(raw_url, str) else ""
+        except ValueError:
+            path = ""
+        # Only fixed endpoint labels are safe to display: redirect paths can
+        # themselves contain credentials or passenger identifiers.
+        endpoint = "other"
+        for known in ("login", "checkUser", "getPassengerDTOs", "submitOrderRequest", "initDc", "checkOrderInfo",
+                      "getQueueCount", "confirmSingleForQueue", "queryOrderWaitTime"):
+            if known in path.split("/") or (known == "login" and "/login/" in path):
+                endpoint = known
+                break
+        history = getattr(response, "history", ())
+        redirects = len(history) if isinstance(history, (tuple, list)) else 0
+        content = getattr(response, "content", None)
+        length = len(content) if isinstance(content, bytes) else None
+        prefix = content.lstrip()[:32].lower() if isinstance(content, bytes) else b""
+        kind = "empty" if length == 0 else "html" if prefix.startswith((b"<!doctype html", b"<html")) else "other"
+        logging.warning("%s 响应诊断: HTTP=%s, type=%s, endpoint=%s, redirects=%s, bytes=%s, body_kind=%s",
+                        stage, status, content_type or "unknown", endpoint, redirects, length, kind)
 
     @staticmethod
     def _response_json_object(response: Any, stage: str) -> Dict[str, Any]:
         """Read an order endpoint JSON response without exposing its contents."""
 
+        status = getattr(response, "status_code", 200)
+        if isinstance(status, int) and not 200 <= status < 300:
+            RailwayClient._log_response_diagnostics(response, stage)
+            raise ResponseFormatError(f"{stage} 返回 HTTP {status}，任务已停止；请核对官方订单状态")
         try:
             payload = response.json()
-        except (TypeError, ValueError) as exc:
-            raise ResponseFormatError(f"{stage} 返回的 JSON 格式无效，任务已停止") from exc
+        except (TypeError, ValueError):
+            RailwayClient._log_response_diagnostics(response, stage)
+            raise ResponseFormatError(f"{stage} 返回的 JSON 格式无效，任务已停止") from None
         if not isinstance(payload, dict):
+            RailwayClient._log_response_diagnostics(response, stage)
             raise ResponseFormatError(f"{stage} 返回的 JSON 顶层不是对象，任务已停止")
         return payload
 
@@ -391,15 +476,22 @@ class RailwayClient:
             timeout=self.cfg.request_timeout_seconds,
         )
         html = response.text
+        status = getattr(response, "status_code", 200)
+        if isinstance(status, int) and not 200 <= status < 300:
+            self._log_response_diagnostics(response, "initDc")
+            raise ResponseFormatError(f"initDc 返回 HTTP {status}；{_INIT_DC_SAFE_STOP}")
         token_match = re.search(r"globalRepeatSubmitToken\s*=\s*'([^']+)'", html)
         if not token_match:
+            self._log_response_diagnostics(response, "initDc")
             raise ResponseFormatError(f"initDc 返回缺少 REPEAT_SUBMIT_TOKEN；{_INIT_DC_SAFE_STOP}")
         ticket_info_text = _extract_js_object(html, "ticketInfoForPassengerForm")
         if not ticket_info_text:
+            self._log_response_diagnostics(response, "initDc")
             raise ResponseFormatError(f"initDc 返回缺少 ticketInfoForPassengerForm；{_INIT_DC_SAFE_STOP}")
         try:
             ticket_info = _parse_js_object(ticket_info_text)
         except ValueError as exc:
+            self._log_response_diagnostics(response, "initDc")
             raise ResponseFormatError(
                 f"initDc 返回的 ticketInfoForPassengerForm 格式无效；{_INIT_DC_SAFE_STOP}"
             ) from exc
@@ -422,6 +514,7 @@ class RailwayClient:
                 # Copying it to the normalized context keeps protocol code out
                 # of the GUI/runner while retaining the unmodified DTO.
                 ticket_info["dw_flag"] = dw_flag
+        ticket_info["quiet_carriage_available"] = extract_quiet_carriage_available(html)
         return token_match.group(1), ticket_info
 
     def check_order_info(self, passengers: PreparedPassengerSet, token: str) -> OrderCheckResult:
@@ -483,7 +576,7 @@ class RailwayClient:
             data=data,
             timeout=self.cfg.request_timeout_seconds,
         )
-        payload = response.json()
+        payload = self._response_json_object(response, "getQueueCount")
         if payload.get("status"):
             return True, payload.get("data", {})
         return False, _message_from_payload(payload)
@@ -513,6 +606,7 @@ class RailwayClient:
             "whatsSelect": "1",
             "roomType": "00",
             "dwAll": "N",
+            "is_jy": preference_payload.is_jy,
             "_json_att": "",
             "REPEAT_SUBMIT_TOKEN": token,
         }
@@ -521,10 +615,28 @@ class RailwayClient:
             data=data,
             timeout=self.cfg.request_timeout_seconds,
         )
-        payload = response.json()
-        if payload.get("status") and payload.get("data", {}).get("submitStatus"):
-            return True, "OK"
-        return False, _message_from_payload(payload)
+        payload = self._response_json_object(response, "confirmSingleForQueue")
+        # This request may already have created a server-side order. Only a
+        # literal boolean refusal permits the runner to try another candidate;
+        # a missing field or a truthy string cannot establish that it is safe.
+        if not isinstance(payload.get("status"), bool):
+            raise ResponseFormatError(
+                "confirmSingleForQueue 返回缺少或包含无效的 status 布尔字段，订单结果无法确认；请核对官方订单状态"
+            )
+        if payload["status"] is False:
+            return False, _message_from_payload(payload)
+        response_data = payload.get("data")
+        if not isinstance(response_data, dict):
+            raise ResponseFormatError(
+                "confirmSingleForQueue 返回的 data 结构无效，订单结果无法确认；请核对官方订单状态"
+            )
+        if not isinstance(response_data.get("submitStatus"), bool):
+            raise ResponseFormatError(
+                "confirmSingleForQueue 返回缺少或包含无效的 submitStatus 布尔字段，订单结果无法确认；请核对官方订单状态"
+            )
+        if response_data["submitStatus"] is False:
+            return False, _message_from_payload(payload)
+        return True, "OK"
 
     def query_order_wait_time(self, token: str) -> Tuple[bool, Dict[str, Any]]:
         response = self.session.get(
@@ -537,7 +649,47 @@ class RailwayClient:
             },
             timeout=self.cfg.request_timeout_seconds,
         )
-        payload = response.json()
-        if payload.get("status"):
-            return True, payload.get("data", {})
-        return False, {"msg": _message_from_payload(payload)}
+        payload = self._response_json_object(response, "queryOrderWaitTime")
+        if not isinstance(payload.get("status"), bool):
+            raise ResponseFormatError(
+                "queryOrderWaitTime 返回缺少或包含无效的 status 布尔字段，订单结果无法确认；请核对官方订单状态"
+            )
+        response_data = payload.get("data")
+        if payload["status"] is True:
+            if not isinstance(response_data, dict):
+                raise ResponseFormatError(
+                    "queryOrderWaitTime 返回的 data 结构无效，订单结果无法确认；请核对官方订单状态"
+                )
+            for key in ("orderId", "msg"):
+                value = response_data.get(key)
+                if value is not None and not isinstance(value, str):
+                    raise ResponseFormatError(
+                        f"queryOrderWaitTime 返回的 {key} 类型无效，订单结果无法确认；请核对官方订单状态"
+                    )
+            wait_time = response_data.get("waitTime")
+            if wait_time is not None and (isinstance(wait_time, bool) or not isinstance(wait_time, int)):
+                raise ResponseFormatError(
+                    "queryOrderWaitTime 返回的 waitTime 类型无效，订单结果无法确认；请核对官方订单状态"
+                )
+            return True, response_data
+
+        # Only actual textual error fields may establish a terminal refusal.
+        # Stringifying an arbitrary response/collection can make an unrelated
+        # nested '出票失败' value look like a definite order rejection.
+        messages = payload.get("messages")
+        if messages is not None and not isinstance(messages, str):
+            if not isinstance(messages, list) or any(not isinstance(item, str) for item in messages):
+                raise ResponseFormatError(
+                    "queryOrderWaitTime 返回的 messages 类型无效，订单结果无法确认；请核对官方订单状态"
+                )
+        message_values = []
+        if isinstance(response_data, dict):
+            message_values.extend(response_data.get(key) for key in ("errMsg", "msg", "message"))
+        message_values.extend(payload.get(key) for key in ("message", "result_message"))
+        if any(value is not None and not isinstance(value, str) for value in message_values):
+            raise ResponseFormatError(
+                "queryOrderWaitTime 返回的错误消息类型无效，订单结果无法确认；请核对官方订单状态"
+            )
+        primary_message = messages[0] if isinstance(messages, list) and messages else messages
+        message = next((value for value in (primary_message, *message_values) if isinstance(value, str) and value), "")
+        return False, {"msg": message or "出票状态查询未返回明确结果"}

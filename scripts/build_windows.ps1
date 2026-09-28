@@ -52,7 +52,7 @@ if ($LASTEXITCODE -ne 0) {
 Push-Location -LiteralPath $projectRoot
 try {
     if (-not $SkipTests) {
-        & $Python -m pytest -q
+        & $Python -m pytest tests -q
         if ($LASTEXITCODE -ne 0) {
             throw "Unit tests failed; packaging was not started."
         }

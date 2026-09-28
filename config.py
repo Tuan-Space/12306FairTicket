@@ -16,6 +16,11 @@ TRAIN_DATE = "2026-05-05"  # YYYY-MM-DD
 # 乘车人。程序会登录后从 12306 常用乘车人中按姓名匹配，不需要在本地写身份证和手机号。
 PASSENGER_NAMES = ["XXX"]
 
+# 每位乘车人可指定 adult（成人票）或 student（学生票），未指定时跟随常用乘车人类型。
+# 学生联系人可选择成人票；选择学生票仍需通过 12306 的学生身份、资格和优惠次数校验。
+# 例如 PASSENGER_TICKET_TYPES = {"张三": "adult", "李四": "student"}
+PASSENGER_TICKET_TYPES = {}
+
 
 # 座席优先级，从左到右尝试。
 # 支持: 商务座、特等座、一等座、二等座、高级软卧、软卧、硬卧、一等卧、二等卧、软座、硬座、无座
@@ -64,6 +69,10 @@ SEAT_POSITION_PREFERENCES = []
 # 部分卧铺车型没有中铺，程序会依据 12306 实时返回的能力自动回退为系统分配。
 # 未选择卧铺席别时，已保存的数量保留但不启用。
 BERTH_PREFERENCE = {"lower": 0, "middle": 0, "upper": 0}
+
+# 静音车厢偏好，仅在 12306 明确开放且本次候选为二等座时提交。
+# 未开放或其他席别时按普通车厢分配，不保证静音车厢席位。
+QUIET_CARRIAGE_PREFERENCE = False
 
 
 # 旧版兼容项。新配置请使用 SEAT_POSITION_PREFERENCES；只有上面的新项不存在时

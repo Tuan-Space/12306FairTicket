@@ -66,7 +66,7 @@ def test_supported_separators_are_shared_by_config_validation_and_json(
     assert validate(imported) == {}
     save_gui_settings(path, imported)
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["version"] == 3
+    assert document["version"] == 4
     assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS
     assert document["settings"]["passenger_names"] == canonical["passenger_names"]
     assert document["settings"]["preferred_trains"] == canonical["preferred_trains"]

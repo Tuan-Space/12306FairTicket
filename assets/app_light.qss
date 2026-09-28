@@ -1,7 +1,11 @@
 /* Light palette overrides; structural styling comes from app.qss. */
+QPushButton#stepButton[stepState="current"] { background: #eaf4ff; border-color: #3b82df; color: #1769c2; }
+QPushButton#stepButton[stepState="complete"] { color: #177a55; border-color: #b7d7c8; }
+QPushButton#stepButton[stepState="pending"] { color: #687792; }
+QLabel#workflowStatus { background: #ffffff; }
 * { color: #26344d; }
 
-QMainWindow, QWidget#appRoot, QScrollArea, QScrollArea > QWidget > QWidget {
+QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QScrollArea, QScrollArea > QWidget > QWidget {
     background: #f3f6fb;
 }
 
@@ -110,7 +114,7 @@ QComboBox QAbstractItemView {
     selection-color: #184f8f;
 }
 
-QComboBox#priorityStrategy::down-arrow {
+QComboBox#priorityStrategy::down-arrow, QComboBox#passengerTicketType::down-arrow {
     image: url(assets/chevron-down-light.svg);
 }
 

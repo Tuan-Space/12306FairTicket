@@ -63,10 +63,14 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
         window.query_ui_timer.stop()
         # Individual lifecycle tests use lightweight thread doubles.  Remove
         # them so closeEvent never opens a modal confirmation in teardown.
-        window.thread = None
+        if window._active_operation is not None and window._executor is not None:
+            window._stop_task()
+            qtbot.waitUntil(lambda: window._active_operation is None, timeout=5000)
+        window._active_operation = None
         window.worker = None
         window.cancel_token = None
         window.close()
+        qtbot.waitUntil(lambda: window._background_thread is None, timeout=3000)
         # ``closeEvent`` owns normal shutdown, but explicitly close here as
         # well so a test that closes the window early cannot leak a listener.
         logging.getLogger().removeHandler(window.log_pipeline.handler)
@@ -148,7 +152,7 @@ def test_berth_guidance_navigates_to_seats_and_clear_keeps_seat_selection(
     berths.set_values({"lower": 1})
     assert "berth_preference" not in main_window._validate_all()
     berths.select_seat_types_button.click()
-    assert main_window.config_tabs.currentIndex() == 0
+    assert main_window.current_step == 0
     target = main_window.seat_types.checkboxes["硬卧"]
     qtbot.waitUntil(lambda: QApplication.focusWidget() is target)
     assert main_window.basic_scroll.viewport().rect().intersects(
@@ -182,9 +186,10 @@ def test_multi_value_form_collects_and_validates_the_same_lists(
 
 def test_main_window_can_be_created_offline_without_starting_a_task(main_window: gui_app.MainWindow) -> None:
     assert main_window.windowTitle() == "12306 Fair Ticket"
-    assert main_window.thread is None
+    assert main_window._active_operation is None
     assert main_window.worker is None
-    assert main_window.start_button.isEnabled()
+    assert not main_window.start_button.isEnabled()
+    assert main_window.next_button.isEnabled()
     assert main_window.advanced["station_cache_days"].minimum() == 1
     assert main_window._test_network_calls == []  # type: ignore[attr-defined]
 
@@ -244,8 +249,8 @@ def test_train_checkbox_precedes_its_error_and_uses_one_error_boundary(main_wind
 
 
 def test_basic_page_has_no_help_icons_and_status_panel_has_no_scroll_area(main_window: gui_app.MainWindow) -> None:
-    assert not main_window.basic_scroll.findChildren(gui_app.QToolButton, "helpButton")
-    assert main_window.advanced_scroll.findChildren(gui_app.QToolButton, "helpButton")
+    assert main_window.advanced_content.isHidden()
+    assert main_window.advanced_content.findChildren(gui_app.QToolButton, "helpButton")
     assert not any(
         label.text() == "整组位置偏好"
         for label in main_window.position_preferences.parentWidget().findChildren(gui_app.QLabel)
@@ -255,55 +260,33 @@ def test_basic_page_has_no_help_icons_and_status_panel_has_no_scroll_area(main_w
 
 
 @pytest.mark.parametrize("dark_theme", [False, True], ids=["light", "dark"])
-@pytest.mark.parametrize("window_size", [(1200, 720), (1260, 850)])
-def test_status_text_and_controls_remain_visible_when_log_panel_expands(
+@pytest.mark.parametrize("window_size", [(640, 480), (900, 700), (1260, 850)])
+def test_wizard_navigation_and_footer_remain_visible_when_body_scrolls(
     main_window: gui_app.MainWindow, qtbot, qapp, dark_theme: bool, window_size: tuple[int, int]
 ) -> None:
     previous_style = qapp.styleSheet()
     try:
         qapp.setStyleSheet(gui_app._load_stylesheet(qapp, dark_theme))
-        main_window.clock_timer.stop()
-        main_window.sale_countdown.setText("02:38:06.9")
-        main_window.rtt_metric.value_label.setText("71ms")
-        main_window.offset_metric.value_label.setText("-0.326s")
-        main_window._on_runtime_event(
-            "qr_status", {"status": "logged_in", "message": "当前登录会话仍然有效，无需重新扫码"}
-        )
+        main_window.account_state = "valid"
         main_window.resize(*window_size)
         main_window.show()
         qtbot.wait(30)
-
-        vertical = next(
-            splitter for splitter in main_window.findChildren(gui_app.QSplitter)
-            if splitter.orientation() == Qt.Orientation.Vertical
-        )
-        labels = [main_window.sale_countdown, main_window.sale_caption, main_window.qr_countdown]
-        for metric in (main_window.query_metric, main_window.rtt_metric, main_window.offset_metric):
-            labels.extend(metric.findChildren(gui_app.QLabel))
-
-        # Check the initial layout and the smallest upper pane the log splitter
-        # permits. Widget containment alone does not catch clipped label text.
-        for expand_log in (False, True):
-            if expand_log:
-                vertical.setSizes([1, 10000])
-                qtbot.wait(30)
-            panel_rect = main_window.status_panel.rect()
-            for widget in (
-                *labels,
-                main_window.qr_image,
-                main_window.timeline,
-                main_window.validate_button,
-                main_window.start_button,
-                main_window.stop_button,
-                main_window.order_button,
-            ):
-                top_left = widget.mapTo(main_window.status_panel, widget.rect().topLeft())
-                bottom_right = widget.mapTo(main_window.status_panel, widget.rect().bottomRight())
-                assert panel_rect.contains(top_left)
-                assert panel_rect.contains(bottom_right)
-            for label in labels:
-                assert label.height() >= label.minimumSizeHint().height(), label.objectName()
-                assert label.width() >= label.minimumSizeHint().width(), label.objectName()
+        for step, scroll in enumerate((main_window.basic_scroll, main_window.passenger_scroll,
+                                       main_window.confirm_scroll, main_window.run_scroll)):
+            main_window._go_to_step(step)
+            main_window.logs_toggle.setChecked(True)
+            qtbot.wait(10)
+            for fraction in (0, 1):
+                scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum() * fraction)
+                qtbot.wait(10)
+                primary = (main_window.next_button, main_window.next_button,
+                           main_window.start_button, main_window.back_button)[step]
+                for widget in (*main_window.step_buttons, primary):
+                    assert widget.isVisible()
+                    point = widget.mapTo(main_window, widget.rect().topLeft())
+                    assert main_window.rect().contains(widget.rect().translated(point))
+                    assert widget.width() >= widget.minimumSizeHint().width()
+                assert scroll.horizontalScrollBar().maximum() == 0
     finally:
         qapp.setStyleSheet(previous_style)
 
@@ -348,7 +331,7 @@ def test_save_and_import_buttons_round_trip_every_editable_setting(
     main_window._save_settings()
 
     document = json.loads(target.read_text(encoding="utf-8"))
-    assert document["version"] == 3
+    assert document["version"] == 4
     assert document["settings"]["query_interval_seconds"] == 1.25
     serialized = target.read_text(encoding="utf-8").lower()
     assert "session_file" not in serialized
@@ -369,13 +352,13 @@ def test_full_validation_switches_page_and_focuses_the_first_error(
     main_window: gui_app.MainWindow, qtbot
 ) -> None:
     main_window.show()
-    main_window.config_tabs.setCurrentIndex(1)
+    main_window._go_to_step(1)
     main_window.from_station.setText("不存在的车站")
 
     errors = main_window._validate_all(focus_first=True)
 
     assert next(iter(errors)) == "from_station"
-    assert main_window.config_tabs.currentIndex() == 0
+    assert main_window.current_step == 0
     qtbot.waitUntil(lambda: QApplication.focusWidget() is main_window.from_station, timeout=1000)
 
 
@@ -482,7 +465,7 @@ def test_priority_preview_changes_strategy_and_config_round_trips(main_window, t
     assert main_window._build_current_config().priority_strategy == "seat_first"
     target = tmp_path / "strategy.json"
     main_window.config_store.save_file(target, main_window._collect_mapping())
-    assert json.loads(target.read_text(encoding="utf-8"))["version"] == 3
+    assert json.loads(target.read_text(encoding="utf-8"))["version"] == 4
     main_window.priority_strategy.setCurrentIndex(0)
     errors, _ = main_window._apply_mapping(main_window.config_store.import_file(target))
     assert not errors
@@ -566,7 +549,7 @@ def test_station_update_is_disabled_and_not_started_while_task_runs(
         def isRunning() -> bool:  # noqa: N802 - mirrors Qt
             return True
 
-    main_window.thread = RunningThread()  # type: ignore[assignment]
+    main_window._active_operation = RunningThread()  # type: ignore[assignment]
     main_window._set_forms_enabled(False)
     assert not main_window.update_stations_button.isEnabled()
     assert not main_window.swap_stations_button.isEnabled()
@@ -662,7 +645,7 @@ def test_start_is_a_noop_while_an_existing_task_is_running(
     def unexpected_config_build() -> None:
         raise AssertionError("a second task attempted to build or launch")
 
-    main_window.thread = RunningThread()  # type: ignore[assignment]
+    main_window._active_operation = RunningThread()  # type: ignore[assignment]
     monkeypatch.setattr(main_window, "_build_current_config", unexpected_config_build)
 
     main_window._start_task()
@@ -788,11 +771,11 @@ def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
     assert main_window.qr_countdown.text() == "已过期"
     assert main_window.refresh_qr_button.isEnabled()
 
-    restarts: list[bool] = []
-    monkeypatch.setattr(main_window, "_start_task", lambda: restarts.append(True))
-    main_window.thread = None
+    restarts: list[tuple[str, bool]] = []
+    monkeypatch.setattr(main_window, "_start_connection_operation", lambda mode, **kw: restarts.append((mode, kw.get("force_login", False))))
+    main_window._active_operation = None
     main_window._restart_for_qr()
-    assert restarts == [True]
+    assert restarts == [("login", True)]
 
 
 def test_reused_login_clears_old_qr_without_notifying_about_a_new_scan(
@@ -832,7 +815,7 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
     # Restore real client construction for this integration path. The fixture's
     # requests.Session.request guard remains active to reject accidental I/O.
     monkeypatch.setattr(client_module.RailwayClient, "__init__", _REAL_CLIENT_INIT)
-    monkeypatch.setattr(ServerClock, "sync", lambda *args: None)
+    monkeypatch.setattr(ServerClock, "sync", lambda *args, **kwargs: True)
     monkeypatch.setattr(StationStore, "load", lambda *args: None)
     monkeypatch.setattr(StationStore, "code", lambda _store, station: station)
     monkeypatch.setattr(TicketRunner, "_resolve_target_start", lambda _runner: None)
@@ -851,7 +834,7 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
     def check_session_response(url, **kwargs):
         assert url.endswith("/otn/login/checkUser")
         checked_sessions.append(shared_session.cookies.get("test_login") == "valid")
-        return SimpleNamespace(json=lambda: {"data": {"flag": checked_sessions[-1]}})
+        return SimpleNamespace(status_code=200, json=lambda: {"data": {"flag": checked_sessions[-1]}})
 
     def create_qr(client):
         assert client.session is shared_session
@@ -884,16 +867,20 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
     main_window.from_station.setText("北京西")
     main_window.to_station.setText("郑州东")
     main_window.auto_submit.setChecked(False)
+    main_window.start_at.set_disabled(True)
+    main_window.stop_at.set_disabled(True)
     main_window.preferred_trains.setText("G79")
     main_window.seat_types.set_values(["二等座"])
     assert main_window._validate_all() == {}
 
     def stop_and_wait():
-        if main_window.thread is not None:
+        if main_window._active_operation is not None:
             main_window._stop_task()
-            qtbot.waitUntil(lambda: main_window.thread is None, timeout=3000)
+            qtbot.waitUntil(lambda: main_window._active_operation is None, timeout=3000)
 
     try:
+        main_window.account_state = "valid"
+        main_window._go_to_step(2)
         main_window._start_task()
         assert main_window.qr_image.text() == "正在检查登录状态…"
         assert main_window.qr_status.text() == "登录失效时将显示二维码"
@@ -905,6 +892,8 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
 
         main_window.preferred_trains.setText("K123")
         main_window.seat_types.set_values(["硬卧"])
+        main_window.account_state = "valid"
+        main_window._go_to_step(2)
         main_window._start_task()
         qtbot.waitUntil(lambda: len(queried_configs) == 2 and "无需重新扫码" in main_window.qr_image.text())
         assert queried_configs[1].preferred_trains == ["K123"]
@@ -917,6 +906,8 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
         stop_and_wait()
 
         shared_session.cookies.clear()
+        main_window.account_state = "valid"
+        main_window._go_to_step(2)
         main_window._start_task()
         qtbot.waitUntil(lambda: main_window.qr_status.text() == "等待扫码")
         assert not main_window.qr_image.pixmap().isNull()
@@ -930,21 +921,24 @@ def test_start_stop_edit_restart_reuses_login_and_expired_session_requests_qr(
         stop_and_wait()
 
 
-def test_refresh_while_running_requests_cancel_before_restart(main_window: gui_app.MainWindow) -> None:
+def test_refresh_while_waiting_queues_login_without_cancelling_task(main_window: gui_app.MainWindow) -> None:
     class RunningThread:
         @staticmethod
         def isRunning() -> bool:  # noqa: N802 - mirrors Qt
             return True
 
     token = GuiCancelToken()
-    main_window.thread = RunningThread()  # type: ignore[assignment]
+    main_window._active_operation = RunningThread()  # type: ignore[assignment]
     main_window.cancel_token = token
+    main_window._operation_mode = "task"
+    main_window._maintenance_enabled = True
+    token.set_actions_enabled(True)
 
     main_window._restart_for_qr()
 
-    assert main_window._pending_restart is True
-    assert token.cancelled is True
-    assert not main_window.stop_button.isEnabled()
+    assert main_window._pending_restart is False
+    assert token.cancelled is False
+    assert token.next_action(0) == "login"
 
 
 def test_sale_countdown_uses_server_anchor_and_monotonic_elapsed_time(

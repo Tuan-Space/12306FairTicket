@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 
 from ticket_app.configuration import AppConfig, AppError
 from ticket_app.input_parsing import split_multi_value_text
+from ticket_app.passengers import normalize_passenger_ticket_types
 from ticket_app.preferences import SeatRelationPreference
 
 
@@ -32,7 +33,7 @@ else:
 RUNTIME_DIR = LOCAL_DATA_DIR
 PROFILE_FILE = RUNTIME_DIR / "gui_profiles.json"
 LEGACY_CONFIG_FILE = PROJECT_ROOT / "config.py"
-GUI_CONFIG_VERSION = 3
+GUI_CONFIG_VERSION = 4
 GUI_CONFIG_MAX_BYTES = 1_000_000
 STATION_CACHE_FILE = LOCAL_DATA_DIR / "stations.json"
 STATION_SNAPSHOT_FILE = PROJECT_ROOT / "assets" / "stations_snapshot.json"
@@ -75,6 +76,8 @@ CONFIG_KEY_MAP: Dict[str, str] = {
     "TO_STATION": "to_station",
     "TRAIN_DATE": "train_date",
     "PASSENGER_NAMES": "passenger_names",
+    "PASSENGER_TICKET_TYPES": "passenger_ticket_types",
+    "QUIET_CARRIAGE_PREFERENCE": "quiet_carriage_preference",
     "SEAT_TYPES": "seat_types",
     "PREFERRED_TRAINS": "preferred_trains",
     "ONLY_PREFERRED_TRAINS": "only_preferred_trains",
@@ -116,6 +119,8 @@ DEFAULT_VALUES: Dict[str, Any] = {
     "to_station": "郑州东",
     "train_date": "",
     "passenger_names": [],
+    "passenger_ticket_types": {},
+    "quiet_carriage_preference": False,
     "seat_types": ["二等座", "无座", "一等座"],
     "preferred_trains": [],
     "only_preferred_trains": True,
@@ -158,6 +163,7 @@ DEFAULT_VALUES: Dict[str, Any] = {
 EDITABLE_SETTINGS_KEYS = frozenset(
     {
         "from_station", "to_station", "train_date", "passenger_names",
+        "passenger_ticket_types", "quiet_carriage_preference",
         "seat_types", "preferred_trains", "only_preferred_trains",
         "priority_strategy", "empty_train_scope",
         "start_at", "stop_at", "query_interval_seconds", "max_retries",
@@ -219,6 +225,12 @@ def canonical_mapping(values: Mapping[str, Any]) -> Dict[str, Any]:
         else:
             result[name] = []
     result["preferred_trains"] = [item.upper() for item in result["preferred_trains"]]
+    try:
+        result["passenger_ticket_types"] = normalize_passenger_ticket_types(result.get("passenger_ticket_types"))
+    except ValueError as exc:
+        raise AppError(f"乘车人票种无效: {exc}") from exc
+    if not isinstance(result.get("quiet_carriage_preference"), bool):
+        raise AppError("静音车厢偏好必须是布尔值")
 
     positions = result.get("seat_position_preferences", [])
     if not structured_position_supplied and result.get("choose_seats"):
@@ -385,7 +397,7 @@ def profile_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
-    """Produce the complete, privacy-safe version 3 settings mapping.
+    """Produce the complete, privacy-safe version 4 settings mapping.
 
     Defaults are filled in intentionally: saving an unfinished form is valid,
     and imported v1/v2 documents receive compatibility defaults. Only the
@@ -404,7 +416,7 @@ def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
         "login_qr_poll_seconds", "time_sync_max_rtt_seconds", "order_wait_interval_seconds",
     }
     integer_keys = {"max_retries", "time_sync_samples", "order_wait_attempts", "station_cache_days"}
-    boolean_keys = {"only_preferred_trains", "auto_submit", "perf_log"}
+    boolean_keys = {"only_preferred_trains", "auto_submit", "perf_log", "quiet_carriage_preference"}
     try:
         for key in float_keys:
             raw = payload[key]
@@ -482,7 +494,7 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
 
 
 def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
-    """Save all editable GUI settings as a version 3 document atomically."""
+    """Save all editable GUI settings as a version 4 document atomically."""
 
     canonical = canonical_mapping(values)
     canonical["empty_train_scope"] = "all"
@@ -493,7 +505,7 @@ def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
 
 
 def load_gui_settings(path: Path) -> Dict[str, Any]:
-    """Import version 3, version 2, or a safe subset of legacy version 1.
+    """Import versions 2/3/4, or a safe subset of legacy version 1.
 
     Version 1 exports used ``values`` and contain only the former profile
     fields.  Old named-profile database documents are intentionally not
@@ -505,7 +517,7 @@ def load_gui_settings(path: Path) -> Dict[str, Any]:
     version = document.get("version")
     if type(version) is not int:
         raise AppError("配置 JSON 缺少整数 version")
-    if version in (2, GUI_CONFIG_VERSION):
+    if version in (2, 3, GUI_CONFIG_VERSION):
         settings = document.get("settings")
         if not isinstance(settings, Mapping):
             raise AppError(f"version {version} 配置的 settings 必须是对象")

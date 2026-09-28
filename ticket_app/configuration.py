@@ -1,12 +1,14 @@
 import importlib.util
 import logging
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .input_parsing import split_multi_value_text
+from .passengers import normalize_passenger_ticket_types
 from .preferences import (
     BERTH_SEAT_TYPES,
     SEATED_SEAT_TYPES,
@@ -46,6 +48,73 @@ class PreparedPassengerSet:
     passengers: List[Dict[str, Any]]
     passenger_ticket_str: str
     old_passenger_str: str
+
+
+@dataclass(frozen=True)
+class ConnectionConfig:
+    """Connection-only settings for login, passenger lookup and clock sync.
+
+    These operations are valid before a journey has been filled in.  They must
+    not invent a journey or bypass AppConfig's booking validation to run.
+    """
+
+    request_timeout_seconds: float = 10.0
+    login_qr_timeout_seconds: float = 180.0
+    login_qr_poll_seconds: float = 1.0
+    time_sync_samples: int = 7
+    time_sync_max_rtt_seconds: float = 1.0
+    persist_session: bool = False
+    session_file: Path = Path(".runtime/session.cookies")
+    qr_code_file: Path = Path(".runtime/login_qr.png")
+
+    @classmethod
+    def from_mapping(
+        cls, mapping: Mapping[str, Any], base_dir: Path | None = None
+    ) -> "ConnectionConfig":
+        def value(name: str, default: Any) -> Any:
+            return mapping.get(name.upper(), mapping.get(name, default))
+
+        def positive_number(name: str, default: float) -> float:
+            raw = value(name, default)
+            if isinstance(raw, bool):
+                raise AppError(f"{name.upper()} 必须是正数")
+            try:
+                number = float(raw)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise AppError(f"{name.upper()} 必须是正数") from exc
+            if not math.isfinite(number) or number <= 0:
+                raise AppError(f"{name.upper()} 必须是有限正数")
+            return number
+
+        samples = positive_number("time_sync_samples", 7)
+        if not samples.is_integer():
+            raise AppError("TIME_SYNC_SAMPLES 必须是正整数")
+        directory = Path(base_dir) if base_dir is not None else DEFAULT_CONFIG_FILE.parent
+        cfg = cls(
+            request_timeout_seconds=positive_number("request_timeout_seconds", 10),
+            login_qr_timeout_seconds=positive_number("login_qr_timeout_seconds", 180),
+            login_qr_poll_seconds=positive_number("login_qr_poll_seconds", 1),
+            time_sync_samples=int(samples),
+            time_sync_max_rtt_seconds=positive_number("time_sync_max_rtt_seconds", 1),
+            persist_session=_as_bool(value("persist_session", False), "PERSIST_SESSION"),
+            session_file=_resolve_path(value("session_file", ".runtime/session.cookies"), directory),
+            qr_code_file=_resolve_path(value("qr_code_file", ".runtime/login_qr.png"), directory),
+        )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        for name in (
+            "request_timeout_seconds", "login_qr_timeout_seconds", "login_qr_poll_seconds",
+            "time_sync_max_rtt_seconds",
+        ):
+            number = getattr(self, name)
+            if isinstance(number, bool) or not isinstance(number, (float, int)) or not math.isfinite(number) or number <= 0:
+                raise AppError(f"{name.upper()} 必须是有限正数")
+        if isinstance(self.time_sync_samples, bool) or not isinstance(self.time_sync_samples, int) or self.time_sync_samples <= 0:
+            raise AppError("TIME_SYNC_SAMPLES 必须是正整数")
+        if not isinstance(self.persist_session, bool):
+            raise AppError("PERSIST_SESSION 必须是布尔值")
 
 
 SEAT_SPECS: Dict[str, SeatSpec] = {
@@ -114,6 +183,8 @@ class AppConfig:
     config_path: Path
     priority_strategy: str = "train_first"
     empty_train_scope: str | None = "all"
+    passenger_ticket_types: Dict[str, str] = field(default_factory=dict)
+    quiet_carriage_preference: bool = False
 
     @property
     def seat_position_preferences(self) -> SeatRelationPreference:
@@ -175,6 +246,7 @@ class AppConfig:
         try:
             seat_preference = SeatRelationPreference.from_value(raw_seat_preference)
             berth_preference = BerthPreference.from_value(value("BERTH_PREFERENCE", {}))
+            passenger_ticket_types = normalize_passenger_ticket_types(value("PASSENGER_TICKET_TYPES", {}))
         except ValueError as exc:
             raise AppError(str(exc)) from exc
 
@@ -214,6 +286,8 @@ class AppConfig:
             config_path=config_path,
             priority_strategy=str(value("PRIORITY_STRATEGY", "train_first")),
             empty_train_scope=value("EMPTY_TRAIN_SCOPE", "all"),
+            passenger_ticket_types=passenger_ticket_types,
+            quiet_carriage_preference=_as_bool(value("QUIET_CARRIAGE_PREFERENCE", False), "QUIET_CARRIAGE_PREFERENCE"),
         )
         cfg.validate()
         return cfg
@@ -226,6 +300,8 @@ class AppConfig:
             "TO_STATION": self.to_station,
             "TRAIN_DATE": self.train_date,
             "PASSENGER_NAMES": list(self.passenger_names),
+            "PASSENGER_TICKET_TYPES": dict(self.passenger_ticket_types),
+            "QUIET_CARRIAGE_PREFERENCE": self.quiet_carriage_preference,
             "SEAT_TYPES": list(self.seat_types),
             "PREFERRED_TRAINS": list(self.preferred_trains),
             "ONLY_PREFERRED_TRAINS": self.only_preferred_trains,
@@ -280,6 +356,14 @@ class AppConfig:
             raise AppError("PASSENGER_NAMES 最多支持 5 位乘车人")
         if len(set(self.passenger_names)) != passenger_count:
             raise AppError("PASSENGER_NAMES 不能包含重复乘车人")
+        try:
+            choices = normalize_passenger_ticket_types(self.passenger_ticket_types)
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+        if any(name not in self.passenger_names for name in choices):
+            raise AppError("PASSENGER_TICKET_TYPES 包含未选择的乘车人")
+        if not isinstance(self.quiet_carriage_preference, bool):
+            raise AppError("QUIET_CARRIAGE_PREFERENCE 必须是布尔值")
         if not self.seat_types:
             raise AppError("SEAT_TYPES 至少需要填写一种座席")
         unsupported = [seat for seat in self.seat_types if seat not in SEAT_SPECS]

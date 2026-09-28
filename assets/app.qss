@@ -1,11 +1,16 @@
 /* 12306 Fair Ticket desktop theme */
+QPushButton#stepButton { padding: 12px 4px; border-radius: 8px; }
+QPushButton#stepButton[stepState="current"] { background: #12243d; border-color: #3b82df; color: #7fbdff; font-weight: 700; }
+QPushButton#stepButton[stepState="complete"] { color: #70cca7; border-color: #285844; }
+QPushButton#stepButton[stepState="pending"] { color: #8f9bb3; }
+QLabel#workflowStatus { padding: 8px 12px; background: #11182a; border-radius: 8px; }
 * {
     font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 13px;
     color: #dbe5f7;
 }
 
-QMainWindow, QWidget#appRoot, QScrollArea, QScrollArea > QWidget > QWidget {
+QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QScrollArea, QScrollArea > QWidget > QWidget {
     background: #0b1020;
 }
 
@@ -186,18 +191,18 @@ QComboBox::drop-down, QDateEdit::drop-down {
     width: 24px;
 }
 
-QComboBox#priorityStrategy {
+QComboBox#priorityStrategy, QComboBox#passengerTicketType {
     padding-right: 32px;
 }
 
-QComboBox#priorityStrategy::drop-down {
+QComboBox#priorityStrategy::drop-down, QComboBox#passengerTicketType::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 24px;
     border: 0;
 }
 
-QComboBox#priorityStrategy::down-arrow {
+QComboBox#priorityStrategy::down-arrow, QComboBox#passengerTicketType::down-arrow {
     image: url(assets/chevron-down-dark.svg);
     width: 10px;
     height: 6px;
