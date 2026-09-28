@@ -127,10 +127,12 @@ def test_gui_json_and_cli_config_accept_exact_new_labels(tmp_path, seats):
     values = settings(seat_types=seats, berth_preference={"lower": 1})
     path = tmp_path / "settings.json"
     save_gui_settings(path, values)
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 4
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 5
     loaded = load_gui_settings(path)
     assert loaded["seat_types"] == seats
     assert build_app_config(loaded).seat_types == seats
     assert AppConfig.from_mapping({**values, "SEAT_TYPES": seats}).seat_types == seats
     assert preference_capabilities(seats) == (False, True)
-    assert build_app_config({**loaded, "seat_types": ["硬座"], "passenger_names": ["甲", "乙"]})
+    inactive = {**loaded, "cart_items": [{**loaded["cart_items"][0], "seat_type": "硬座"}],
+                "passenger_names": ["甲", "乙"]}
+    assert build_app_config(inactive).seat_types == ["硬座"]

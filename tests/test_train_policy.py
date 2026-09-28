@@ -102,10 +102,14 @@ def test_invalid_policy_is_field_oriented_for_gui_and_rejected_by_cli():
 
 
 @pytest.mark.parametrize("scope", [None, "high_speed", "conventional", "all"])
-def test_gui_scope_is_always_all_while_cli_retains_its_range(scope):
+def test_gui_scope_requires_explicit_migration_while_cli_retains_its_range(scope):
     values = config_values(empty_train_scope=scope)
     assert validate_gui_mapping(values, {"北京西", "郑州东"}) == {}
-    assert build_app_config(values).empty_train_scope == "all"
+    if scope == "all":
+        assert build_app_config(values).empty_train_scope == "all"
+    else:
+        with pytest.raises(AppError):
+            build_app_config(values)
     if scope is None:
         with pytest.raises(AppError):
             AppConfig.from_mapping(values)

@@ -1,4 +1,4 @@
-"""Strategy dropdown rendering and user interaction in both desktop themes."""
+"""Cart scope dropdown rendering and interaction in both desktop themes."""
 
 from __future__ import annotations
 
@@ -9,22 +9,25 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QComboBox, QStyle, QStyleOptionComboBox
+from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
 
 from ticket_app.gui.app import ASSET_DIR, _load_stylesheet
+from ticket_app.gui.cart_widgets import CartDialog
 
 
 @pytest.fixture(params=[False, True], ids=["light", "dark"])
-def strategy_dropdown(qtbot, qapp, request):
+def cart_scope_dropdown(qtbot, qapp, request):
     previous_style = qapp.styleSheet()
     qapp.setStyleSheet(_load_stylesheet(qapp, request.param))
-    combo = QComboBox()
-    combo.setObjectName("priorityStrategy")
-    combo.addItem("车次优先", "train_first")
-    combo.addItem("席别优先", "seat_first")
-    qtbot.addWidget(combo)
-    combo.resize(260, 42)
-    combo.show()
+    dialog = CartDialog([{
+        "from_station": "北京南", "to_station": "上海虹桥",
+        "train_scope": "specific", "train_code": "G101", "seat_type": "二等座",
+    }])
+    qtbot.addWidget(dialog)
+    dialog.show()
+    dialog.list.setCurrentRow(0)
+    dialog.edit_current()
+    combo = dialog.train_scope
     qapp.processEvents()
     yield combo, request.param
     combo.hidePopup()
@@ -42,8 +45,8 @@ def _arrow_rect(combo):
     )
 
 
-def test_strategy_arrow_asset_is_resolved_and_visible(strategy_dropdown, qapp):
-    combo, dark = strategy_dropdown
+def test_cart_scope_arrow_asset_is_resolved_and_visible(cart_scope_dropdown, qapp):
+    combo, dark = cart_scope_dropdown
     icon = ASSET_DIR / f"chevron-down-{'dark' if dark else 'light'}.svg"
     renderer = QSvgRenderer(str(icon))
     assert renderer.isValid()
@@ -68,8 +71,8 @@ def test_strategy_arrow_asset_is_resolved_and_visible(strategy_dropdown, qapp):
 
 
 @pytest.mark.parametrize("target", ["arrow", "body"])
-def test_strategy_popup_opens_from_arrow_or_body(strategy_dropdown, qtbot, target):
-    combo, _dark = strategy_dropdown
+def test_cart_scope_popup_opens_from_arrow_or_body(cart_scope_dropdown, qtbot, target):
+    combo, _dark = cart_scope_dropdown
     point = _arrow_rect(combo).center() if target == "arrow" else QPoint(40, combo.height() // 2)
     qtbot.mouseClick(combo, Qt.MouseButton.LeftButton, pos=point)
     qtbot.waitUntil(combo.view().isVisible)
@@ -81,16 +84,16 @@ def test_strategy_popup_opens_from_arrow_or_body(strategy_dropdown, qtbot, targe
         combo.view().viewport(), Qt.MouseButton.LeftButton,
         pos=combo.view().visualRect(index).center(),
     )
-    assert combo.currentData() == "seat_first"
+    assert combo.currentData() == "all"
     assert not combo.view().isVisible()
 
 
-def test_strategy_dropdown_retains_keyboard_selection(strategy_dropdown, qtbot):
-    combo, _dark = strategy_dropdown
+def test_cart_scope_dropdown_retains_keyboard_selection(cart_scope_dropdown, qtbot):
+    combo, _dark = cart_scope_dropdown
     combo.setFocus()
     qtbot.keyClick(combo, Qt.Key.Key_Down, modifier=Qt.KeyboardModifier.AltModifier)
     qtbot.waitUntil(combo.view().isVisible)
     qtbot.keyClick(combo.view(), Qt.Key.Key_Down)
     qtbot.keyClick(combo.view(), Qt.Key.Key_Return)
-    assert combo.currentData() == "seat_first"
+    assert combo.currentData() == "all"
     assert not combo.view().isVisible()

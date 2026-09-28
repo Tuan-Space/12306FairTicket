@@ -10,7 +10,7 @@ QLabel#workflowStatus { padding: 8px 12px; background: #11182a; border-radius: 8
     color: #dbe5f7;
 }
 
-QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QScrollArea, QScrollArea > QWidget > QWidget {
+QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QDialog#cartDialog, QScrollArea, QScrollArea > QWidget > QWidget {
     background: #0b1020;
 }
 
@@ -191,18 +191,18 @@ QComboBox::drop-down, QDateEdit::drop-down {
     width: 24px;
 }
 
-QComboBox#priorityStrategy, QComboBox#passengerTicketType {
+QComboBox {
     padding-right: 32px;
 }
 
-QComboBox#priorityStrategy::drop-down, QComboBox#passengerTicketType::drop-down {
+QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 24px;
     border: 0;
 }
 
-QComboBox#priorityStrategy::down-arrow, QComboBox#passengerTicketType::down-arrow {
+QComboBox::down-arrow {
     image: url(assets/chevron-down-dark.svg);
     width: 10px;
     height: 6px;
@@ -318,20 +318,6 @@ QCheckBox::indicator:checked {
     image: url(assets/check.svg);
 }
 
-QListWidget#priorityList::indicator {
-    width: 17px;
-    height: 17px;
-    border: 1px solid #41506d;
-    border-radius: 5px;
-    background: #0d1526;
-}
-
-QListWidget#priorityList::indicator:checked {
-    background: #3986f3;
-    border-color: #65a3fb;
-    image: url(assets/check.svg);
-}
-
 QToolButton#helpButton {
     min-width: 20px;
     min-height: 20px;
@@ -382,7 +368,7 @@ QTabBar::tab:hover:!selected {
     color: #b9c6dc;
 }
 
-QListWidget#priorityList, QListWidget#timeline {
+QListWidget#timeline, QListWidget#cartPriorityList {
     background: #0c1424;
     border: 1px solid #253149;
     border-radius: 9px;
@@ -390,13 +376,13 @@ QListWidget#priorityList, QListWidget#timeline {
     padding: 4px;
 }
 
-QListWidget#priorityList::item, QListWidget#timeline::item {
+QListWidget#timeline::item, QListWidget#cartPriorityList::item {
     min-height: 27px;
     border-radius: 6px;
     padding: 3px 7px;
 }
 
-QListWidget#priorityList::item:selected {
+QListWidget#cartPriorityList::item:selected {
     background: #233b62;
 }
 

@@ -3,8 +3,10 @@ import logging
 import re
 import time
 import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http.cookiejar import MozillaCookieJar
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import requests
 
@@ -27,6 +29,15 @@ from .quiet_capability import extract_quiet_carriage_available
 
 
 _INIT_DC_SAFE_STOP = "尚未进入确认排队，本次任务已安全停止"
+
+
+@dataclass(frozen=True)
+class TicketQueryResult:
+    """A successful empty response is different from an unavailable query."""
+
+    success: bool
+    tickets: List[Dict[str, Any]]
+    error: str = ""
 
 
 class RailwayClient:
@@ -269,6 +280,14 @@ class RailwayClient:
         return False, str(payload.get("result_message") or payload)
 
     def query_tickets(self, from_code: str, to_code: str) -> List[Dict[str, Any]]:
+        # Keep the public list API for legacy callers; cart rounds need the
+        # explicit outcome so a failed route can be retried next round.
+        return self.query_tickets_result(from_code, to_code).tickets
+
+    def query_tickets_result(
+        self, from_code: str, to_code: str,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> TicketQueryResult:
         params = {
             "leftTicketDTO.train_date": self.cfg.train_date,
             "leftTicketDTO.from_station": from_code,
@@ -279,6 +298,9 @@ class RailwayClient:
         for endpoint in ("query", "queryA", "queryZ"):
             self.cancel_token.checkpoint()
             try:
+                if before_request is not None:
+                    before_request()
+                self.cancel_token.checkpoint()
                 request_start = time.perf_counter()
                 response = self.session.get(
                     f"{BASE_URL}/otn/leftTicket/{endpoint}",
@@ -287,15 +309,26 @@ class RailwayClient:
                 )
                 self.cancel_token.checkpoint()
                 request_ms = _elapsed_ms(request_start)
+                status = getattr(response, "status_code", 200)
+                if isinstance(status, int) and not 200 <= status < 300:
+                    raise ValueError(f"HTTP {status}")
                 payload = response.json()
-                if not payload.get("status"):
-                    last_error = _message_from_payload(payload)
+                if not isinstance(payload, dict) or payload.get("status") is not True:
+                    last_error = "服务端未确认查询成功"
                     continue
-                data = payload.get("data") or {}
-                results = data.get("result") or []
+                data = payload.get("data")
+                if not isinstance(data, dict) or not isinstance(data.get("result"), list):
+                    raise ValueError("余票响应缺少有效结果列表")
+                results = data["result"]
                 station_map = data.get("map") or {}
+                if not isinstance(station_map, dict) or not all(isinstance(row, str) for row in results):
+                    raise ValueError("余票响应格式错误")
                 parse_start = time.perf_counter()
                 tickets = self._parse_tickets(results, station_map)
+                for ticket in tickets:
+                    # Query column 13 is the train's originating date, not
+                    # necessarily the boarding date at an intermediate stop.
+                    ticket["query_date"] = self.cfg.train_date
                 _perf_log(
                     self.cfg,
                     "查票接口 %s: 请求 %.1fms，解析 %.1fms，结果 %s 条",
@@ -304,15 +337,17 @@ class RailwayClient:
                     _elapsed_ms(parse_start),
                     len(tickets),
                 )
-                return tickets
+                return TicketQueryResult(True, tickets)
             except RunCancelled:
                 raise
             except Exception as exc:
-                last_error = str(exc)
-                logging.debug("余票查询接口 %s 失败: %s", endpoint, exc)
+                # Exception bodies can include an upstream response or URL.
+                # Keep diagnostics useful without copying ticket credentials.
+                last_error = type(exc).__name__
+                logging.debug("余票查询接口 %s 失败: %s", endpoint, last_error)
         if last_error:
             logging.warning("余票查询失败: %s", last_error)
-        return []
+        return TicketQueryResult(False, [], last_error or "未取得有效余票响应")
 
     @staticmethod
     def _parse_tickets(results: List[str], station_map: Dict[str, str]) -> List[Dict[str, Any]]:
@@ -353,6 +388,7 @@ class RailwayClient:
                     "duration": item(10),
                     "can_buy": item(11) == "Y" or item(1) == "预订",
                     "date": train_date,
+                    "start_train_date": train_date,
                     "from_station": station_map.get(item(6), item(6)),
                     "to_station": station_map.get(item(7), item(7)),
                     "location_code": item(15),
@@ -447,10 +483,11 @@ class RailwayClient:
         return payload
 
     def submit_order_request(self, ticket: Dict[str, Any]) -> Tuple[bool, str]:
+        boarding_date = ticket.get("query_date") or ticket["date"]
         data = {
             "secretStr": ticket["secret_str"],
-            "train_date": ticket["date"],
-            "back_train_date": ticket["date"],
+            "train_date": boarding_date,
+            "back_train_date": boarding_date,
             "tour_flag": "dc",
             "purpose_codes": self.cfg.purpose_codes,
             "query_from_station_name": ticket["from_station"],
@@ -559,7 +596,7 @@ class RailwayClient:
     def get_queue_count(self, ticket: Dict[str, Any], ticket_info: Dict[str, Any], seat_type: str, token: str) -> Tuple[bool, Any]:
         query_dto = ticket_info.get("queryLeftTicketRequestDTO") or {}
         data = {
-            "train_date": _format_queue_date(ticket["date"]),
+            "train_date": _format_queue_date(self._queue_boarding_date(ticket, ticket_info)),
             "train_no": query_dto.get("train_no") or ticket.get("train_no", ""),
             "stationTrainCode": query_dto.get("station_train_code") or ticket.get("station_train_code", ""),
             "seatType": seat_type,
@@ -580,6 +617,30 @@ class RailwayClient:
         if payload.get("status"):
             return True, payload.get("data", {})
         return False, _message_from_payload(payload)
+
+    @staticmethod
+    def _queue_boarding_date(ticket: Dict[str, Any], ticket_info: Dict[str, Any]) -> str:
+        """Use the server's order date, checked against this query's date.
+
+        The official confirmation page reads orderRequestDTO.train_date.time;
+        start_train_date from the query row is a different field. Contexts
+        without an order-date DTO retain the already submitted boarding date.
+        """
+        boarding_date = ticket.get("query_date") or ticket["date"]
+        order = ticket_info.get("orderRequestDTO") or {}
+        if "train_date" not in order:
+            return boarding_date
+        raw = order["train_date"]
+        timestamp = raw.get("time") if isinstance(raw, Mapping) else None
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise ResponseFormatError("订单页乘车日期格式无效，任务已安全停止；请核对 12306 订单")
+        try:
+            server_date = datetime.fromtimestamp(timestamp / 1000, timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, OSError) as exc:
+            raise ResponseFormatError("订单页乘车日期格式无效，任务已安全停止；请核对 12306 订单") from exc
+        if server_date != boarding_date:
+            raise ResponseFormatError("订单页乘车日期与本次查询不一致，任务已安全停止；请核对 12306 订单")
+        return server_date
 
     def confirm_single_for_queue(
         self,

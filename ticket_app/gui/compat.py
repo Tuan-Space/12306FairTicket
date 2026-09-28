@@ -18,6 +18,10 @@ from dataclasses import MISSING, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional
 
+from ticket_app.cart import (
+    cart_migration_messages, cart_seat_types, migrate_legacy_cart,
+    normalize_cart_items, normalize_cart_migration, serialize_cart_items,
+)
 from ticket_app.configuration import AppConfig, AppError
 from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.passengers import normalize_passenger_ticket_types
@@ -33,7 +37,7 @@ else:
 RUNTIME_DIR = LOCAL_DATA_DIR
 PROFILE_FILE = RUNTIME_DIR / "gui_profiles.json"
 LEGACY_CONFIG_FILE = PROJECT_ROOT / "config.py"
-GUI_CONFIG_VERSION = 4
+GUI_CONFIG_VERSION = 5
 GUI_CONFIG_MAX_BYTES = 1_000_000
 STATION_CACHE_FILE = LOCAL_DATA_DIR / "stations.json"
 STATION_SNAPSHOT_FILE = PROJECT_ROOT / "assets" / "stations_snapshot.json"
@@ -72,6 +76,8 @@ COMMON_STATIONS = (
 
 
 CONFIG_KEY_MAP: Dict[str, str] = {
+    "CART_ITEMS": "cart_items",
+    "CART_MIGRATION": "cart_migration",
     "FROM_STATION": "from_station",
     "TO_STATION": "to_station",
     "TRAIN_DATE": "train_date",
@@ -115,6 +121,9 @@ CANONICAL_TO_CONFIG = {value: key for key, value in CONFIG_KEY_MAP.items()}
 
 
 DEFAULT_VALUES: Dict[str, Any] = {
+    # None is only the legacy adapter marker. New GUI drafts explicitly use [].
+    "cart_items": None,
+    "cart_migration": {"notes": [], "issues": []},
     "from_station": "北京西",
     "to_station": "郑州东",
     "train_date": "",
@@ -163,6 +172,7 @@ DEFAULT_VALUES: Dict[str, Any] = {
 EDITABLE_SETTINGS_KEYS = frozenset(
     {
         "from_station", "to_station", "train_date", "passenger_names",
+        "cart_items", "cart_migration",
         "passenger_ticket_types", "quiet_carriage_preference",
         "seat_types", "preferred_trains", "only_preferred_trains",
         "priority_strategy", "empty_train_scope",
@@ -175,6 +185,10 @@ EDITABLE_SETTINGS_KEYS = frozenset(
         "log_level", "perf_log",
     }
 )
+LEGACY_SELECTION_KEYS = frozenset({
+    "from_station", "to_station", "seat_types", "preferred_trains",
+    "only_preferred_trains", "priority_strategy", "empty_train_scope",
+})
 # Kept as a public compatibility name for the v1 named-profile reader.
 PROFILE_KEYS = frozenset(
     {
@@ -214,7 +228,20 @@ def canonical_mapping(values: Mapping[str, Any]) -> Dict[str, Any]:
     )
     for key, value in values.items():
         canonical = CONFIG_KEY_MAP.get(str(key), str(key).lower())
-        result[canonical] = _json_value(value)
+        if canonical == "cart_items" and value is not None:
+            try:
+                result[canonical] = serialize_cart_items(value)
+            except ValueError as exc:
+                raise AppError(str(exc)) from exc
+        else:
+            result[canonical] = _json_value(value)
+
+    try:
+        result["cart_migration"] = normalize_cart_migration(result.get("cart_migration"))
+    except ValueError as exc:
+        raise AppError(str(exc)) from exc
+    if result.get("cart_items") is not None:
+        result["seat_types"] = cart_seat_types(normalize_cart_items(result["cart_items"]))
 
     for name in ("passenger_names", "seat_types", "preferred_trains"):
         value = result.get(name)
@@ -341,6 +368,14 @@ def build_app_config(values: Mapping[str, Any], config_path: Optional[Path] = No
     """Build AppConfig through the new mapping API or the legacy dataclass."""
 
     canonical = canonical_mapping(values)
+    if canonical["cart_items"] is None:
+        try:
+            canonical.update(migrate_legacy_cart(canonical))
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+    _, migration_issues = cart_migration_messages(canonical["cart_migration"])
+    if migration_issues:
+        raise AppError("；".join(migration_issues))
     # Desktop policy: every process starts with a fresh QR login.  Runtime
     # state and diagnostics live under the user's local application-data path.
     canonical["persist_session"] = False
@@ -397,7 +432,7 @@ def profile_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
-    """Produce the complete, privacy-safe version 4 settings mapping.
+    """Produce the complete, privacy-safe version 5 settings mapping.
 
     Defaults are filled in intentionally: saving an unfinished form is valid,
     and imported v1/v2 documents receive compatibility defaults. Only the
@@ -416,7 +451,9 @@ def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
         "login_qr_poll_seconds", "time_sync_max_rtt_seconds", "order_wait_interval_seconds",
     }
     integer_keys = {"max_retries", "time_sync_samples", "order_wait_attempts", "station_cache_days"}
-    boolean_keys = {"only_preferred_trains", "auto_submit", "perf_log", "quiet_carriage_preference"}
+    boolean_keys = {"auto_submit", "perf_log", "quiet_carriage_preference"}
+    if canonical["cart_items"] is None:
+        boolean_keys.add("only_preferred_trains")
     try:
         for key in float_keys:
             raw = payload[key]
@@ -437,12 +474,15 @@ def editable_settings_payload(values: Mapping[str, Any]) -> Dict[str, Any]:
         for key in boolean_keys:
             if not isinstance(payload[key], bool):
                 raise ValueError("必须是布尔值")
-        if not isinstance(payload["priority_strategy"], str):
+        if canonical["cart_items"] is None and not isinstance(payload["priority_strategy"], str):
             raise ValueError("priority_strategy 必须是字符串")
-        if payload["empty_train_scope"] is not None and not isinstance(payload["empty_train_scope"], str):
+        if canonical["cart_items"] is None and payload["empty_train_scope"] is not None and not isinstance(payload["empty_train_scope"], str):
             raise ValueError("empty_train_scope 必须是字符串或 null")
     except (TypeError, ValueError, OverflowError) as exc:
         raise AppError(f"配置字段类型无效: {exc}") from exc
+    if canonical["cart_items"] is not None:
+        for key in LEGACY_SELECTION_KEYS:
+            payload.pop(key, None)
     return payload
 
 
@@ -494,9 +534,14 @@ def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
 
 
 def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
-    """Save all editable GUI settings as a version 4 document atomically."""
+    """Save all editable GUI settings as a version 5 document atomically."""
 
     canonical = canonical_mapping(values)
+    if canonical["cart_items"] is None:
+        try:
+            canonical.update(migrate_legacy_cart(canonical))
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
     canonical["empty_train_scope"] = "all"
     _atomic_write_json(
         path,
@@ -505,7 +550,7 @@ def save_gui_settings(path: Path, values: Mapping[str, Any]) -> None:
 
 
 def load_gui_settings(path: Path) -> Dict[str, Any]:
-    """Import versions 2/3/4, or a safe subset of legacy version 1.
+    """Import versions 1–5 with explicit cart migration and privacy filtering.
 
     Version 1 exports used ``values`` and contain only the former profile
     fields.  Old named-profile database documents are intentionally not
@@ -517,17 +562,33 @@ def load_gui_settings(path: Path) -> Dict[str, Any]:
     version = document.get("version")
     if type(version) is not int:
         raise AppError("配置 JSON 缺少整数 version")
-    if version in (2, 3, GUI_CONFIG_VERSION):
+    if version in (2, 3, 4, GUI_CONFIG_VERSION):
         settings = document.get("settings")
         if not isinstance(settings, Mapping):
             raise AppError(f"version {version} 配置的 settings 必须是对象")
-        return canonical_mapping(editable_settings_payload(settings))
-    if version == 1:
+    elif version == 1:
         settings = document.get("values")
         if not isinstance(settings, Mapping):
             raise AppError("version 1 配置必须包含 values 对象")
-        return canonical_mapping(editable_settings_payload(settings))
-    raise AppError(f"不支持的配置版本: {version}")
+    else:
+        raise AppError(f"不支持的配置版本: {version}")
+    if version < GUI_CONFIG_VERSION:
+        settings = {
+            key: value for key, value in settings.items()
+            if CONFIG_KEY_MAP.get(str(key), str(key).lower()) not in {"cart_items", "cart_migration"}
+        }
+    canonical = canonical_mapping(editable_settings_payload(settings))
+    if version < GUI_CONFIG_VERSION:
+        # Legacy version numbers never reinterpret injected cart fields: their
+        # published schema only contains the original route/train/seat inputs.
+        canonical["cart_items"] = None
+        try:
+            canonical.update(migrate_legacy_cart(canonical))
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+    elif canonical["cart_items"] is None:
+        raise AppError("version 5 配置必须包含 cart_items 项目列表（空草稿可使用 []）")
+    return canonical_mapping(canonical)
 
 
 class GuiConfigStore:

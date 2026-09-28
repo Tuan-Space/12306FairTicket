@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from cart_helpers import set_cart
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtWidgets import QApplication
 from shiboken6 import isValid
@@ -282,7 +283,7 @@ def test_confirmation_summary_fits_all_lines_and_last_line_can_be_scrolled_into_
         application.setStyleSheet(gui_app._load_stylesheet(application, dark))
         main_window.resize(width, 720)
         main_window.passengers.setText("示例乘车人甲、示例乘车人乙、示例乘车人丙、示例乘车人丁、示例乘车人戊")
-        main_window.seat_types.set_values(["二等座", "一等座", "商务座", "一等卧", "二等卧"])
+        set_cart(main_window, ["二等座", "一等座", "商务座", "一等卧", "二等卧"])
         main_window.preferred_trains.setText("G79，G81，D123，K45")
         main_window.account_state = "valid"
         main_window.show()

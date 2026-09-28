@@ -5,7 +5,7 @@ QPushButton#stepButton[stepState="pending"] { color: #687792; }
 QLabel#workflowStatus { background: #ffffff; }
 * { color: #26344d; }
 
-QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QScrollArea, QScrollArea > QWidget > QWidget {
+QMainWindow, QWidget#appRoot, QDialog#passengerSelectionDialog, QDialog#cartDialog, QScrollArea, QScrollArea > QWidget > QWidget {
     background: #f3f6fb;
 }
 
@@ -114,7 +114,7 @@ QComboBox QAbstractItemView {
     selection-color: #184f8f;
 }
 
-QComboBox#priorityStrategy::down-arrow, QComboBox#passengerTicketType::down-arrow {
+QComboBox::down-arrow {
     image: url(assets/chevron-down-light.svg);
 }
 
@@ -193,20 +193,6 @@ QCheckBox { color: #34435d; }
 QCheckBox::indicator { background: #ffffff; border-color: #9aaac0; }
 QCheckBox::indicator:checked { background: #2f7fdf; border-color: #2f7fdf; image: url(assets/check.svg); }
 
-QListWidget#priorityList::indicator {
-    width: 17px;
-    height: 17px;
-    border: 1px solid #9aaac0;
-    border-radius: 5px;
-    background: #ffffff;
-}
-
-QListWidget#priorityList::indicator:checked {
-    background: #2f7fdf;
-    border-color: #2f7fdf;
-    image: url(assets/check.svg);
-}
-
 QToolButton#helpButton {
     color: #216dbd;
     background: #e9f3ff;
@@ -218,13 +204,13 @@ QTabBar::tab { color: #687792; }
 QTabBar::tab:selected { color: #1d3352; border-bottom-color: #317fdc; }
 QTabBar::tab:hover:!selected { color: #344a67; }
 
-QListWidget#priorityList, QListWidget#timeline {
+QListWidget#timeline, QListWidget#cartPriorityList {
     color: #34435d;
     background: #f8fafd;
     border-color: #d4deea;
 }
 
-QListWidget#priorityList::item:selected {
+QListWidget#cartPriorityList::item:selected {
     color: #194f8e;
     background: #dcecff;
 }

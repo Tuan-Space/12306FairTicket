@@ -5,6 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from cart_helpers import set_cart
 
 from test_gui_app import main_window  # noqa: F401 - isolated, network-blocked fixture
 from PySide6.QtCore import Qt
@@ -29,7 +30,7 @@ def set_valid_trip(window, *, monitor=False):
     window.to_station.setText("郑州东")
     window.train_date.setDate(gui_app.QDate.currentDate())
     window.preferred_trains.setText("G79")
-    window.seat_types.set_values(["二等座"])
+    set_cart(window, ["二等座"])
     window.start_at.set_disabled(True)
     window.stop_at.set_disabled(True)
     window.auto_submit.setChecked(not monitor)
@@ -51,7 +52,7 @@ def test_new_window_starts_at_trip_step_without_authentication_or_booking(main_w
     assert main_window._active_operation is None
     assert not main_window.start_button.isEnabled()
     assert main_window.start_button.isHidden()
-    assert main_window.seat_types.values() == []
+    assert main_window.cart_items == []
     assert not main_window.advanced_toggle.isChecked()
     assert main_window.advanced_content.isHidden()
     main_window.step_buttons[2].click()
@@ -73,7 +74,7 @@ def test_trip_next_validates_only_trip_fields_and_never_logs_in(main_window):
 
 def test_trip_step_blocks_missing_seats_even_if_account_is_already_valid(main_window):
     set_valid_trip(main_window)
-    main_window.seat_types.set_values([])
+    set_cart(main_window, [])
     main_window.account_state = "valid"
     main_window._next_step()
     assert main_window.current_step == 0
@@ -226,7 +227,7 @@ def test_back_edit_revalidates_preserved_preferences_and_focuses_confirmation(
 ):
     set_valid_trip(main_window)
     if change == "berth_count":
-        main_window.seat_types.set_values(["硬卧"])
+        set_cart(main_window, ["硬卧"])
     main_window.show()
     main_window.activateWindow()
     main_window._next_step()
@@ -247,7 +248,7 @@ def test_back_edit_revalidates_preserved_preferences_and_focuses_confirmation(
     main_window.back_button.click()
     assert main_window.current_step == 0
     if change == "seat_layout":
-        main_window.seat_types.set_values(["商务座"])
+        set_cart(main_window, ["商务座"])
     main_window._next_step()
     assert main_window.current_step == 1
     if change != "seat_layout":
@@ -434,6 +435,7 @@ def test_start_stop_modify_and_restart_preserve_draft_and_process_session(main_w
         assert main_window.passenger_ticket_types.values() == {"学生甲": "adult"}
         assert shared_session.cookies.get("wizard-test") == "in-memory"
         main_window.preferred_trains.setText("G123")
+        set_cart(main_window, ["二等座"])
         main_window._next_step()
         main_window._next_step()
         assert main_window.current_step == 2
@@ -441,7 +443,7 @@ def test_start_stop_modify_and_restart_preserve_draft_and_process_session(main_w
         main_window._start_task()
         qtbot.waitUntil(started.is_set)
         assert sessions == [shared_session, shared_session]
-        assert configs[-1].preferred_trains == ["G123"]
+        assert [item.train_code for item in configs[-1].cart_items] == ["G123"]
         assert configs[-1].passenger_ticket_types == {"学生甲": "adult"}
     finally:
         if main_window._active_operation is not None:

@@ -47,6 +47,7 @@ class WizardFlow:
         self.flow_error.setWordWrap(True)
         self.flow_error.hide()
         root.addWidget(self.flow_error)
+        root.addWidget(self._build_cart_bar())
 
         self.steps = QStackedWidget()
         self.passenger_scroll, _, self.passenger_layout = _scroll_page()
@@ -141,6 +142,15 @@ class WizardFlow:
 
     def _visit_step(self, step):
         if self._active_operation is None and step <= self._visited_step and step < 3 and self.current_step < 3:
+            if self.current_step == 0 and step > 0:
+                if not self._handle_unadded_cart_draft():
+                    return
+                errors = self._step_errors(0)
+                if errors:
+                    self._apply_validation(errors)
+                    self._focus_first_error(errors)
+                    self._show_flow_error(next(iter(errors.values())))
+                    return
             self._go_to_step(step)
 
     def _go_to_step(self, step):
@@ -161,6 +171,8 @@ class WizardFlow:
             return
         if self.current_step == 1 and self.account_state != "valid":
             self._show_flow_error("请先扫码登录 12306，再选择乘车人。")
+            return
+        if self.current_step == 0 and not self._handle_unadded_cart_draft():
             return
         errors = self._step_errors(self.current_step)
         if errors:
@@ -232,13 +244,10 @@ class WizardFlow:
         people = "、".join(f"{name}（{labels.get(values['passenger_ticket_types'].get(name), default_ticket_label(name, contact_types))}）"
                           for name in _split_names(self.passengers.text())) or "未选择（仅监控）"
         self.confirm_summary.setText(
-            f"{values['from_station']} → {values['to_station']}    {values['train_date']}\n\n"
-            f"乘车人：{people}\n"
-            f"席别顺序：{' → '.join(values['seat_types']) or '尚未选择'}\n"
-            f"优先车次：{'、'.join(values['preferred_trains']) or '未指定'}\n"
-            f"{self.range_summary.text()}\n"
-            f"尝试策略：{'席别优先' if values['priority_strategy'] == 'seat_first' else '车次优先'}\n"
-            f"{self.order_preview.text()}\n\n"
+            f"乘车日期：{values['train_date']}\n乘车人：{people}\n\n"
+            f"{self._cart_confirmation_text()}\n\n"
+            "各项是同一次出行的备选，成功一项即停止。\n"
+            "同站对每轮共用一次查询；站对越多，一轮查询可能越久。\n\n"
             f"任务模式：{'自动提交订单，之后手动支付' if values['auto_submit'] else '仅监控，不提交订单'}\n"
             f"开始 / 开售时间：{values['start_at'] or '点击开始后立即查询'}\n"
             f"停止时间：{values['stop_at'] or '不设停止时间（仍受最大查询轮数限制）'}"
@@ -254,6 +263,7 @@ class WizardFlow:
         step = self.current_step
         count = len(_split_names(self.passengers.text()))
         self.steps.setCurrentIndex(step)
+        self.cart_bar.setVisible(step == 0)
         for index, button in enumerate(self.step_buttons):
             state = "current" if index == step else "complete" if index < step else "pending"
             button.setProperty("stepState", state)

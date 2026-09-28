@@ -12,6 +12,7 @@ from ticket_app.gui.compat import (
     DEFAULT_VALUES,
     EDITABLE_SETTINGS_KEYS,
     GUI_CONFIG_VERSION,
+    LEGACY_SELECTION_KEYS,
     bundled_station_names,
     cached_station_names,
     load_gui_settings,
@@ -20,7 +21,7 @@ from ticket_app.gui.compat import (
 from ticket_app.gui.station_worker import StationRefreshWorker, refresh_station_cache
 
 
-def test_v3_round_trip_contains_all_editable_settings_and_no_sensitive_values(tmp_path: Path) -> None:
+def test_v5_round_trip_contains_all_cart_settings_and_no_sensitive_values(tmp_path: Path) -> None:
     target = tmp_path / "travel.json"
     values = {
         **DEFAULT_VALUES,
@@ -42,19 +43,19 @@ def test_v3_round_trip_contains_all_editable_settings_and_no_sensitive_values(tm
     document = json.loads(target.read_text(encoding="utf-8"))
     assert not list(tmp_path.glob(".travel.json.*.tmp"))
     assert document["version"] == GUI_CONFIG_VERSION
-    assert set(document["settings"]) == set(EDITABLE_SETTINGS_KEYS)
+    assert set(document["settings"]) == set(EDITABLE_SETTINGS_KEYS - LEGACY_SELECTION_KEYS)
     serialized = target.read_text(encoding="utf-8")
     for secret in ("do-not-save-cookie", "do-not-save-token", "do-not-save-identity", "do-not-save-session-path"):
         assert secret not in serialized
 
     restored = load_gui_settings(target)
-    assert restored["from_station"] == "上海虹桥"
+    assert restored["cart_items"][0]["from_station"] == "上海虹桥"
     assert restored["request_timeout_seconds"] == 13.5
     assert restored["persist_session"] is False
     assert restored["session_file"] == DEFAULT_VALUES["session_file"]
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_legacy_migration_preserves_order_preferences_and_compatibility_defaults(tmp_path: Path, version: int) -> None:
     legacy = tmp_path / "legacy.json"
     settings = {
@@ -73,17 +74,21 @@ def test_legacy_migration_preserves_order_preferences_and_compatibility_defaults
     assert loaded["priority_strategy"] == "train_first"
     new_file = tmp_path / "migrated.json"
     save_gui_settings(new_file, loaded)
-    assert json.loads(new_file.read_text(encoding="utf-8"))["version"] == 4
-    assert load_gui_settings(new_file) == loaded
+    assert json.loads(new_file.read_text(encoding="utf-8"))["version"] == 5
+    restored = load_gui_settings(new_file)
+    for key in set(restored) - LEGACY_SELECTION_KEYS:
+        assert restored[key] == loaded[key]
+    assert restored["cart_migration"]["notes"] == ["train_first_any_multi_seat"]
 
 
 @pytest.mark.parametrize("scope", [None, "high_speed", "conventional", "all"])
-def test_v3_save_normalizes_removed_scope_and_keeps_priority_strategy(tmp_path: Path, scope: str | None) -> None:
+def test_v5_save_keeps_restricted_legacy_scope_pending_in_cart(tmp_path: Path, scope: str | None) -> None:
     path = tmp_path / "draft.json"
-    save_gui_settings(path, {**DEFAULT_VALUES, "empty_train_scope": scope, "priority_strategy": "seat_first"})
+    save_gui_settings(path, {**DEFAULT_VALUES, "only_preferred_trains": False, "empty_train_scope": scope, "priority_strategy": "seat_first"})
     restored = load_gui_settings(path)
     assert restored["empty_train_scope"] == "all"
-    assert restored["priority_strategy"] == "seat_first"
+    assert bool(restored["cart_migration"]["issues"]) == (scope != "all")
+    assert [row["seat_type"] for row in restored["cart_items"]] == DEFAULT_VALUES["seat_types"]
 
 
 @pytest.mark.parametrize(("key", "value"), [

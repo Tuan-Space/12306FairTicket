@@ -18,7 +18,6 @@ from ticket_app.gui.widgets import (
     HelpLabel,
     CurrentPhaseWidget,
     PositionPreferences,
-    PriorityListEditor,
     SeatMapWidget,
     TimeFieldsWidget,
     set_validation_state,
@@ -114,25 +113,6 @@ def test_unfocused_clean_spin_boxes_ignore_wheel_changes(qtbot) -> None:
     assert not event.isAccepted()
 
 
-def test_priority_list_is_three_column_and_shows_selected_priority_rank(qtbot) -> None:
-    editor = PriorityListEditor([f"席别 {index}" for index in range(10)])
-    qtbot.addWidget(editor)
-    editor.set_values(["席别 4", "席别 2", "席别 4", "已废弃席别"])
-
-    assert editor.list.count() == 10
-    assert editor.COLUMNS == 3
-    assert editor.list.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert editor.list.viewMode() == editor.list.ViewMode.IconMode
-    assert editor.list.flow() == editor.list.Flow.LeftToRight
-    assert editor.list.height() < 10 * 32
-    assert editor.values() == ["席别 4", "席别 2"]
-    assert editor.list.item(0).text() == "1. 席别 4"
-    assert editor.list.item(1).text() == "2. 席别 2"
-    assert editor.list.dragDropMode() == editor.list.DragDropMode.InternalMove
-
-    assert editor.list._move_item(1, 0)
-    assert editor.values() == ["席别 2", "席别 4"]
-    assert editor.list.item(0).text() == "1. 席别 2"
 
 
 def test_seat_and_berth_widgets_use_friendly_relation_and_step_controls(qtbot) -> None:

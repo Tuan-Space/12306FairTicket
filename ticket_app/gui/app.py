@@ -45,7 +45,7 @@ from ticket_app.clock import ServerClock
 from ticket_app.configuration import AppConfig, AppError, ConnectionConfig, SEAT_SPECS
 from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.preferences import BERTH_SEAT_TYPES, SEATED_SEAT_TYPES
-from ticket_app.train_policy import classify_train_codes, priority_preview, scope_summary
+from ticket_app.cart import migrate_legacy_cart
 
 from .compat import (
     DEFAULT_VALUES,
@@ -61,6 +61,7 @@ from .compat import (
 from .station_worker import StationRefreshWorker
 from .passenger_widgets import PassengerTicketEditor
 from .wizard import WizardFlow
+from .cart_flow import CartFlow
 from .validation import validate_gui_mapping
 from .widgets import (
     Card,
@@ -71,7 +72,6 @@ from .widgets import (
     HelpLabel,
     LogView,
     PositionPreferences,
-    GroupedSeatEditor,
     TimeFieldsWidget,
     set_validation_state,
 )
@@ -108,7 +108,7 @@ class StationRefreshRelay(QObject):
     completed = Signal(object, object)
 
 
-class MainWindow(WizardFlow, QMainWindow):
+class MainWindow(CartFlow, WizardFlow, QMainWindow):
     submit_operation = Signal(object)
     retire_executor = Signal(object)
 
@@ -255,13 +255,13 @@ class MainWindow(WizardFlow, QMainWindow):
         layout.setSpacing(8)
         self.save_settings_button = QPushButton("保存为…")
         self.save_settings_button.setToolTip(
-            "保存全部可编辑参数为 version 4 JSON；允许保存未完成草稿。"
+            "保存购物车与公共参数为 version 5 JSON；添加区未加入的内容不保存。"
             "不会保存 Cookie、Token、二维码、证件、手机号或本机路径。"
         )
         self.save_settings_button.clicked.connect(self._save_settings)
         self.import_settings_button = QPushButton("导入…")
         self.import_settings_button.setToolTip(
-            "仅导入 JSON，兼容 version 1、version 2、version 3 和 version 4；导入后会立即检查并标出问题字段。"
+            "仅导入 JSON，兼容 version 1–5；导入后会检查问题，并说明旧配置的购物车转换。"
         )
         self.import_settings_button.clicked.connect(self._import_settings)
         layout.addWidget(self.save_settings_button)
@@ -326,31 +326,12 @@ class MainWindow(WizardFlow, QMainWindow):
         scroll, _page, layout = _scroll_page()
         self.basic_scroll = scroll
 
-        trip = Card("设置行程", "先确定去哪、何时出发和接受哪些席别；下一步再登录并选择乘车人。")
+        trip = Card("公共日期与时间", "购物车里的全部备选共用日期、时间和乘车人。")
         trip_grid = QGridLayout()
         trip_grid.setHorizontalSpacing(8)
         trip_grid.setVerticalSpacing(10)
         trip_grid.setColumnStretch(0, 1)
         trip_grid.setColumnStretch(2, 1)
-        self.from_station = QLineEdit()
-        self.from_station.setPlaceholderText("出发站")
-        self.from_station.setClearButtonEnabled(True)
-        self.to_station = QLineEdit()
-        self.to_station.setPlaceholderText("到达站")
-        self.to_station.setClearButtonEnabled(True)
-        self.swap_stations_button = QToolButton()
-        self.swap_stations_button.setText("⇄")
-        self.swap_stations_button.setFixedWidth(36)
-        self.swap_stations_button.setToolTip("交换出发站和到达站")
-        self.swap_stations_button.clicked.connect(self._swap_stations)
-        self.update_stations_button = QPushButton("更新站点")
-        self.update_stations_button.setToolTip("手动从 12306 获取最新站点列表；程序启动时不会自动联网")
-        self.update_stations_button.clicked.connect(self._refresh_stations)
-        trip_grid.addWidget(self._field_block("from_station", "出发站", self.from_station), 0, 0)
-        trip_grid.addWidget(self.swap_stations_button, 0, 1, alignment=Qt.AlignmentFlag.AlignBottom)
-        trip_grid.addWidget(self._field_block("to_station", "到达站", self.to_station), 0, 2)
-        trip_grid.addWidget(self.update_stations_button, 0, 3, alignment=Qt.AlignmentFlag.AlignBottom)
-
         self.train_date = DatePickerWidget()
         trip_grid.addWidget(
             self._field_block(
@@ -398,6 +379,7 @@ class MainWindow(WizardFlow, QMainWindow):
         self.prep_clock_status.setWordWrap(True)
         trip.body.addWidget(self.prep_clock_status)
         layout.addWidget(trip)
+        layout.addWidget(self._build_cart_entry())
 
         self.passengers = QLineEdit()
         self.passengers.setPlaceholderText("张三，李四（最多 5 人）")
@@ -415,56 +397,6 @@ class MainWindow(WizardFlow, QMainWindow):
         self.passenger_ticket_types = PassengerTicketEditor()
         self.passenger_card.body.addWidget(self._field_block("passenger_ticket_types", "选择购买的车票类型", self.passenger_ticket_types, page_index=1))
         self.passenger_ticket_types.changed.connect(lambda: self._schedule_validation("passenger_ticket_types"))
-        people = Card("车次范围", "车次留空时不限类型，按已选席别查询；实际尝试范围以下方说明为准。")
-        self.preferred_trains = QLineEdit()
-        self.preferred_trains.setPlaceholderText("G79, G95（从左到右优先）")
-        self.preferred_trains.setClearButtonEnabled(True)
-        self.preferred_trains.setToolTip(
-            "多个车次可用中英文逗号、顿号、中英文分号、换行或制表符分隔，"
-            "车次优先时先按填写顺序尝试；席别优先时，在同一席别内按填写顺序尝试。"
-        )
-        self.only_preferred = QCheckBox("只尝试上述车次")
-        self.only_preferred.setToolTip("勾选后不会尝试优先车次输入框以外的其他车次。")
-        train_editor = QWidget()
-        train_layout = QVBoxLayout(train_editor)
-        train_layout.setContentsMargins(0, 0, 0, 0)
-        train_layout.setSpacing(7)
-        train_layout.addWidget(self.preferred_trains)
-        train_layout.addWidget(self.only_preferred)
-        train_block = self._field_block(
-            "preferred_trains",
-            "优先车次",
-            train_editor,
-        )
-        self.field_widgets["preferred_trains"] = self.preferred_trains
-        people.body.addWidget(train_block)
-        self.range_summary = QLabel()
-        self.range_summary.setWordWrap(True)
-        self.range_summary.setObjectName("muted")
-        people.body.addWidget(self.range_summary)
-        layout.addWidget(people)
-
-        seating = Card("席别与优先顺序", "勾选可接受的席别，再排列顺序；切换车次不会更改已选席别。")
-        self.seat_types = GroupedSeatEditor(SEAT_SPECS.keys())
-        self.seat_types.changed.connect(self._seat_types_changed)
-        seat_block = self._field_block(
-            "seat_types",
-            "席别优先级",
-            self.seat_types,
-        )
-        self.field_widgets["seat_types"] = self.seat_types.list
-        seating.body.addWidget(seat_block)
-        self.priority_strategy = QComboBox()
-        self.priority_strategy.setObjectName("priorityStrategy")
-        self.priority_strategy.addItem("车次优先：先选车次，再选席别", "train_first")
-        self.priority_strategy.addItem("席别优先：先选席别，再选车次", "seat_first")
-        seating.body.addWidget(self._field_block("priority_strategy", "尝试策略", self.priority_strategy))
-        self.order_preview = QLabel()
-        self.order_preview.setWordWrap(True)
-        self.order_preview.setObjectName("muted")
-        seating.body.addWidget(self.order_preview)
-        layout.addWidget(seating)
-
         position = Card("座位与铺位偏好", "偏好只提交一次；若 12306 未开放或无法满足，订单仍保留并由系统分配其他位置。")
         self.position_preferences = PositionPreferences()
         self.position_preferences.berths.select_seat_types_requested.connect(self._focus_sleeper_seats)
@@ -507,19 +439,11 @@ class MainWindow(WizardFlow, QMainWindow):
         action.body.addWidget(hint)
         layout.addWidget(action)
 
-        self.from_station.textChanged.connect(lambda: self._schedule_validation("from_station", "to_station"))
-        self.to_station.textChanged.connect(lambda: self._schedule_validation("to_station", "from_station"))
         self.train_date.changed.connect(lambda: self._schedule_validation("train_date"))
         self.start_at.changed.connect(self._target_edited)
         self.start_at.changed.connect(lambda: self._schedule_validation("start_at"))
         self.stop_at.changed.connect(lambda: self._schedule_validation("stop_at"))
         self.passengers.textChanged.connect(self._passenger_names_changed)
-        self.preferred_trains.textChanged.connect(self._preferred_trains_edited)
-        self.only_preferred.toggled.connect(self._train_inputs_changed)
-        self.priority_strategy.currentIndexChanged.connect(self._strategy_changed)
-        self.seat_types.changed.connect(
-            lambda: self._schedule_validation("seat_types", "seat_position_preferences", "berth_preference")
-        )
         self.position_preferences.changed.connect(
             lambda: self._schedule_validation("seat_position_preferences", "berth_preference")
         )
@@ -643,6 +567,17 @@ class MainWindow(WizardFlow, QMainWindow):
         self.phase_badge.setObjectName("phaseBadge")
         self.phase_badge.setWordWrap(True)
         status.body.addWidget(self.phase_badge)
+        self.current_cart_item = QLabel("任务开始后显示当前备选")
+        self.current_cart_item.setTextFormat(Qt.TextFormat.PlainText)
+        self.current_cart_item.setWordWrap(True)
+        status.body.addWidget(self.current_cart_item)
+        self.cart_query_status = QLabel()
+        self.cart_query_status.setWordWrap(True)
+        self.cart_query_status.setObjectName("muted")
+        status.body.addWidget(self.cart_query_status)
+        self.run_cart_button = QPushButton("查看本轮购物车")
+        self.run_cart_button.clicked.connect(self._open_cart)
+        status.body.addWidget(self.run_cart_button, alignment=Qt.AlignmentFlag.AlignLeft)
         self.sale_countdown = QLabel("--:--:--.-")
         self.sale_countdown.setObjectName("saleCountdown")
         self.sale_countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -652,7 +587,7 @@ class MainWindow(WizardFlow, QMainWindow):
         status.body.addWidget(self.sale_countdown)
         status.body.addWidget(self.sale_caption)
         metrics = QHBoxLayout()
-        self.query_metric = self._metric("查询", "0")
+        self.query_metric = self._metric("查询轮数", "0")
         self.rtt_metric = self._metric("RTT", "--")
         self.offset_metric = self._metric("时钟偏移", "--")
         for metric in (self.query_metric, self.rtt_metric, self.offset_metric):
@@ -746,7 +681,7 @@ class MainWindow(WizardFlow, QMainWindow):
 
     # ----- JSON settings and configuration -------------------------------
     def _load_initial_values(self) -> None:
-        self._apply_mapping({**DEFAULT_VALUES, "seat_types": [], "seat_position_preferences": [],
+        self._apply_mapping({**DEFAULT_VALUES, "cart_items": [], "seat_types": [], "seat_position_preferences": [],
                              "berth_preference": {"lower": 0, "middle": 0, "upper": 0},
                              "empty_train_scope": "all", "only_preferred_trains": False})
 
@@ -767,8 +702,8 @@ class MainWindow(WizardFlow, QMainWindow):
         except (AppError, OSError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        logging.info("已保存 version 4 JSON 配置: %s", path)
-        QMessageBox.information(self, "保存成功", "已保存全部可编辑参数；文件不包含登录态或身份信息。")
+        logging.info("已保存 version 5 JSON 配置: %s", path)
+        QMessageBox.information(self, "保存成功", "已保存购物车与公共参数；添加区未加入的内容不保存。文件不含登录态或身份信息。")
 
     def _import_settings(self) -> None:
         name, _filter = QFileDialog.getOpenFileName(self, "导入界面参数", "", "JSON 配置 (*.json)")
@@ -793,17 +728,12 @@ class MainWindow(WizardFlow, QMainWindow):
 
     def _collect_mapping(self) -> Dict[str, Any]:
         values: Dict[str, Any] = {
-            "from_station": self.from_station.text().strip(),
-            "to_station": self.to_station.text().strip(),
+            "cart_items": deepcopy(self.cart_items),
+            "cart_migration": deepcopy(self.cart_migration),
             "train_date": self.train_date.date().toString("yyyy-MM-dd"),
             "passenger_names": _split_names(self.passengers.text()),
             "passenger_ticket_types": self.passenger_ticket_types.values(),
             "quiet_carriage_preference": self.quiet_carriage.isChecked(),
-            "seat_types": self.seat_types.values(),
-            "preferred_trains": [item.upper() for item in _split_names(self.preferred_trains.text())],
-            "only_preferred_trains": self.only_preferred.isChecked(),
-            "empty_train_scope": "all",
-            "priority_strategy": self.priority_strategy.currentData(),
             "start_at": self.start_at.text().strip(),
             "stop_at": self.stop_at.text().strip(),
             "auto_submit": self.auto_submit.isChecked(),
@@ -830,14 +760,20 @@ class MainWindow(WizardFlow, QMainWindow):
 
     def _apply_mapping(self, raw_values: Mapping[str, Any]) -> tuple[Dict[str, str], list[str]]:
         values = canonical_mapping(raw_values)
+        if values.get("cart_items") is None:
+            values.update(migrate_legacy_cart(values))
         import_errors: Dict[str, str] = {}
         warnings: list[str] = []
-        if values.get("empty_train_scope") != "all":
-            warnings.append("已移除“未指定车次时的范围”：旧设置已转换为不限类型，车次留空时按已选席别查询所有列车。")
         self._applying_values = True
         try:
-            self.from_station.setText(str(values["from_station"]))
-            self.to_station.setText(str(values["to_station"]))
+            self.cart_items = deepcopy(values["cart_items"])
+            self.cart_migration = deepcopy(values.get("cart_migration", {"notes": [], "issues": []}))
+            first = self.cart_items[0] if self.cart_items else values
+            self.from_station.setText(str(first.get("from_station", "")))
+            self.to_station.setText(str(first.get("to_station", "")))
+            self.train_scope.setCurrentIndex(0)
+            self.preferred_trains.clear()
+            self.cart_seat.setCurrentIndex(0)
             raw_date = str(values["train_date"])
             parsed = QDate.fromString(raw_date, "yyyy-MM-dd")
             if raw_date and (not parsed.isValid() or parsed < QDate.currentDate()):
@@ -849,16 +785,6 @@ class MainWindow(WizardFlow, QMainWindow):
                 import_errors["passenger_ticket_types"] = "导入票种包含未选择的乘车人，请核对并重新设置"
             self.passenger_ticket_types.set_names(values["passenger_names"], overrides)
             self.quiet_carriage.setChecked(values["quiet_carriage_preference"])
-            self.preferred_trains.setText(", ".join(values["preferred_trains"]))
-            self.only_preferred.setChecked(bool(values["only_preferred_trains"]))
-            for key, combo in (("priority_strategy", self.priority_strategy),):
-                index = combo.findData(values.get(key))
-                if index < 0:
-                    # Retain invalid imported values as an explicit item so a
-                    # later validation cannot silently accept a different rule.
-                    combo.addItem(f"无效设置：{values.get(key)}", values.get(key))
-                    index = combo.count() - 1
-                combo.setCurrentIndex(index)
             for key, editor in (("start_at", self.start_at), ("stop_at", self.stop_at)):
                 raw_time = str(values[key] or "").strip()
                 if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw_time):
@@ -870,11 +796,6 @@ class MainWindow(WizardFlow, QMainWindow):
                     editor.set_disabled(True)
                     import_errors[key] = "导入时间不是有效的 HH:MM:SS，请重新设置"
             self.auto_submit.setChecked(bool(values["auto_submit"]))
-            requested_seats = list(values["seat_types"])
-            unknown_seats = [seat for seat in requested_seats if seat not in SEAT_SPECS]
-            self.seat_types.set_values(requested_seats)
-            if unknown_seats:
-                import_errors["seat_types"] = f"导入配置包含未知席别：{'、'.join(unknown_seats)}"
             self.position_preferences.seats.set_positions(values["seat_position_preferences"])
             self.position_preferences.berths.set_values(values["berth_preference"])
             for key, widget in self.advanced.items():
@@ -896,8 +817,9 @@ class MainWindow(WizardFlow, QMainWindow):
                         widget.setCurrentText(str(value))
                 elif isinstance(widget, QCheckBox):
                     widget.setChecked(bool(value))
-            self._seat_types_changed()
-            self._refresh_train_guidance()
+            self._cart_changed()
+            self._cart_draft_baseline = self._cart_draft_signature()
+            self._cart_draft_changed()
             self._target_edited()
         finally:
             self._applying_values = False
@@ -908,10 +830,19 @@ class MainWindow(WizardFlow, QMainWindow):
         return import_errors, warnings
 
     def _reset_advanced(self) -> None:
+        draft = (self.from_station.text(), self.to_station.text(), self.train_scope.currentIndex(),
+                 self.preferred_trains.text(), self.cart_seat.currentIndex(), self._cart_draft_baseline)
         current = self._collect_mapping()
         for key in self.advanced:
             current[key] = DEFAULT_VALUES[key]
         self._apply_mapping(current)
+        self.from_station.setText(draft[0])
+        self.to_station.setText(draft[1])
+        self.train_scope.setCurrentIndex(draft[2])
+        self.preferred_trains.setText(draft[3])
+        self.cart_seat.setCurrentIndex(draft[4])
+        self._cart_draft_baseline = draft[5]
+        self._cart_draft_changed()
         self._touched_fields.update(self.advanced)
         self._validate_all(full=False)
         logging.info("已恢复高级参数默认值")
@@ -1007,12 +938,6 @@ class MainWindow(WizardFlow, QMainWindow):
         elif key == "berth_preference":
             self.position_preferences.tabs.setCurrentIndex(1)
             focus_target = self.position_preferences.berths.spins["lower"]
-        elif key == "seat_types" and not self.seat_types.values():
-            classification = classify_train_codes(_split_names(self.preferred_trains.text()))
-            ordinary = classification == "conventional"
-            self.seat_types.groups["sleeper" if ordinary else "seated"].setChecked(True)
-            focus_target = self.seat_types.checkboxes["硬卧" if ordinary else "二等座"]
-            scroll.ensureWidgetVisible(focus_target, 24, 24)
         elif isinstance(widget, TimeFieldsWidget):
             focus_target = widget.parts[0]
         else:
@@ -1200,7 +1125,7 @@ class MainWindow(WizardFlow, QMainWindow):
         QMessageBox.information(
             self,
             "配置有效",
-            f"{cfg.from_station} → {cfg.to_station}\n{cfg.train_date}\n乘车人 {len(cfg.passenger_names)} 位，席别 {len(cfg.seat_types)} 种",
+            f"购物车 {len(cfg.cart_items or [])} 项\n{cfg.train_date}\n乘车人 {len(cfg.passenger_names)} 位",
         )
 
     # ----- Task lifecycle --------------------------------------------------
@@ -1305,6 +1230,8 @@ class MainWindow(WizardFlow, QMainWindow):
         self.refresh_qr_button.setEnabled(False)
         self.query_metric.value_label.setText("0")  # type: ignore[attr-defined]
         self.phase_badge.setText("正在启动")
+        self.current_cart_item.setText(f"购物车 {len(cfg.cart_items or [])} 项 · 正在准备")
+        self.cart_query_status.clear()
         self.start_button.setEnabled(False)
         self.validate_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -1418,7 +1345,12 @@ class MainWindow(WizardFlow, QMainWindow):
         )
         if not self._accept_operation_callback(generation, allow_cancelled=terminal):
             return
-        if kind == "phase":
+        self._update_cart_runtime(payload)
+        if kind == "cart_item":
+            self.cart_query_status.setText("按购物车顺序检查此项")
+        elif kind in {"query_failed", "query_empty", "query_route_mismatch"}:
+            self.cart_query_status.setText(message)
+        elif kind == "phase":
             self._set_phase(str(payload.get("phase", "preparing")), message)
         elif kind == "maintenance_availability":
             self._maintenance_enabled = bool(payload.get("enabled"))
@@ -1512,6 +1444,7 @@ class MainWindow(WizardFlow, QMainWindow):
             if not self.query_ui_timer.isActive():
                 self.query_ui_timer.start()
         elif kind == "candidate":
+            self.cart_query_status.setText(message or "发现符合条件的票源")
             self._set_phase("querying", message)
             self.phase_badge.setText(message or "发现候选票")
         elif kind in {"order_wait", "queue", "queued"}:
@@ -1527,6 +1460,8 @@ class MainWindow(WizardFlow, QMainWindow):
             if first_success and not self._success_prompt_shown:
                 self._success_prompt_shown = True
                 details = "订单已提交，请尽快前往 12306 完成支付。"
+                if payload.get("cart_index"):
+                    details += "\n\n" + self.current_cart_item.text()
                 if self._order_id:
                     details += f"\n\n订单号：{self._order_id}"
                 QMessageBox.information(self, "出票成功", details)
@@ -1719,59 +1654,11 @@ class MainWindow(WizardFlow, QMainWindow):
         logging.info("站点列表已更新，共 %d 个站名", len(self.station_names))
         QMessageBox.information(self, "站点已更新", f"已载入 {len(self.station_names)} 个站名。")
 
-    def _seat_types_changed(self) -> None:
-        self.position_preferences.adapt_to_seats(self.seat_types.values())
-        self._refresh_order_preview()
-
-    def _preferred_trains_edited(self, *_args: object) -> None:
-        if self._applying_values:
-            return
-        if not _split_names(self.preferred_trains.text()):
-            self.only_preferred.setChecked(False)
-        self._train_inputs_changed()
-
-    def _train_inputs_changed(self, *_args: object) -> None:
-        if self._applying_values:
-            return
-        self._refresh_train_guidance()
-        self._schedule_validation("preferred_trains")
-
-    def _strategy_changed(self, *_args: object) -> None:
-        if not self._applying_values:
-            self._refresh_order_preview()
-            self._schedule_validation("priority_strategy")
-
-    def _refresh_train_guidance(self) -> None:
-        preferred = _split_names(self.preferred_trains.text())
-        # An invalid legacy checked/empty configuration stays repairable: the
-        # user may uncheck it, but cannot check it again without entering trains.
-        self.only_preferred.setEnabled(bool(preferred) or self.only_preferred.isChecked())
-        classification = classify_train_codes(preferred)
-        labels = {"high_speed": "高铁/动车", "conventional": "普通列车", "all": "高铁/动车与普通列车"}
-        detected = f"已识别：{labels[classification]}\n" if classification in labels else ""
-        self.range_summary.setText(detected + scope_summary(preferred, self.only_preferred.isChecked(), "all"))
-        self._refresh_order_preview()
-
-    def _refresh_order_preview(self) -> None:
-        self.order_preview.setText(
-            "尝试顺序示例\n" + priority_preview(
-                _split_names(self.preferred_trains.text()), self.seat_types.values(),
-                self.priority_strategy.currentData(), self.only_preferred.isChecked(),
-                "all",
-            )
-        )
-
-    def _focus_seat_types(self) -> None:
-        self._go_to_step(0)
-        self.basic_scroll.ensureWidgetVisible(self.field_blocks["seat_types"], 24, 24)
-        self.seat_types.list.setFocus()
-
     def _focus_sleeper_seats(self) -> None:
         self._go_to_step(0)
-        self.seat_types.focus_sleeper_group()
-        target = self.seat_types.checkboxes["硬卧"]
-        self.basic_scroll.ensureWidgetVisible(target, 24, 24)
-        QTimer.singleShot(0, target.setFocus)
+        self.basic_scroll.ensureWidgetVisible(self.cart_seat, 24, 24)
+        self.cart_seat.setFocus()
+        self.cart_draft_status.setText("请选一种卧铺席别，并加入购物车。")
 
     def _swap_stations(self) -> None:
         left, right = self.from_station.text(), self.to_station.text()
@@ -1791,11 +1678,12 @@ class MainWindow(WizardFlow, QMainWindow):
             self.quiet_carriage,
             self.select_passengers_button,
             self.preferred_trains,
-            self.only_preferred,
-            self.priority_strategy,
+            self.train_scope,
+            self.cart_seat,
+            self.add_cart_button,
+            self.resolve_cart_button,
             self.start_at,
             self.stop_at,
-            self.seat_types,
             self.position_preferences,
             self.auto_submit,
             self.save_settings_button,
@@ -1809,7 +1697,7 @@ class MainWindow(WizardFlow, QMainWindow):
         )
         self.reset_advanced_button.setEnabled(enabled)
         if enabled:
-            self._refresh_train_guidance()
+            self._cart_draft_changed()
 
     def _open_order_page(self) -> None:
         QDesktopServices.openUrl(QUrl(ORDER_URL))

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$Python = "python",
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$OutputRoot = "dist"
 )
 
 Set-StrictMode -Version Latest
@@ -13,7 +14,12 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $specPath = Join-Path $projectRoot "scripts\12306FairTicket.spec"
-$distDir = Join-Path $projectRoot "dist\12306FairTicket"
+$distRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $OutputRoot))
+if (-not $distRoot.StartsWith($projectRoot + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "OutputRoot must be a directory inside this checkout."
+}
+$distDir = Join-Path $distRoot "12306FairTicket"
+$workRoot = Join-Path $projectRoot ("build\" + (Split-Path -Leaf $distRoot))
 $exePath = Join-Path $distDir "12306FairTicket.exe"
 
 $requiredPaths = @(
@@ -68,7 +74,7 @@ try {
         }
     }
 
-    & $Python -m PyInstaller --noconfirm --clean $specPath
+    & $Python -m PyInstaller --noconfirm --clean --distpath $distRoot --workpath $workRoot $specPath
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }

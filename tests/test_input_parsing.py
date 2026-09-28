@@ -12,6 +12,7 @@ from ticket_app.configuration import AppConfig, AppError, _as_list
 from ticket_app.gui.compat import (
     DEFAULT_VALUES,
     EDITABLE_SETTINGS_KEYS,
+    LEGACY_SELECTION_KEYS,
     build_app_config,
     canonical_mapping,
     load_gui_settings,
@@ -59,20 +60,21 @@ def test_supported_separators_are_shared_by_config_validation_and_json(
         assert config.passenger_names == canonical["passenger_names"]
         assert config.preferred_trains == canonical["preferred_trains"]
 
-    # Exercise legacy import of raw text fields, then save the normalized v3 schema.
+    # Exercise legacy text import, then save the atomic-cart v5 schema.
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"version": 2, "settings": values}), encoding="utf-8")
     imported = load_gui_settings(path)
     assert validate(imported) == {}
     save_gui_settings(path, imported)
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["version"] == 4
-    assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS
+    assert document["version"] == 5
+    assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS - LEGACY_SELECTION_KEYS
     assert document["settings"]["passenger_names"] == canonical["passenger_names"]
-    assert document["settings"]["preferred_trains"] == canonical["preferred_trains"]
+    assert [row["train_code"] for row in document["settings"]["cart_items"]] == canonical["preferred_trains"]
     restored = load_gui_settings(path)
-    assert restored == imported
-    assert build_app_config(restored).preferred_trains == ["D123", "G79", "1461"]
+    for key in set(restored) - LEGACY_SELECTION_KEYS:
+        assert restored[key] == imported[key]
+    assert [row.train_code for row in build_app_config(restored).cart_items] == ["D123", "G79", "1461"]
 
 
 def test_mixed_separators_keep_internal_spaces_order_and_duplicates() -> None:
@@ -133,8 +135,9 @@ def test_invalid_train_is_still_reported_after_save_import(trains: str, tmp_path
     values = valid_values(preferred_trains=trains)
     path = tmp_path / "invalid-train.json"
     save_gui_settings(path, values)
-    for candidate in (values, canonical_mapping(values), load_gui_settings(path)):
+    for candidate in (values, canonical_mapping(values)):
         assert "格式不正确" in validate(candidate)["preferred_trains"]
+    assert "合法车次" in validate(load_gui_settings(path))["cart_items"]
 
 
 def test_legacy_v1_uppercase_text_fields_import_with_shared_rules(tmp_path: Path) -> None:

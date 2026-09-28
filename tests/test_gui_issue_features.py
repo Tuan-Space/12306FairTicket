@@ -10,6 +10,7 @@ from email.utils import format_datetime
 from types import SimpleNamespace
 
 import pytest
+from cart_helpers import set_cart
 from PySide6.QtCore import QThread
 from shiboken6 import getCppPointer, isValid
 
@@ -79,7 +80,7 @@ def test_contact_worker_boundary_removes_identity_data():
 
 
 def test_v4_roundtrip_new_settings_and_old_versions_remain_compatible(main_window, tmp_path):
-    assert main_window.seat_types.values() == []
+    assert main_window.cart_items == []
     assert not main_window.quiet_carriage.isChecked()
     main_window.passengers.setText("测试甲，测试乙")
     combo = main_window.passenger_ticket_types.rows["测试甲"]
@@ -90,7 +91,7 @@ def test_v4_roundtrip_new_settings_and_old_versions_remain_compatible(main_windo
     values.update(contacts=[{"id": "PRIVATE-ID"}], cookie="PRIVATE-COOKIE", checked_at="PRIVATE-TIME")
     save_gui_settings(path, values)
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["version"] == 4
+    assert document["version"] == 5
     assert document["settings"]["passenger_ticket_types"] == {"测试甲": "student"}
     assert document["settings"]["quiet_carriage_preference"] is True
     assert "PRIVATE" not in path.read_text(encoding="utf-8")
@@ -185,7 +186,7 @@ def test_idle_status_command_with_empty_draft_uses_shared_executor_and_never_sca
     monkeypatch.setattr(worker_module, "RailwayClient", Client)
     main_window.passengers.clear()
     main_window.from_station.clear()
-    main_window.seat_types.set_values([])
+    set_cart(main_window, [])
     main_window._go_to_step(1)
     main_window._start_connection_operation("check_login")
     qtbot.waitUntil(lambda: main_window._active_operation is None)
@@ -343,7 +344,7 @@ def test_successful_clock_survives_failed_idle_and_task_sync_in_real_workers(mai
     main_window.start_at.setText(scheduled.strftime("%H:%M:%S"))
     main_window.stop_at.set_disabled(True)
     main_window.auto_submit.setChecked(False)
-    main_window.seat_types.set_values(["二等座"])
+    set_cart(main_window, ["二等座"])
     main_window.account_state = "valid"
     main_window._go_to_step(2)
     main_window._start_task()
@@ -413,7 +414,7 @@ def test_repeated_operations_reuse_qt_objects_and_reject_old_queued_results(main
         monkeypatch.setattr(main_window, name, record)
 
     main_window.auto_submit.setChecked(False)
-    main_window.seat_types.set_values(["二等座"])
+    set_cart(main_window, ["二等座"])
     generations = []
     executor = background_thread = None
     executor_address = None

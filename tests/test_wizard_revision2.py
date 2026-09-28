@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from cart_helpers import set_cart
 from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtWidgets import QPushButton
 
@@ -63,7 +64,7 @@ def prepare_confirmation(window):
     window.start_at.set_disabled(True)
     window.stop_at.set_disabled(True)
     window.preferred_trains.setText("G79")
-    window.seat_types.set_values(["二等座"])
+    set_cart(window, ["二等座"])
     window.auto_submit.setChecked(True)
     window._on_connection_completed("login", {"authenticated": True, "contacts": [
         {"name": "学生甲", "passenger_type": "3"},
@@ -188,7 +189,7 @@ def test_stop_button_becomes_continue_and_restarts_original_configuration_from_z
     assert restarted.generation != first.generation
     assert restarted.cancel_token is not first.cancel_token
     assert restarted.cfg is not first.cfg
-    assert restarted.cfg.preferred_trains == ["G79"]
+    assert [item.train_code for item in restarted.cfg.cart_items] == ["G79"]
     assert restarted.cfg.passenger_names == ["学生甲", "成人乙"]
     assert restarted.session is first.session
     assert restarted.clock is first.clock

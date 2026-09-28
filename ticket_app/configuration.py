@@ -7,6 +7,10 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .cart import (
+    CartItem, cart_migration_messages, cart_seat_types, normalize_cart_items,
+    serialize_cart_items, validate_cart_items,
+)
 from .input_parsing import split_multi_value_text
 from .passengers import normalize_passenger_ticket_types
 from .preferences import (
@@ -185,6 +189,9 @@ class AppConfig:
     empty_train_scope: str | None = "all"
     passenger_ticket_types: Dict[str, str] = field(default_factory=dict)
     quiet_carriage_preference: bool = False
+    # None preserves the established CLI policy; an explicit empty cart is an
+    # unfinished cart and must never fall back to the legacy route silently.
+    cart_items: List[CartItem] | None = None
 
     @property
     def seat_position_preferences(self) -> SeatRelationPreference:
@@ -247,6 +254,12 @@ class AppConfig:
             seat_preference = SeatRelationPreference.from_value(raw_seat_preference)
             berth_preference = BerthPreference.from_value(value("BERTH_PREFERENCE", {}))
             passenger_ticket_types = normalize_passenger_ticket_types(value("PASSENGER_TICKET_TYPES", {}))
+            raw_cart = value("CART_ITEMS", None)
+            cart_items = normalize_cart_items(raw_cart) if raw_cart is not None else None
+            if cart_items is not None:
+                _, cart_issues = cart_migration_messages(value("CART_MIGRATION", None))
+                if cart_issues:
+                    raise ValueError("；".join(cart_issues))
         except ValueError as exc:
             raise AppError(str(exc)) from exc
 
@@ -288,6 +301,7 @@ class AppConfig:
             empty_train_scope=value("EMPTY_TRAIN_SCOPE", "all"),
             passenger_ticket_types=passenger_ticket_types,
             quiet_carriage_preference=_as_bool(value("QUIET_CARRIAGE_PREFERENCE", False), "QUIET_CARRIAGE_PREFERENCE"),
+            cart_items=cart_items,
         )
         cfg.validate()
         return cfg
@@ -295,7 +309,7 @@ class AppConfig:
     def to_mapping(self) -> Dict[str, Any]:
         """Return a serializable mapping suitable for GUI persistence."""
 
-        return {
+        mapping = {
             "FROM_STATION": self.from_station,
             "TO_STATION": self.to_station,
             "TRAIN_DATE": self.train_date,
@@ -333,14 +347,29 @@ class AppConfig:
             "SESSION_FILE": str(self.session_file),
             "STATION_CACHE_FILE": str(self.station_cache_file),
         }
+        if self.cart_items is not None:
+            mapping["CART_ITEMS"] = serialize_cart_items(self.cart_items)
+        return mapping
 
     def validate(self) -> None:
-        if not self.from_station:
-            raise AppError("FROM_STATION 不能为空")
-        if not self.to_station:
-            raise AppError("TO_STATION 不能为空")
-        if self.from_station == self.to_station:
-            raise AppError("FROM_STATION 和 TO_STATION 不能相同")
+        if self.cart_items is not None:
+            try:
+                self.cart_items = normalize_cart_items(self.cart_items)
+                cart_errors = validate_cart_items(self.cart_items, SEAT_SPECS)
+            except ValueError as exc:
+                raise AppError(str(exc)) from exc
+            if cart_errors:
+                raise AppError("；".join(cart_errors))
+            self.seat_types = cart_seat_types(self.cart_items)
+            self.from_station = self.cart_items[0].from_station
+            self.to_station = self.cart_items[0].to_station
+        else:
+            if not self.from_station:
+                raise AppError("FROM_STATION 不能为空")
+            if not self.to_station:
+                raise AppError("TO_STATION 不能为空")
+            if self.from_station == self.to_station:
+                raise AppError("FROM_STATION 和 TO_STATION 不能相同")
         if not self.train_date:
             raise AppError("TRAIN_DATE 不能为空，格式为 YYYY-MM-DD")
         try:
@@ -373,7 +402,7 @@ class AppConfig:
         policy_errors = validate_train_policy(
             self.preferred_trains, self.only_preferred_trains,
             self.empty_train_scope, self.priority_strategy,
-        )
+        ) if self.cart_items is None else {}
         if policy_errors:
             raise AppError(next(iter(policy_errors.values())))
         has_seats, has_berths = preference_capabilities(self.seat_types)

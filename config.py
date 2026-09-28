@@ -37,6 +37,25 @@ EMPTY_TRAIN_SCOPE = "all"
 PRIORITY_STRATEGY = "train_first"
 
 
+# 可选：多站点备选购物车。取消下方示例的注释后，列表顺序就是实际尝试顺序。
+# 每项只有一个站对、一个车次范围、一种席别；同车的二等座和一等座分成两项。
+# train_scope="specific" 必须填写单个 train_code；"all" 必须将 train_code 留空。
+# 所有项目共用 TRAIN_DATE、乘车人、开抢/停止时间和偏好；任意一项成功后整车停止。
+# 这些项目是一次出行的备选，不会分别购买。站对越多，一轮查询可能越久。
+# 启用购物车后，上面的 FROM_STATION/TO_STATION、SEAT_TYPES、PREFERRED_TRAINS、
+# ONLY_PREFERRED_TRAINS、EMPTY_TRAIN_SCOPE、PRIORITY_STRATEGY 不参与任务。
+# 未配置 CART_ITEMS 或设为 None 时，完全保留上面的旧逻辑；显式 [] 是空购物车，会报错。
+# CART_ITEMS = [
+#     {"from_station": "北京南", "to_station": "上海虹桥",
+#      "train_scope": "specific", "train_code": "G101", "seat_type": "二等座"},
+#     {"from_station": "北京", "to_station": "上海",
+#      "train_scope": "all", "train_code": "", "seat_type": "硬卧"},
+#     {"from_station": "北京南", "to_station": "上海虹桥",
+#      "train_scope": "specific", "train_code": "G101", "seat_type": "一等座"},
+# ]
+# 示例中的车次只说明填写方式，请替换为出行日期实际开行的车次。
+
+
 # 定时设置。留空表示立即开始或不自动停止。
 # 支持 "HH:MM:SS" 或 "YYYY-MM-DD HH:MM:SS"。
 START_AT = "15:00:00"
@@ -46,6 +65,8 @@ STOP_AT = "15:05:00"
 # 轮询策略
 QUERY_INTERVAL_SECONDS = 0.6
 MAX_RETRIES = 1000
+# 购物车模式下 MAX_RETRIES 计算完整轮询次数；同一轮内相同站对只查一次。
+# 所有站对共用上述查询间隔，不会因增加项目而提高总查询频率。
 
 
 # 热身查询策略：START_AT 是目标开售时间，程序会提前 PRE_QUERY_SECONDS 开始查票。
