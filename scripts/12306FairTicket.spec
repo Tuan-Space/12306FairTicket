@@ -10,7 +10,7 @@ from PyInstaller.utils.win32.versioninfo import (
 from ticket_app import __version__
 
 
-project_root = Path(SPECPATH).resolve()
+project_root = Path(SPECPATH).resolve().parent
 entry_script = project_root / "gui.py"
 assets_dir = project_root / "assets"
 version_tuple = tuple(int(part) for part in __version__.split(".")[:3]) + (0,)

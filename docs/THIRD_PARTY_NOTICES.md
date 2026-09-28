@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-This notice covers the expected dependencies of the Windows onedir build. Direct GUI and build dependencies are pinned in `requirements-gui.txt` and `requirements-dev.txt`; transitive versions selected from `requirements.txt` may still vary. Wheel metadata and license files shipped by each installed package remain authoritative.
+This notice covers the expected dependencies of the Windows onedir build. Runtime, GUI and build dependencies are declared in `requirements/base.txt`, `requirements/gui.txt` and `requirements/dev.txt`; direct and transitive versions are constrained by `requirements/constraints.txt`. Wheel metadata and license files shipped by each installed package remain authoritative.
 
 ## Runtime components
 

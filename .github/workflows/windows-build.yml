@@ -2,7 +2,9 @@ name: Windows GUI build
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
+    branches: [main]
     tags:
       - "v*"
 
@@ -28,19 +30,19 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
-            requirements.txt
-            requirements-gui.txt
-            requirements-dev.txt
+            requirements/*.txt
 
       - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install -r requirements/dev.txt
 
       - name: Run unit and GUI tests
         shell: pwsh
-        run: python -m pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q -p no:cacheprovider --basetemp .pytest-tmp-ci
 
       - name: Build Windows onedir application
         shell: pwsh

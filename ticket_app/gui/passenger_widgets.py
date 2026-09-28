@@ -7,8 +7,8 @@ from typing import Any, Iterable, Mapping
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGridLayout, QLabel,
-    QScrollArea, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QGridLayout, QLabel,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -196,72 +196,6 @@ class InlinePassengerSelector(QWidget):
             self._selection.remove(name)
         self._update_status()
         self.changed.emit()
-
-    def selected_names(self) -> list[str]:
-        return list(self._selection)
-
-
-class PassengerSelectionDialog(QDialog):
-    """Choose up to five unique contacts in checkbox-selection order."""
-
-    def __init__(self, contacts: Iterable[Mapping[str, str]], parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("从 12306 账号选择乘车人")
-        self.setObjectName("passengerSelectionDialog")
-        self.resize(430, 440)
-        self._selection: list[str] = []
-        self.checkboxes: list[QCheckBox] = []
-        layout = QVBoxLayout(self)
-        description = QLabel("最多选择 5 位，按勾选先后回填。取消或未选择时保留当前乘车人。")
-        description.setWordWrap(True)
-        layout.addWidget(description)
-        self.status = QLabel("已选择 0 / 5 位")
-        layout.addWidget(self.status)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        panel = QWidget()
-        items = QVBoxLayout(panel)
-        rows = list(contacts)
-        counts = Counter(item.get("name", "") for item in rows)
-        labels = {"1": "成人", "2": "儿童", "3": "学生", "4": "残军"}
-        for row in rows:
-            name = str(row.get("name", ""))
-            if not name:
-                continue
-            category = labels.get(str(row.get("passenger_type", "")), "账号联系人")
-            box = QCheckBox(f"{name} · {category}")
-            box.setProperty("passengerName", name)
-            if counts[name] > 1:
-                box.setText(box.text() + "（重名，无法按姓名唯一匹配）")
-                box.setEnabled(False)
-            box.toggled.connect(lambda checked, item=box: self._toggle(item, checked))
-            self.checkboxes.append(box)
-            items.addWidget(box)
-        if not self.checkboxes:
-            items.addWidget(QLabel("账号中没有可用的乘车人，请先在 12306 添加。"))
-        items.addStretch(1)
-        scroll.setWidget(panel)
-        layout.addWidget(scroll, 1)
-        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("使用所选乘车人")
-        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-    def _toggle(self, checkbox: QCheckBox, checked: bool) -> None:
-        name = str(checkbox.property("passengerName"))
-        if checked and name not in self._selection:
-            if len(self._selection) >= 5:
-                checkbox.blockSignals(True)
-                checkbox.setChecked(False)
-                checkbox.blockSignals(False)
-                self.status.setText("最多选择 5 位乘车人，请先取消一位。")
-                return
-            self._selection.append(name)
-        elif not checked and name in self._selection:
-            self._selection.remove(name)
-        self.status.setText(f"已选择 {len(self._selection)} / 5 位")
 
     def selected_names(self) -> list[str]:
         return list(self._selection)

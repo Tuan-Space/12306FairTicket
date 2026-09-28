@@ -1,4 +1,4 @@
--r requirements-gui.txt
+-r gui.txt
 
 # Windows onedir packaging, pinned for reproducible CI output.
 PyInstaller==6.22.2

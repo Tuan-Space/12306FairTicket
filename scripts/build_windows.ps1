@@ -12,7 +12,7 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
 }
 
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$specPath = Join-Path $projectRoot "12306FairTicket.spec"
+$specPath = Join-Path $projectRoot "scripts\12306FairTicket.spec"
 $distDir = Join-Path $projectRoot "dist\12306FairTicket"
 $exePath = Join-Path $distDir "12306FairTicket.exe"
 
@@ -25,8 +25,9 @@ $requiredPaths = @(
     (Join-Path $projectRoot "assets\check.svg"),
     (Join-Path $projectRoot "assets\stations_snapshot.json"),
     $specPath,
-    (Join-Path $projectRoot "README_GUI.md"),
-    (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md")
+    (Join-Path $projectRoot "README.md"),
+    (Join-Path $projectRoot "docs\四步订票流程操作说明.md"),
+    (Join-Path $projectRoot "docs\THIRD_PARTY_NOTICES.md")
 )
 
 foreach ($requiredPath in $requiredPaths) {
@@ -46,14 +47,23 @@ if ($pythonVersion.Trim() -ne "3.12") {
 
 & $Python -c "import PyInstaller, PySide6, json5; print(f'PyInstaller {PyInstaller.__version__}; PySide6 {PySide6.__version__}; json5 {json5.__version__}')"
 if ($LASTEXITCODE -ne 0) {
-    throw "Build dependencies are missing. Run: python -m pip install -r requirements-dev.txt"
+    throw "Build dependencies are missing. Run: python -m pip install -r requirements/dev.txt"
 }
 
 Push-Location -LiteralPath $projectRoot
 try {
     if (-not $SkipTests) {
-        & $Python -m pytest tests -q
-        if ($LASTEXITCODE -ne 0) {
+        $previousQtPlatform = $env:QT_QPA_PLATFORM
+        try {
+            $env:QT_QPA_PLATFORM = "offscreen"
+            $testTemp = Join-Path $projectRoot (".pytest-tmp-" + [Guid]::NewGuid().ToString("N"))
+            & $Python -m pytest tests -q -p no:cacheprovider --basetemp $testTemp
+            $testExitCode = $LASTEXITCODE
+        }
+        finally {
+            $env:QT_QPA_PLATFORM = $previousQtPlatform
+        }
+        if ($testExitCode -ne 0) {
             throw "Unit tests failed; packaging was not started."
         }
     }
@@ -76,8 +86,8 @@ try {
         throw "Frozen application smoke test failed with exit code $($smokeProcess.ExitCode)."
     }
 
-    Copy-Item -LiteralPath (Join-Path $projectRoot "README_GUI.md") -Destination $distDir -Force
-    Copy-Item -LiteralPath (Join-Path $projectRoot "THIRD_PARTY_NOTICES.md") -Destination $distDir -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $distDir -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot "docs") -Destination $distDir -Recurse -Force
 
     Write-Host "Windows onedir build ready: $exePath"
 }
