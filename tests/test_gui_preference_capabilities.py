@@ -20,7 +20,8 @@ def test_ordinary_seats_hide_inactive_map_and_preserve_clearable_draft(qtbot, se
     preferences.adapt_to_seats(seat_types)
     assert preferences.seats.grid.isHidden()
     assert preferences.seats.guide.isHidden()
-    assert preferences.seats.fallback.isHidden()
+    assert not hasattr(preferences.seats, "help_details")
+    assert not hasattr(preferences.seats, "fallback")
     assert preferences.seats.layout().alignment() & Qt.AlignmentFlag.AlignTop
     assert not preferences.seats.inactive_hint.isHidden()
     assert preferences.seats.positions() == ["1A", "1F"]
@@ -42,12 +43,13 @@ def test_seat_map_uses_actual_seat_code_capabilities(qtbot, seat_types, letters)
     preferences.adapt_to_seats(seat_types)
     assert not preferences.seats.grid.isHidden()
     assert not preferences.seats.guide.isHidden()
-    assert not preferences.seats.fallback.isHidden()
+    assert "该席别内自动分配" in preferences.seats.guide.text()
+    assert not hasattr(preferences.seats, "help_details")
     assert {token for token, button in preferences.seats.buttons.items() if button.isEnabled()} == {
         f"{row}{letter}" for row in (1, 2) for letter in letters
     }
     if "商务座" in seat_types:
-        assert "C 位是否提供" in preferences.seats.availability_note.text()
+        assert "C 位是否提供" in preferences.seats.guide.text()
 
 
 def test_inactive_berth_and_seat_drafts_restore_on_matching_selection(qtbot):

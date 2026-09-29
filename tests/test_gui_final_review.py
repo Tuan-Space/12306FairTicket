@@ -42,7 +42,9 @@ def test_cancelled_connection_leaves_booking_idle_after_worker_releases_session(
     qtbot.waitUntil(lambda: main_window._active_operation is None)
     assert "正在安全停止" not in main_window.phase_badge.text()
     assert main_window._task_state == "idle"
-    assert "任务未开始" in main_window.workflow_status.text()
+    assert main_window.workflow_status.text() == ""
+    assert main_window.workflow_status.isHidden()
+    assert main_window._task_state == "idle"
     assert not main_window.start_button.isEnabled()
     assert not main_window.stop_button.isEnabled()
     assert main_window.passengers.text() == ""
@@ -65,7 +67,7 @@ def test_failed_idle_login_check_keeps_last_confirmed_login_display(main_window,
     main_window._start_connection_operation("check_login")
     qtbot.waitUntil(lambda: main_window._active_operation is None)
     assert main_window.qr_image.text() == original_display
-    assert "检查失败" in main_window.session_check_status.text()
+    assert "检查失败" in main_window._session_check_text
     assert not main_window._login_required
     assert main_window.login_button.isEnabled()
 

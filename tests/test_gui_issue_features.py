@@ -18,9 +18,9 @@ from test_gui_app import main_window  # noqa: F401 - shared isolated window fixt
 from ticket_app.configuration import AppError, ConnectionConfig
 from ticket_app.gui import app as gui_app
 from ticket_app.gui import worker as worker_module
-from ticket_app.gui.compat import load_gui_settings, save_gui_settings
+from ticket_app.gui.settings import load_gui_settings, save_gui_settings
 from ticket_app.gui.passenger_widgets import InlinePassengerSelector, contact_display_rows
-from ticket_app.gui.worker import ConnectionWorker, EventRelay, GuiCancelToken, OperationOutcome
+from ticket_app.gui.worker import GuiCancelToken, OperationOutcome, OperationRequest, OperationWorker
 
 
 @pytest.fixture(autouse=True)
@@ -79,7 +79,7 @@ def test_contact_worker_boundary_removes_identity_data():
     }]) == [{"name": "测试甲", "passenger_type": "3"}]
 
 
-def test_v4_roundtrip_new_settings_and_old_versions_remain_compatible(main_window, tmp_path):
+def test_current_settings_roundtrip_preserves_ticket_choices_and_excludes_private_data(main_window, tmp_path):
     assert main_window.cart_items == []
     assert not main_window.quiet_carriage.isChecked()
     main_window.passengers.setText("测试甲，测试乙")
@@ -98,13 +98,6 @@ def test_v4_roundtrip_new_settings_and_old_versions_remain_compatible(main_windo
     main_window._apply_mapping(load_gui_settings(path))
     assert main_window.passenger_ticket_types.values() == {"测试甲": "student"}
     assert main_window.quiet_carriage.isChecked()
-    for version in (1, 2, 3):
-        path.write_text(json.dumps({"version": version, "values" if version == 1 else "settings": {
-            "passenger_names": ["测试甲"], "seat_types": ["二等座"],
-        }}), encoding="utf-8")
-        old = load_gui_settings(path)
-        assert old["passenger_ticket_types"] == {}
-        assert old["quiet_carriage_preference"] is False
 
 
 @pytest.mark.parametrize("overrides", [None, [], {"测试甲": {"id": "PRIVATE"}}, {"测试甲": "child"}])
@@ -116,14 +109,13 @@ def test_malformed_ticket_choices_cannot_be_persisted(tmp_path, overrides):
 @pytest.mark.parametrize("mode", ["check_login", "login", "contacts", "sync_clock"])
 def test_independent_worker_never_creates_ticket_runner(qtbot, monkeypatch, mode):
     calls = []
-    relay = EventRelay()
     token = GuiCancelToken()
     cfg = ConnectionConfig.from_mapping({"persist_session": False})
     session = object()
 
     class Client:
         def __init__(self, config, sink, cancel, shared):
-            assert config is cfg and sink is relay and cancel is token and shared is session
+            assert config is cfg and callable(sink) and cancel is token and shared is session
 
         def check_session(self):
             calls.append("check")
@@ -148,18 +140,21 @@ def test_independent_worker_never_creates_ticket_runner(qtbot, monkeypatch, mode
     monkeypatch.setattr(worker_module, "RailwayClient", Client)
     monkeypatch.setattr(worker_module, "ServerClock", Clock)
     monkeypatch.setattr(worker_module, "TicketRunner", lambda *_args, **_kwargs: pytest.fail("No ticket runner"))
-    worker = ConnectionWorker(mode, cfg, relay, token, session)
-    completed = []
-    worker.completed.connect(lambda action, result: completed.append((action, result)))
-    worker.run()
+    worker = OperationWorker()
+    outcomes = []
+    worker.finished.connect(lambda generation, outcome: outcomes.append((generation, outcome)))
+    worker.execute(OperationRequest(7, mode, cfg, token, session))
     expected = {"check_login": ["check"], "login": [("login", False), "contacts"],
                 "contacts": ["check"], "sync_clock": ["clock"]}
     assert calls == expected[mode]
-    assert completed[0][0] == mode
+    assert len(outcomes) == 1
+    generation, outcome = outcomes[0]
+    assert generation == 7 and outcome.mode == mode and not outcome.error
+    assert outcome.order_state == "safe" and outcome.safe_to_restart
     if mode == "contacts":
-        assert completed[0][1] == {"authenticated": False, "contacts": None}
+        assert outcome.result == {"authenticated": False, "contacts": None}
     elif mode == "login":
-        assert completed[0][1] == {
+        assert outcome.result == {
             "authenticated": True, "contacts": [{"name": "测试甲", "passenger_type": "3"}],
         }
 
@@ -191,10 +186,12 @@ def test_idle_status_command_with_empty_draft_uses_shared_executor_and_never_sca
     main_window._start_connection_operation("check_login")
     qtbot.waitUntil(lambda: main_window._active_operation is None)
     assert calls == ["check"]
-    assert "失效" in main_window.session_check_status.text()
+    assert "失效" in main_window._session_check_text
     assert main_window.login_button.isEnabled()
     assert main_window.refresh_qr_button.isEnabled()
-    assert "任务未开始" in main_window.workflow_status.text()
+    assert main_window.workflow_status.text() == ""
+    assert main_window.workflow_status.isHidden()
+    assert main_window._task_state == "idle"
     assert main_window._background_thread.isRunning()
     assert isValid(main_window._executor)
     assert main_window._test_network_calls == []
@@ -218,12 +215,12 @@ def test_waiting_commands_are_serial_and_forbidden_during_query(main_window):
     main_window._start_connection_operation("login")
     assert token.next_action(0) is None
     assert not main_window.login_button.isEnabled()
-    assert not token.cancelled
+    assert not token.is_cancelled
 
 
 def test_failed_recalibration_keeps_anchor_and_login_valid_replaces_stale_qr(main_window):
     main_window._on_runtime_event("clock_sync", {"success": False, "checked_at": 100})
-    assert "本地时间" in main_window.clock_check_status.text()
+    assert "本地时间" in main_window._clock_check_text
     main_window._on_runtime_event("clock_sync", {
         "success": True, "offset_seconds": 0.5, "rtt_ms": 20, "server_timestamp": 100, "monotonic_timestamp": 90,
     })
@@ -231,12 +228,12 @@ def test_failed_recalibration_keeps_anchor_and_login_valid_replaces_stale_qr(mai
         "success": False, "offset_seconds": 0, "rtt_ms": None, "server_timestamp": 300, "monotonic_timestamp": 290,
     })
     assert main_window._server_anchor == (100, 90)
-    assert main_window.offset_metric.value_label.text() == "+0.500s"
-    assert main_window.rtt_metric.value_label.text() == "20ms"
-    assert "保留上次校准" in main_window.clock_check_status.text()
+    assert main_window._offset_value == "+0.500s"
+    assert main_window._rtt_value == "20ms"
+    assert "保留上次校准" in main_window._clock_check_text
     main_window._on_runtime_event("session_checked", {"state": "expired"})
     main_window._on_runtime_event("session_checked", {"state": "valid"})
-    assert "检查时已登录" in main_window.session_check_status.text()
+    assert "检查时已登录" in main_window._session_check_text
     assert "已登录" in main_window.qr_image.text()
     assert main_window.qr_countdown.text() == "会话有效"
 
@@ -269,14 +266,14 @@ def test_stopping_real_async_contact_fetch_discards_late_event_and_result(main_w
     main_window.account_state = "valid"
     main_window._go_to_step(1)
     main_window.passengers.setText("当前乘车人")
-    before_status = main_window.session_check_status.text()
+    before_status = main_window._session_check_text
     main_window._start_connection_operation("contacts")
     qtbot.waitUntil(started.is_set)
     old_generation = main_window._operation_generation
     main_window._stop_task()
     release.set()
     qtbot.waitUntil(lambda: main_window._active_operation is None)
-    assert main_window.session_check_status.text() == before_status
+    assert main_window._session_check_text == before_status
     assert main_window._server_anchor is None
     assert contact_updates == []
     assert main_window.passengers.text() == "当前乘车人"
@@ -286,22 +283,31 @@ def test_stopping_real_async_contact_fetch_discards_late_event_and_result(main_w
     main_window._operation_generation += 1
     main_window.cancel_token = GuiCancelToken()
     main_window._receive_runtime_event(old_generation, "session_checked", {"state": "expired", "checked_at": 200})
-    assert main_window.session_check_status.text() == before_status
+    assert main_window._session_check_text == before_status
 
 
 def test_successful_clock_survives_failed_idle_and_task_sync_in_real_workers(main_window, qtbot, monkeypatch, caplog):
-    """Use real QThreads, ServerClock and runner scheduling; fake only network."""
+    """Use real workers and clocks; pin wall time so midnight cannot expire HH:MM."""
     import requests
+    from ticket_app import clock as clock_module
     from ticket_app import runner as runner_module
     from ticket_app.stations import StationStore
 
+    # The GUI deliberately keeps HH:MM on the current day. A run just before
+    # midnight must not accidentally turn this waiting test into live querying.
+    wall_origin = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+    perf_origin = time.perf_counter()
+    local_wall = lambda: wall_origin + time.perf_counter() - perf_origin
+    monkeypatch.setattr(clock_module, "time", SimpleNamespace(
+        time=local_wall, perf_counter=time.perf_counter, monotonic=time.monotonic, sleep=time.sleep,
+    ))
     main_window.advanced["time_sync_samples"].setValue(1)
     calls = []
 
     def head(_url, **kwargs):
         calls.append(kwargs)
         if len(calls) == 1:
-            ahead = datetime.now(timezone.utc) + timedelta(seconds=120)
+            ahead = datetime.fromtimestamp(local_wall() + 120, timezone.utc)
             return SimpleNamespace(status_code=200, headers={"Date": format_datetime(ahead, usegmt=True)})
         raise requests.ConnectionError("simulated offline clock")
 
@@ -313,7 +319,7 @@ def test_successful_clock_survives_failed_idle_and_task_sync_in_real_workers(mai
     assert shared.has_synchronized
     assert anchor is not None
     assert shared.offset_seconds > 118
-    first_rtt = main_window.rtt_metric.value_label.text()
+    first_rtt = main_window._rtt_value
 
     main_window.advanced["request_timeout_seconds"].setValue(7)
     main_window._start_connection_operation("sync_clock")
@@ -321,7 +327,7 @@ def test_successful_clock_survives_failed_idle_and_task_sync_in_real_workers(mai
     assert main_window.shared_clock is shared
     assert shared.timeout == 7
     assert main_window._server_anchor == anchor
-    assert main_window.rtt_metric.value_label.text() == first_rtt
+    assert main_window._rtt_value == first_rtt
     assert "保留上次成功校时结果" in caplog.text
     assert "使用本地时间" not in caplog.text
 
@@ -350,13 +356,13 @@ def test_successful_clock_survives_failed_idle_and_task_sync_in_real_workers(mai
     main_window._start_task()
     try:
         qtbot.waitUntil(lambda: main_window._maintenance_enabled and main_window._target_timestamp is not None)
-        assert main_window.worker.runner.clock is shared
+        assert main_window._executor.runner.clock is shared
         assert main_window._server_anchor == anchor
-        assert main_window.rtt_metric.value_label.text() == first_rtt
+        assert main_window._rtt_value == first_rtt
         assert len(calls) == 3  # First success, idle failure, task startup failure.
         assert 85 < main_window._target_timestamp - shared.now_timestamp() < 91
         assert abs(main_window._server_now_timestamp() - shared.now_timestamp()) < 0.1
-        assert shared.now_timestamp() - time.time() > 118
+        assert shared.now_timestamp() - local_wall() > 118
         assert "使用本地时间" not in caplog.text
         assert errors == []
     finally:
@@ -435,7 +441,7 @@ def test_repeated_operations_reuse_qt_objects_and_reject_old_queued_results(main
             executor = main_window._executor
             executor_address = getCppPointer(executor)
             background_thread = main_window._background_thread
-        assert main_window.worker is main_window._executor is executor
+        assert main_window._executor is executor
         assert main_window._background_thread is background_thread
         release.set()
         deadline = time.monotonic() + 3
@@ -446,11 +452,11 @@ def test_repeated_operations_reuse_qt_objects_and_reject_old_queued_results(main
         assert background_thread.isRunning()
         qtbot.waitUntil(lambda: main_window._active_operation is None)
         assert ("_release_operation", generation) in callbacks
-        snapshot = (main_window.phase_badge.text(), main_window.session_check_status.text(),
+        snapshot = (main_window.phase_badge.text(), main_window._session_check_text,
                     main_window.account_state, main_window._operation_generation)
         main_window._receive_runtime_event(generation, "session_checked", {"state": "expired"})
         main_window._receive_operation_outcome(generation, OperationOutcome(mode, error="旧结果不应显示"))
-        assert snapshot == (main_window.phase_badge.text(), main_window.session_check_status.text(),
+        assert snapshot == (main_window.phase_badge.text(), main_window._session_check_text,
                             main_window.account_state, main_window._operation_generation)
     assert len(set(generations)) == 24
     assert sum(name == "_release_operation" for name, _generation in callbacks) == 24

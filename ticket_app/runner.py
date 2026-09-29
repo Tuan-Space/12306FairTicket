@@ -14,7 +14,6 @@ from .passengers import is_student_ticket_rejection, select_passengers
 from .runtime import CancellationToken, EventSink, RunCancelled, emit_event
 from .stations import StationStore
 from .configuration import SHARED_BERTH_CODES
-from .train_policy import priority_preview, priority_sort_key, scope_summary, train_in_scope
 
 
 class _StopDeadlineReached(RunCancelled):
@@ -79,8 +78,6 @@ class TicketRunner:
         self.clock.cfg = cfg
         self.clock.timeout = cfg.request_timeout_seconds
         self.stations = StationStore(self.client.session, cfg)
-        self.preferred_order = {train: index for index, train in enumerate(cfg.preferred_trains)}
-        self.seat_sequence = [(seat_label, SEAT_SPECS[seat_label]) for seat_label in cfg.seat_types]
         self._ambiguous_berth_warnings: set[tuple[str, str]] = set()
         self._order_state = "safe"
 
@@ -145,23 +142,12 @@ class TicketRunner:
         prepared_passengers = self._prepared_passengers
         self._maintenance_available(False, clear_pending=True)
         self._phase("querying", "开始查询余票")
-        cart = getattr(self.cfg, "cart_items", None)
-        if cart is None:
-            logging.info("任务启动: %s -> %s, 日期 %s, 座席 %s", self.cfg.from_station,
-                         self.cfg.to_station, self.cfg.train_date, ",".join(self.cfg.seat_types))
-            logging.info("%s", scope_summary(getattr(self.cfg, "preferred_trains", []),
-                                             getattr(self.cfg, "only_preferred_trains", False),
-                                             getattr(self.cfg, "empty_train_scope", "all")))
-            logging.info("尝试顺序示例：%s", priority_preview(
-                getattr(self.cfg, "preferred_trains", []), self.cfg.seat_types,
-                getattr(self.cfg, "priority_strategy", "train_first"),
-                getattr(self.cfg, "only_preferred_trains", False), getattr(self.cfg, "empty_train_scope", "all")))
-        else:
-            logging.info("购物车任务启动: 日期 %s，%s 个备选，%s 个站对；按购物车顺序尝试，成功一项即停止",
-                         self.cfg.train_date, len(cart), len(self._query_routes))
-            for index, item in enumerate(cart, 1):
-                logging.info("备选 %s: %s → %s · %s · %s", index, item.from_station, item.to_station,
-                             item.train_code if item.train_scope == "specific" else "不限车次", item.seat_type)
+        cart = self.cfg.cart_items
+        logging.info("购物车任务启动: 日期 %s，%s 个备选，%s 个站对；按购物车顺序尝试，成功一项即停止",
+                     self.cfg.train_date, len(cart), len(self._query_routes))
+        for index, item in enumerate(cart, 1):
+            logging.info("备选 %s: %s → %s · %s · %s", index, item.from_station, item.to_station,
+                         item.train_code if item.train_scope == "specific" else "不限车次", item.seat_type)
         self._last_query_request_at = None
         first_query_perf = time.perf_counter()
         for attempt in range(1, self.cfg.max_retries + 1):
@@ -218,8 +204,6 @@ class TicketRunner:
                 if not self.safe_to_restart:
                     raise AppError("订单状态尚未确认，整车任务已停止；请到 12306 官方订单页核对")
             _perf_log(self.cfg, "本轮查票总耗时 %.1fms，候选 %s 个", _elapsed_ms(query_start), candidate_count)
-            if cart is None:
-                self._sleep(self._current_query_interval(target_start))
         logging.info("已达到最大重试次数，任务结束")
         emit_event(self.event_sink, "phase", "已达到最大重试次数", phase="stopped")
         return 1
@@ -462,13 +446,9 @@ class TicketRunner:
         return self.cfg.query_interval_seconds
 
     def _resolve_query_routes(self) -> None:
-        cart = getattr(self.cfg, "cart_items", None)
-        if cart is None:
-            station_pairs = [(self.cfg.from_station, self.cfg.to_station)]
-        else:
-            if not cart:
-                raise AppError("购物车为空，请先添加至少一个备选")
-            station_pairs = [(item.from_station, item.to_station) for item in cart]
+        if not self.cfg.cart_items:
+            raise AppError("购物车为空，请先添加至少一个备选")
+        station_pairs = [(item.from_station, item.to_station) for item in self.cfg.cart_items]
         self._query_routes = {
             pair: (self.stations.code(pair[0]), self.stations.code(pair[1]))
             for pair in dict.fromkeys(station_pairs)
@@ -486,11 +466,7 @@ class TicketRunner:
         self._last_query_request_at = time.monotonic()
 
     def _round_candidates(self, target_start: Optional[datetime]) -> Iterator[Dict[str, Any]]:
-        cart = getattr(self.cfg, "cart_items", None)
-        if cart is None:
-            codes = self._query_routes[(self.cfg.from_station, self.cfg.to_station)]
-            yield from self._find_candidates(self.client.query_tickets(*codes))
-            return
+        cart = self.cfg.cart_items
 
         # None means this route failed this round. Empty means success with no
         # usable tickets. Both are cached, but never carried into another round.
@@ -549,7 +525,7 @@ class TicketRunner:
                 if candidate is None:
                     continue
                 matching = True
-                key = (ticket.get("query_date") or self.cfg.train_date, from_code, to_code,
+                key = (RailwayClient._query_boarding_date(ticket), from_code, to_code,
                        ticket.get("train_no") or train_code, item.seat_type)
                 if key in attempted:
                     continue
@@ -567,7 +543,7 @@ class TicketRunner:
         context = {"from_station": candidate.get("from_station", ticket.get("from_station", "")),
                    "to_station": candidate.get("to_station", ticket.get("to_station", "")),
                    "train_code": ticket["station_train_code"],
-                   "train_date": ticket.get("query_date") or ticket.get("date", "")}
+                   "train_date": RailwayClient._query_boarding_date(ticket)}
         for name in ("cart_index", "cart_total"):
             if name in candidate:
                 context[name] = candidate[name]
@@ -594,29 +570,6 @@ class TicketRunner:
                 return None
         return {"ticket": ticket, "seat_label": seat_label,
                 "seat_type": _resolve_submit_seat_code(seat_label, ticket), "stock": stock}
-
-    def _find_candidates(self, tickets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        candidates: List[Dict[str, Any]] = []
-        for ticket in tickets:
-            train_code = ticket["station_train_code"].upper()
-            if not train_in_scope(
-                train_code, self.cfg.preferred_trains, self.cfg.only_preferred_trains,
-                getattr(self.cfg, "empty_train_scope", "all"),
-            ):
-                continue
-            if not ticket["can_buy"]:
-                continue
-            for seat_label, _spec in self.seat_sequence:
-                candidate = self._candidate_for_seat(ticket, seat_label)
-                if candidate is not None:
-                    candidates.append(candidate)
-        seat_labels = [label for label, _spec in self.seat_sequence]
-        candidates.sort(key=lambda candidate: priority_sort_key(
-            candidate["ticket"]["station_train_code"], candidate["seat_label"],
-            self.cfg.preferred_trains, seat_labels,
-            getattr(self.cfg, "priority_strategy", "train_first"),
-        ))
-        return candidates
 
     def _book_ticket(self, candidate: Dict[str, Any], prepared_passengers: Dict[str, PreparedPassengerSet]) -> bool:
         if not self.safe_to_restart:

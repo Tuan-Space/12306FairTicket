@@ -40,7 +40,8 @@ def verify(exe: Path, source_root: Path = ROOT) -> dict:
         checked.append(name)
     required = {"ticket_app.cart", "ticket_app.client", "ticket_app.runner", "ticket_app.configuration",
                 "ticket_app.gui.app", "ticket_app.gui.cart_flow", "ticket_app.gui.cart_widgets",
-                "ticket_app.gui.compat", "ticket_app.gui.validation", "ticket_app.gui.worker"}
+                "ticket_app.gui.settings", "ticket_app.gui.validation", "ticket_app.gui.worker",
+                "ticket_app.gui.floating_cart", "ticket_app.gui.scroll_state"}
     if not required.issubset(checked):
         raise ValueError(f"Missing required modules: {required - set(checked)}")
     entry = compile((source_root / "gui.py").read_bytes(), "gui.py", "exec", dont_inherit=True)

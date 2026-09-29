@@ -18,10 +18,10 @@ def contact(name, identity_type="1"):
 
 def config_values(**updates):
     values = {
-        "from_station": "北京南", "to_station": "上海虹桥",
+        "cart_items": [{"from_station": "北京南", "to_station": "上海虹桥",
+                        "train_scope": "all", "train_code": "", "seat_type": "二等座"}],
         "train_date": (date.today() + timedelta(days=1)).isoformat(),
-        "passenger_names": ["学生甲", "学生乙", "成人"], "seat_types": ["二等座"],
-        "only_preferred_trains": False,
+        "passenger_names": ["学生甲", "学生乙", "成人"],
     }
     values.update(updates)
     return values
@@ -41,7 +41,7 @@ def test_mixed_ticket_choices_preserve_contact_identity_and_order():
     assert contacts == original
 
 
-def test_legacy_selection_follows_all_contact_types_without_overriding_identity():
+def test_default_selection_follows_all_contact_types_without_overriding_identity():
     contacts = [contact(str(code), str(code)) for code in range(1, 5)]
     selected = select_passengers(contacts, ["1", "2", "3", "4"])
     assert [item["ticket_type"] for item in selected] == ["1", "2", "3", "4"]

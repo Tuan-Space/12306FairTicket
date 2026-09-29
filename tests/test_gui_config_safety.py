@@ -1,6 +1,4 @@
-"""Security and compatibility regression tests for GUI-owned configuration."""
-
-from __future__ import annotations
+"""Privacy, atomic saves and strict current-schema GUI configuration tests."""
 
 import json
 from pathlib import Path
@@ -8,192 +6,104 @@ from pathlib import Path
 import pytest
 
 from ticket_app.configuration import AppError
-from ticket_app.gui.compat import (
-    DEFAULT_VALUES,
-    PROFILE_KEYS,
-    ProfileStore,
-    safe_read_legacy_config,
+from ticket_app.gui.settings import (
+    DEFAULT_VALUES, EDITABLE_SETTINGS_KEYS, build_app_config,
+    canonical_mapping, load_gui_settings, save_gui_settings,
 )
 
 
-def test_profile_store_round_trip_only_persists_profile_safe_fields(tmp_path: Path) -> None:
-    profile_path = tmp_path / "LocalAppData" / "12306FairTicket" / "gui_profiles.json"
-    exported_path = tmp_path / "exported-profile.json"
-    values = {
-        **DEFAULT_VALUES,
-        "from_station": "上海虹桥",
-        "to_station": "杭州东",
-        "passenger_names": ["张三", "李四"],
-        "preferred_trains": ["G123"],
-        "seat_position_preferences": ["1A", "1F"],
-        "berth_preference": {"lower": 0, "middle": 0, "upper": 0},
-        # None of these credentials, identity data, runtime paths or advanced
-        # networking knobs may be written to a reusable GUI profile.
-        "cookie": "COOKIE-SECRET-DO-NOT-PERSIST",
-        "token": "TOKEN-SECRET-DO-NOT-PERSIST",
-        "passenger_id_no": "11010519491231002X",
-        "id_card": "IDENTITY-SECRET-DO-NOT-PERSIST",
-        "request_timeout_seconds": 73.5,
-        "login_qr_timeout_seconds": 731.0,
-        "login_qr_poll_seconds": 7.3,
-        "time_sync_samples": 29,
-        "time_sync_max_rtt_seconds": 9.5,
-        "session_file": str(tmp_path / "SECRET-session.cookies"),
-        "station_cache_file": str(tmp_path / "SECRET-stations.json"),
-        "qr_code_file": str(tmp_path / "SECRET-login.png"),
-    }
-
-    store = ProfileStore(profile_path)
-    store.put("周末行程", values)
-    store.export_file(exported_path, "周末行程", values)
-
-    document = json.loads(profile_path.read_text(encoding="utf-8"))
-    persisted = document["profiles"]["周末行程"]
-    assert set(persisted) == set(PROFILE_KEYS)
-    assert persisted["passenger_names"] == ["张三", "李四"]
-    assert persisted["seat_position_preferences"] == ["1A", "1F"]
-
-    serialized = profile_path.read_text(encoding="utf-8") + exported_path.read_text(encoding="utf-8")
-    for secret in (
-        "COOKIE-SECRET-DO-NOT-PERSIST",
-        "TOKEN-SECRET-DO-NOT-PERSIST",
-        "11010519491231002X",
-        "IDENTITY-SECRET-DO-NOT-PERSIST",
-        "SECRET-session.cookies",
-        "SECRET-stations.json",
-        "SECRET-login.png",
-    ):
-        assert secret not in serialized
-    for excluded_key in (
-        "cookie",
-        "token",
-        "passenger_id_no",
-        "id_card",
-        "request_timeout_seconds",
-        "login_qr_timeout_seconds",
-        "login_qr_poll_seconds",
-        "time_sync_samples",
-        "time_sync_max_rtt_seconds",
-        "session_file",
-        "station_cache_file",
-        "qr_code_file",
-        "persist_session",
-    ):
-        assert excluded_key not in persisted
-
-    reloaded = ProfileStore(profile_path)
-    restored = reloaded.get("周末行程")
-    assert restored is not None
-    assert restored["from_station"] == "上海虹桥"
-    assert restored["to_station"] == "杭州东"
-    assert restored["passenger_names"] == ["张三", "李四"]
-    assert restored["request_timeout_seconds"] == DEFAULT_VALUES["request_timeout_seconds"]
-
-    imported_store = ProfileStore(tmp_path / "Imported" / "gui_profiles.json")
-    imported_name = imported_store.import_file(exported_path)
-    imported = imported_store.get(imported_name)
-    assert imported is not None
-    assert imported["preferred_trains"] == ["G123"]
-    assert imported["seat_position_preferences"] == ["1A", "1F"]
+def cart_settings():
+    return {**DEFAULT_VALUES, "cart_items": [{
+        "from_station": "上海虹桥", "to_station": "杭州东", "train_scope": "specific",
+        "train_code": "G123", "seat_type": "二等座",
+    }], "passenger_names": ["张三", "Mary Ann"], "seat_position_preferences": ["1A", "1F"]}
 
 
-def test_profile_store_ignores_profiles_from_an_unsupported_document_version(tmp_path: Path) -> None:
-    profile_path = tmp_path / "LocalAppData" / "12306FairTicket" / "gui_profiles.json"
-    profile_path.parent.mkdir(parents=True)
-    profile_path.write_text(
-        json.dumps(
-            {
-                "version": 2,
-                "last_profile": "future-profile",
-                "profiles": {
-                    "future-profile": {
-                        "from_station": "不应加载",
-                        "to_station": "也不应加载",
-                    }
-                },
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-
-    store = ProfileStore(profile_path)
-
-    assert store.names() == []
-    assert store.last_profile == ""
-    assert store.get("future-profile") is None
+def test_current_settings_roundtrip_preserves_order_without_private_or_removed_fields(tmp_path):
+    values = {**cart_settings(), "cart_migration": {"notes": ["train_first_any_multi_seat"], "issues": []},
+              "cookie": "secret-cookie", "token": "secret-token", "passenger_id_no": "secret-identity",
+              "session_file": "secret-path", "persist_session": True,
+              "from_station": "旧单站", "preferred_trains": ["K1"], "priority_strategy": "seat_first",
+              "CHOOSE_SEATS": "1B", "config_path": "secret-config"}
+    path = tmp_path / "journey.json"
+    save_gui_settings(path, values)
+    text = path.read_text(encoding="utf-8")
+    settings = json.loads(text)["settings"]
+    assert set(settings) == EDITABLE_SETTINGS_KEYS
+    assert "secret" not in text
+    assert "旧单站" not in text
+    restored = load_gui_settings(path)
+    assert restored["cart_items"] == values["cart_items"]
+    assert restored["passenger_names"] == ["张三", "Mary Ann"]
+    assert restored["seat_position_preferences"] == ["1A", "1F"]
+    assert restored["persist_session"] is False
+    assert "cart_migration" not in restored
+    assert "choose_seats" not in restored
 
 
-def test_safe_legacy_reader_never_executes_python_expressions(tmp_path: Path) -> None:
-    marker = tmp_path / "expression-was-executed.txt"
-    legacy = tmp_path / "config.py"
-    legacy.write_text(
-        "\n".join(
-            (
-                'FROM_STATION = "上海"',
-                'PASSENGER_NAMES = ["张三"]',
-                'SEAT_TYPES = ["二等座"]',
-                f'TO_STATION = __import__("pathlib").Path({str(marker)!r}).write_text("owned")',
-                "REQUEST_TIMEOUT_SECONDS = 1 + 72",
-                f'__import__("pathlib").Path({str(marker)!r}).write_text("owned")',
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    values = safe_read_legacy_config(legacy)
-
+@pytest.mark.parametrize("version", [1, 2, 3, 4, 6, True, "5", None])
+def test_only_v5_json_is_accepted_without_executing_python(tmp_path, version):
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"version": version, "settings": cart_settings(), "values": cart_settings()}), encoding="utf-8")
+    with pytest.raises(AppError, match="version|版本"):
+        load_gui_settings(path)
+    marker = tmp_path / "executed"
+    executable = tmp_path / "config.py"
+    executable.write_text(f"__import__('pathlib').Path({str(marker)!r}).touch()", encoding="utf-8")
+    with pytest.raises(AppError, match="仅支持 JSON"):
+        load_gui_settings(executable)
     assert not marker.exists()
-    assert values["from_station"] == "上海"
-    assert values["passenger_names"] == ["张三"]
-    assert values["to_station"] == DEFAULT_VALUES["to_station"]
-    assert values["request_timeout_seconds"] == DEFAULT_VALUES["request_timeout_seconds"]
-    assert values["config_path"] == str(legacy.resolve())
 
 
-def test_legacy_choose_seats_is_migrated_to_structured_positions(tmp_path: Path) -> None:
-    legacy = tmp_path / "config.py"
-    legacy.write_text("CHOOSE_SEATS = '1A1F'\n", encoding="utf-8")
-
-    values = safe_read_legacy_config(legacy)
-
-    assert values["seat_position_preferences"] == ["1A", "1F"]
-
-
-def test_legacy_letter_only_choose_seats_is_migrated(tmp_path: Path) -> None:
-    legacy = tmp_path / "config.py"
-    legacy.write_text("CHOOSE_SEATS = 'AF'\n", encoding="utf-8")
-
-    values = safe_read_legacy_config(legacy)
-
-    assert values["seat_position_preferences"] == ["1A", "1F"]
+@pytest.mark.parametrize("metadata", [
+    {"issues": ["empty_scope_high_speed"], "notes": []},
+    {"issues": "bad"}, {"issues": None}, {"notes": "bad"}, {"pending": True}, [], "bad", True,
+])
+def test_pending_or_malformed_migration_cannot_be_silently_discarded(tmp_path, metadata):
+    values = {**cart_settings(), "cart_migration": metadata}
+    path = tmp_path / "pending.json"
+    path.write_text(json.dumps({"version": 5, "settings": values}), encoding="utf-8")
+    with pytest.raises(AppError, match="购物车|限制"):
+        load_gui_settings(path)
+    with pytest.raises(AppError, match="购物车|限制"):
+        save_gui_settings(tmp_path / "output.json", values)
 
 
-def test_invalid_legacy_choose_seats_is_reported(tmp_path: Path) -> None:
-    legacy = tmp_path / "config.py"
-    legacy.write_text("CHOOSE_SEATS = '3A'\n", encoding="utf-8")
-
-    with pytest.raises(AppError, match="座位位置偏好无效"):
-        safe_read_legacy_config(legacy)
-
-
-def test_profile_import_rejects_files_larger_than_one_megabyte(tmp_path: Path) -> None:
-    oversized = tmp_path / "oversized.json"
-    oversized.write_bytes(b" " * 1_000_001)
-    store = ProfileStore(tmp_path / "profiles.json")
-
-    with pytest.raises(AppError, match="超过 1 MB"):
-        store.import_file(oversized)
+@pytest.mark.parametrize("cart", [None, "bad", {}, False])
+def test_v5_requires_cart_list(tmp_path, cart):
+    path = tmp_path / "cart.json"
+    path.write_text(json.dumps({"version": 5, "settings": {"cart_items": cart}}), encoding="utf-8")
+    with pytest.raises(AppError):
+        load_gui_settings(path)
+    path.write_text(json.dumps({"version": 5, "settings": {}}), encoding="utf-8")
+    with pytest.raises(AppError, match="cart_items"):
+        load_gui_settings(path)
 
 
-def test_explicit_empty_structured_positions_override_legacy_choose_seats(tmp_path: Path) -> None:
-    legacy = tmp_path / "config.py"
-    # Put CHOOSE_SEATS last so this also catches order-dependent migration.
-    legacy.write_text(
-        "SEAT_POSITION_PREFERENCES = []\nCHOOSE_SEATS = '1A1F'\n",
-        encoding="utf-8",
-    )
+def test_empty_cart_draft_saves_but_cannot_start(tmp_path):
+    path = tmp_path / "draft.json"
+    save_gui_settings(path, {"cart_items": []})
+    restored = load_gui_settings(path)
+    assert restored["cart_items"] == []
+    with pytest.raises(AppError, match="购物车"):
+        build_app_config(restored)
 
-    values = safe_read_legacy_config(legacy)
 
-    assert values["seat_position_preferences"] == []
+def test_failed_atomic_replace_preserves_previous_file(tmp_path, monkeypatch):
+    from ticket_app.gui import settings
+    path = tmp_path / "journey.json"
+    original = '{"previous": true}\n'
+    path.write_text(original, encoding="utf-8")
+    def fail_replace(*_args):
+        raise OSError("disk unavailable")
+    monkeypatch.setattr(settings.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk unavailable"):
+        save_gui_settings(path, cart_settings())
+    assert path.read_text(encoding="utf-8") == original
+    assert not list(tmp_path.glob(".journey.json.*.tmp"))
+
+
+def test_choose_seats_is_not_interpreted():
+    result = canonical_mapping({"cart_items": [], "CHOOSE_SEATS": "1A1F"})
+    assert result["seat_position_preferences"] == []
+    assert "choose_seats" not in result

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 from ticket_app.configuration import AppError
 from ticket_app.gui import app as gui_app
 from ticket_app.gui import worker as worker_module
-from ticket_app.gui.compat import load_gui_settings, save_gui_settings
+from ticket_app.gui.settings import load_gui_settings, save_gui_settings
 from ticket_app.gui.worker import GuiCancelToken
 
 
@@ -142,7 +142,7 @@ def test_loaded_contacts_block_handwritten_unknown_name(main_window, contacts):
     set_valid_trip(main_window)
     main_window._next_step()
     confirm_login(main_window, contacts=contacts)
-    main_window.manual_toggle.setChecked(True)
+    assert not main_window.field_blocks["passenger_names"].isHidden()
     main_window.passengers.setText("账号外乘车人")
 
     main_window._next_step()
@@ -174,7 +174,7 @@ def test_contact_refresh_failure_clears_stale_known_names_and_allows_manual_fall
     assert not main_window._contacts_loaded
     assert main_window._contacts == []
     assert main_window.contact_selector.checkboxes == []
-    assert main_window.manual_toggle.isChecked()
+    assert not main_window.field_blocks["passenger_names"].isHidden()
     assert main_window.passengers.text() == "账号外乘车人"
     assert "读取失败" in main_window.contacts_status.text()
     main_window._next_step()
@@ -330,7 +330,7 @@ def test_login_remains_valid_when_automatic_contact_fetch_fails(main_window, qtb
     assert main_window.current_step == 1
     assert "读取失败" in main_window.contacts_status.text()
     assert "private-response" not in main_window.contacts_status.text()
-    main_window.manual_toggle.setChecked(True)
+    assert not main_window.field_blocks["passenger_names"].isHidden()
     main_window.passengers.setText("学生甲")
     main_window._next_step()
     assert main_window.current_step == 2
@@ -503,9 +503,9 @@ def test_running_qr_recovery_queues_authentication_without_restarting_task(main_
 def test_imported_ticket_types_restore_without_signing_in_or_starting(main_window, tmp_path):
     path = tmp_path / "wizard-config.json"
     save_gui_settings(path, {
-        "from_station": "北京西", "to_station": "郑州东", "train_date": date.today().isoformat(),
+        "cart_items": [{"from_station": "北京西", "to_station": "郑州东", "train_scope": "specific", "train_code": "G79", "seat_type": "二等座"}], "train_date": date.today().isoformat(),
         "passenger_names": ["学生甲", "学生乙"], "passenger_ticket_types": {"学生甲": "adult", "学生乙": "student"},
-        "seat_types": ["二等座"], "quiet_carriage_preference": True,
+        "quiet_carriage_preference": True,
     })
     main_window._apply_mapping(load_gui_settings(path))
     assert main_window.passenger_ticket_types.values() == {"学生甲": "adult", "学生乙": "student"}

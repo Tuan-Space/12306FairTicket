@@ -9,10 +9,9 @@ from pathlib import Path
 import pytest
 
 from ticket_app.configuration import AppConfig, AppError, _as_list
-from ticket_app.gui.compat import (
+from ticket_app.gui.settings import (
     DEFAULT_VALUES,
     EDITABLE_SETTINGS_KEYS,
-    LEGACY_SELECTION_KEYS,
     build_app_config,
     canonical_mapping,
     load_gui_settings,
@@ -20,6 +19,7 @@ from ticket_app.gui.compat import (
 )
 from ticket_app.gui.validation import _string_list, validate_gui_mapping
 from ticket_app.input_parsing import split_multi_value_text
+from ticket_app.train_policy import normalize_train_codes
 
 
 SEPARATORS = [",", "，", "、", ";", "；", "\r", "\n", "\r\n", "\t"]
@@ -27,13 +27,17 @@ STATIONS = {"北京西", "郑州东"}
 TODAY = date(2026, 9, 11)
 
 
+def train_items(trains: object) -> list[dict[str, str]]:
+    return [{"from_station": "北京西", "to_station": "郑州东", "train_scope": "specific",
+             "train_code": train, "seat_type": "二等座"} for train in normalize_train_codes(trains)]
+
+
 def valid_values(**updates: object) -> dict[str, object]:
     return {
         **DEFAULT_VALUES,
         "train_date": "2099-01-01",
         "passenger_names": ["张三"],
-        "seat_types": ["二等座"],
-        "preferred_trains": ["G79"],
+        "cart_items": train_items(["G79"]),
         **updates,
     }
 
@@ -48,51 +52,49 @@ def test_supported_separators_are_shared_by_config_validation_and_json(
 ) -> None:
     passengers = f"{separator} 张三 {separator}{separator} Mary Ann {separator}李四{separator}"
     trains = f"{separator} d123 {separator}{separator} g79 {separator}1461{separator}"
-    values = valid_values(passenger_names=passengers, preferred_trains=trains)
+    values = valid_values(passenger_names=passengers, cart_items=train_items(trains))
 
     assert split_multi_value_text(passengers) == ["张三", "Mary Ann", "李四"]
     assert validate(values) == {}
     canonical = canonical_mapping(values)
     assert canonical["passenger_names"] == ["张三", "Mary Ann", "李四"]
-    assert canonical["preferred_trains"] == ["D123", "G79", "1461"]
+    assert [row["train_code"] for row in canonical["cart_items"]] == ["D123", "G79", "1461"]
 
     for config in (AppConfig.from_mapping(values), build_app_config(values)):
         assert config.passenger_names == canonical["passenger_names"]
-        assert config.preferred_trains == canonical["preferred_trains"]
+        assert [row.train_code for row in config.cart_items] == ["D123", "G79", "1461"]
 
-    # Exercise legacy text import, then save the atomic-cart v5 schema.
+    # JSON v5 accepts the same passenger separators and preserves cart order.
     path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"version": 2, "settings": values}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 5, "settings": values}), encoding="utf-8")
     imported = load_gui_settings(path)
     assert validate(imported) == {}
     save_gui_settings(path, imported)
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["version"] == 5
-    assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS - LEGACY_SELECTION_KEYS
+    assert set(document["settings"]) == EDITABLE_SETTINGS_KEYS
     assert document["settings"]["passenger_names"] == canonical["passenger_names"]
-    assert [row["train_code"] for row in document["settings"]["cart_items"]] == canonical["preferred_trains"]
+    assert [row["train_code"] for row in document["settings"]["cart_items"]] == ["D123", "G79", "1461"]
     restored = load_gui_settings(path)
-    for key in set(restored) - LEGACY_SELECTION_KEYS:
-        assert restored[key] == imported[key]
+    assert restored == imported
     assert [row.train_code for row in build_app_config(restored).cart_items] == ["D123", "G79", "1461"]
 
 
 def test_mixed_separators_keep_internal_spaces_order_and_duplicates() -> None:
     text = " ,，、;；\r\n\t 张三 , Mary  Ann；\t李四、 张三 \r\n; "
     assert split_multi_value_text(text) == ["张三", "Mary  Ann", "李四", "张三"]
-    values = canonical_mapping({"PREFERRED_TRAINS": "d123、g79；D123\t1461"})
-    assert values["preferred_trains"] == ["D123", "G79", "D123", "1461"]
+    assert normalize_train_codes("d123、g79；D123\t1461") == ["D123", "G79", "D123", "1461"]
 
 
 @pytest.mark.parametrize("text", ["", "  ", ",，、;；\r\n\t", " , ，\t； "])
 def test_empty_fields_and_separator_only_fields_remain_empty(text: str) -> None:
     assert split_multi_value_text(text) == []
-    values = valid_values(passenger_names=text, preferred_trains=text)
+    values = valid_values(passenger_names=text, cart_items=train_items(text))
     errors = validate(values)
     assert "1 到 5" in errors["passenger_names"]
-    assert "至少填写" in errors["preferred_trains"]
+    assert "请至少加入" in errors["cart_items"]
     with pytest.raises(AppError, match="必须填写 PASSENGER_NAMES"):
-        AppConfig.from_mapping(values)
+        AppConfig.from_mapping(valid_values(passenger_names=text))
 
 
 @pytest.mark.parametrize("container", [list, tuple])
@@ -106,9 +108,9 @@ def test_structured_sequence_entries_are_atomic(container: type) -> None:
 
     # A separator inside an existing train array entry is still an invalid
     # identifier, rather than silently turning one configured entry into two.
-    values = valid_values(preferred_trains=container(["g79；D123"]))
-    assert canonical_mapping(values)["preferred_trains"] == ["G79；D123"]
-    assert "格式不正确" in validate(values)["preferred_trains"]
+    values = valid_values(cart_items=train_items(container(["g79；D123"])))
+    assert canonical_mapping(values)["cart_items"][0]["train_code"] == "G79；D123"
+    assert "合法车次" in validate(values)["cart_items"]
 
 
 @pytest.mark.parametrize(
@@ -132,31 +134,20 @@ def test_passenger_errors_survive_normalization_and_save_import(
 
 @pytest.mark.parametrize("trains", ["g79、not-a-train；D123", "g79 G95", "G79，D123/5"])
 def test_invalid_train_is_still_reported_after_save_import(trains: str, tmp_path: Path) -> None:
-    values = valid_values(preferred_trains=trains)
+    values = valid_values(cart_items=train_items(trains))
     path = tmp_path / "invalid-train.json"
     save_gui_settings(path, values)
     for candidate in (values, canonical_mapping(values)):
-        assert "格式不正确" in validate(candidate)["preferred_trains"]
+        assert "合法车次" in validate(candidate)["cart_items"]
     assert "合法车次" in validate(load_gui_settings(path))["cart_items"]
 
 
-def test_legacy_v1_uppercase_text_fields_import_with_shared_rules(tmp_path: Path) -> None:
-    path = tmp_path / "legacy.json"
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "values": {
-                    "PASSENGER_NAMES": "张三、李四；Mary Ann",
-                    "PREFERRED_TRAINS": "d123\tg79，1461",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    values = load_gui_settings(path)
-    assert values["passenger_names"] == ["张三", "李四", "Mary Ann"]
-    assert values["preferred_trains"] == ["D123", "G79", "1461"]
+def test_uppercase_cli_fields_share_current_passenger_and_cart_rules() -> None:
+    values = {"TRAIN_DATE": "2099-01-01", "PASSENGER_NAMES": "张三、李四；Mary Ann",
+              "CART_ITEMS": train_items("d123\tg79，1461")}
+    cfg = AppConfig.from_mapping(values)
+    assert cfg.passenger_names == ["张三", "李四", "Mary Ann"]
+    assert [row.train_code for row in cfg.cart_items] == ["D123", "G79", "1461"]
 
 
 @pytest.mark.parametrize(
@@ -172,6 +163,6 @@ def test_legacy_v1_uppercase_text_fields_import_with_shared_rules(tmp_path: Path
 def test_shared_text_parser_does_not_relax_existing_config_type_checks(
     key: str, value: object, tmp_path: Path
 ) -> None:
-    values = valid_values(passenger_names="张三、李四", preferred_trains="g79；D123", **{key: value})
+    values = valid_values(passenger_names="张三、李四", cart_items=train_items("g79；D123"), **{key: value})
     with pytest.raises(AppError, match="配置字段类型无效"):
         save_gui_settings(tmp_path / "invalid-type.json", values)

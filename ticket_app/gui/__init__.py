@@ -2,4 +2,4 @@
 
 from __future__ import annotations
 
-__all__ = ["app", "async_logging", "compat", "station_worker", "validation", "widgets", "worker"]
+__all__ = ["app", "async_logging", "settings", "station_worker", "validation", "widgets", "worker"]

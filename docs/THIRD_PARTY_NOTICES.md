@@ -28,7 +28,11 @@ PySide6 wheels include Qt shared libraries and plugins. The onedir build intenti
 
 The PyInstaller bootloader exception permits distribution of applications produced by PyInstaller under the application's chosen license, subject to the exception's terms. PyInstaller itself is a build dependency and is not an application feature.
 
-## Release checklist
+## Packaged license texts
+
+The Windows build runs `scripts/collect_licenses.py` offline and includes a `licenses/` directory with deduplicated license texts and `inventory.json` recording exact component versions, upstream sources and hashes. Official fallback texts are versioned in `docs/licenses/`. Python packaging helpers retained by the dependency analyzer are included in that inventory as well.
+
+## Maintainer checklist
 
 Before distributing a build outside the project team:
 

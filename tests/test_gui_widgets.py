@@ -16,7 +16,6 @@ from ticket_app.gui.widgets import (
     CleanSpinBox,
     DatePickerWidget,
     HelpLabel,
-    CurrentPhaseWidget,
     PositionPreferences,
     SeatMapWidget,
     TimeFieldsWidget,
@@ -124,7 +123,8 @@ def test_seat_and_berth_widgets_use_friendly_relation_and_step_controls(qtbot) -
     labels = [label.text() for label in seats.findChildren(QLabel)]
     assert "前排" in labels
     assert "后排" in labels
-    assert "不代表行驶方向" in labels[0]
+    assert "不代表行驶方向" in seats.guide.text()
+    assert not seats.guide.isHidden()
     assert "关系 1" not in labels
     assert "关系 2" not in labels
 
@@ -166,16 +166,3 @@ def test_position_preferences_tab_wheel_requires_an_actual_tab_button(qtbot) -> 
 
     assert tabs.currentIndex() == 1
     assert not ignored_event.isAccepted()
-
-
-def test_current_phase_widget_keeps_only_current_phase_and_allows_fallback(qtbot) -> None:
-    phase = CurrentPhaseWidget()
-    qtbot.addWidget(phase)
-
-    phase.set_phase("querying", "查询余票")
-    assert phase.current_phase == "querying"
-    assert phase.phase_title.text() == "查询余票"
-    phase.set_phase("login", "重新扫码")
-    assert phase.current_phase == "login"
-    assert phase.phase_title.text() == "登录 12306"
-    assert phase.phase_message.text() == "重新扫码"

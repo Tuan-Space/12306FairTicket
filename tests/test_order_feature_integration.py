@@ -60,11 +60,11 @@ class OfflineOrderSession:
 ])
 def test_ticket_types_and_quiet_preference_reach_exactly_one_final_form(label, code, quiet_script, available):
     cfg = AppConfig.from_mapping({
-        "from_station": "北京南", "to_station": "上海虹桥",
+        "cart_items": [{"from_station": "北京南", "to_station": "上海虹桥",
+                        "train_scope": "specific", "train_code": "D1", "seat_type": label}],
         "train_date": (date.today() + timedelta(days=1)).isoformat(),
         "passenger_names": ["学生甲", "学生乙"],
         "passenger_ticket_types": {"学生甲": "adult", "学生乙": "student"},
-        "seat_types": [label], "only_preferred_trains": False,
         "quiet_carriage_preference": True, "persist_session": False, "perf_log": False,
     })
     session = OfflineOrderSession(quiet_script)
@@ -72,8 +72,8 @@ def test_ticket_types_and_quiet_preference_reach_exactly_one_final_form(label, c
     selected = runner._select_passengers()
     prepared = runner._prepare_passengers_by_seat_code(selected)
     candidate = {"seat_label": label, "seat_type": code, "stock": "有", "ticket": {
-        "station_train_code": "D1", "train_no": "fixture-train", "date": cfg.train_date,
-        "from_station": cfg.from_station, "to_station": cfg.to_station,
+        "station_train_code": "D1", "train_no": "fixture-train", "query_date": cfg.train_date,
+        "from_station": cfg.cart_items[0].from_station, "to_station": cfg.cart_items[0].to_station,
         "secret_str": "fixture-secret", "left_ticket": "fixture-left",
     }}
     assert runner._book_ticket(candidate, prepared)

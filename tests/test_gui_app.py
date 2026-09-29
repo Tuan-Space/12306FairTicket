@@ -18,12 +18,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, Qt  # noqa: E402
 from PySide6.QtGui import QImage  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QToolButton  # noqa: E402
 
 from ticket_app import client as client_module  # noqa: E402
 from ticket_app.gui import app as gui_app  # noqa: E402
-from ticket_app.gui.worker import EventRelay, GuiCancelToken  # noqa: E402
-from ticket_app.gui.worker import TicketWorker  # noqa: E402
+from ticket_app.gui.settings import load_gui_settings, save_gui_settings  # noqa: E402
+from ticket_app.gui.worker import GuiCancelToken, OperationRequest, OperationWorker  # noqa: E402
 from ticket_app.runtime import RuntimeEvent  # noqa: E402
 
 
@@ -67,7 +67,6 @@ def main_window(qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Itera
             window._stop_task()
             qtbot.waitUntil(lambda: window._active_operation is None, timeout=5000)
         window._active_operation = None
-        window.worker = None
         window.cancel_token = None
         window.close()
         qtbot.waitUntil(lambda: window._background_thread is None, timeout=3000)
@@ -105,7 +104,7 @@ def _add_seat(main_window: gui_app.MainWindow, label: str, *, train: str = "G79"
     main_window.to_station.setText("郑州东")
     main_window.train_scope.setCurrentIndex(main_window.train_scope.findData("specific" if train else "all"))
     main_window.preferred_trains.setText(train)
-    main_window.cart_seat.setCurrentIndex(main_window.cart_seat.findData(label))
+    main_window.cart_seat.set_selected_seats([label])
     if qtbot is None:
         assert main_window._add_cart_items()
     else:
@@ -119,16 +118,6 @@ def _set_cart_seats(main_window, seats, train="G79"):
     main_window._cart_changed()
     for seat in seats:
         _add_seat(main_window, seat, train=train)
-
-
-def _legacy_mapping(main_window, **overrides):
-    values = main_window._collect_mapping()
-    values.pop("cart_items", None)
-    values.pop("cart_migration", None)
-    values.update(from_station="北京西", to_station="郑州东", preferred_trains=[],
-                  seat_types=["二等座"], only_preferred_trains=False, empty_train_scope="all")
-    values.update(overrides)
-    return values
 
 
 @pytest.mark.parametrize("sleeper", ["硬卧", "软卧", "高级软卧", "一等卧", "二等卧"])
@@ -176,7 +165,7 @@ def test_berth_guidance_navigates_to_seats_and_clear_keeps_seat_selection(
     assert "berth_preference" not in main_window._validate_all()
     berths.select_seat_types_button.click()
     assert main_window.current_step == 0
-    target = main_window.cart_seat
+    target = main_window.cart_seat.checkboxes["硬卧"]
     qtbot.waitUntil(lambda: QApplication.focusWidget() is target)
     assert main_window.basic_scroll.viewport().rect().intersects(
         target.rect().translated(
@@ -209,7 +198,7 @@ def test_multi_value_form_collects_and_validates_the_same_lists(
 def test_main_window_can_be_created_offline_without_starting_a_task(main_window: gui_app.MainWindow) -> None:
     assert main_window.windowTitle() == "12306 Fair Ticket"
     assert main_window._active_operation is None
-    assert main_window.worker is None
+    assert main_window._executor is None
     assert not main_window.start_button.isEnabled()
     assert main_window.next_button.isEnabled()
     assert main_window.advanced["station_cache_days"].minimum() == 1
@@ -230,7 +219,7 @@ def test_configuration_bar_explains_json_and_privacy(main_window: gui_app.MainWi
     assert "Cookie" in main_window.save_settings_button.toolTip()
     assert "Token" in main_window.save_settings_button.toolTip()
     assert "JSON" in main_window.import_settings_button.toolTip()
-    assert "version 1–5" in main_window.import_settings_button.toolTip()
+    assert "version 5" in main_window.import_settings_button.toolTip()
     assert "version 5" in main_window.save_settings_button.toolTip()
 
 
@@ -258,7 +247,7 @@ def test_live_validation_marks_only_touched_field_and_direct_dependencies(
 
 def test_specific_train_requires_input_without_implicitly_accepting_all(main_window: gui_app.MainWindow, qtbot) -> None:
     main_window.show()
-    main_window.cart_seat.setCurrentText("二等座")
+    main_window.cart_seat.set_selected_seats(["二等座"])
     main_window.preferred_trains.clear()
     assert not main_window._add_cart_items()
     assert "指定车次" in main_window.cart_draft_status.text()
@@ -272,13 +261,14 @@ def test_specific_train_requires_input_without_implicitly_accepting_all(main_win
 
 def test_basic_page_has_no_help_icons_and_status_panel_has_no_scroll_area(main_window: gui_app.MainWindow) -> None:
     assert main_window.advanced_content.isHidden()
-    assert main_window.advanced_content.findChildren(gui_app.QToolButton, "helpButton")
+    assert main_window.advanced_content.findChildren(QToolButton, "helpButton")
     assert not any(
         label.text() == "整组位置偏好"
-        for label in main_window.position_preferences.parentWidget().findChildren(gui_app.QLabel)
+        for label in main_window.position_preferences.parentWidget().findChildren(QLabel)
     )
-    assert isinstance(main_window.timeline, gui_app.CurrentPhaseWidget)
-    assert not main_window.status_panel.findChildren(gui_app.QScrollArea)
+    assert not hasattr(main_window, "timeline")
+    assert isinstance(main_window.phase_badge, QLabel)
+    assert not main_window.status_panel.findChildren(QScrollArea)
 
 
 @pytest.mark.parametrize("dark_theme", [False, True], ids=["light", "dark"])
@@ -428,11 +418,13 @@ def test_unknown_station_is_marked_and_clears_after_correction(main_window: gui_
 
 
 def test_all_twelve_seat_types_remain_available_and_cart_order_is_visible(main_window: gui_app.MainWindow) -> None:
-    assert {main_window.cart_seat.itemData(index) for index in range(1, main_window.cart_seat.count())} == set(gui_app.SEAT_SPECS)
+    assert set(main_window.cart_seat.checkboxes) == set(gui_app.SEAT_SPECS)
     _set_cart_seats(main_window, ["二等卧", "一等卧", "无座"])
     assert [item["seat_type"] for item in main_window.cart_items] == ["二等卧", "一等卧", "无座"]
-    assert "购物车（3）" in main_window.cart_button.text()
-    assert "二等卧" in main_window.cart_summary.text()
+    assert main_window.cart_button.count == 3
+    assert "3" in main_window.cart_button.accessibleName()
+    main_window._refresh_confirmation()
+    assert "二等卧" in main_window.confirm_cart.text()
 
 
 def test_new_draft_has_no_cart_and_any_train_requires_explicit_choice(main_window):
@@ -440,16 +432,17 @@ def test_new_draft_has_no_cart_and_any_train_requires_explicit_choice(main_windo
     assert not hasattr(main_window, "empty_train_scope")
     assert "empty_train_scope" not in main_window.field_widgets
     assert main_window.cart_items == []
-    assert main_window.cart_seat.currentData() == ""
+    assert main_window.cart_seat.selected_seats() == []
     assert main_window.position_preferences.seats.positions() == []
     assert main_window.position_preferences.berths.values() == {"lower": 0, "middle": 0, "upper": 0}
     assert main_window.train_scope.currentData() == "specific"
     assert "cart_items" in main_window._validate_all()
     _set_cart_seats(main_window, ["硬卧", "二等座"], train="")
     assert main_window._validate_all() == {}
-    assert main_window._build_current_config().empty_train_scope == "all"
+    assert all(item.train_scope == "all" for item in main_window._build_current_config().cart_items)
     assert all(item["train_scope"] == "all" for item in main_window.cart_items)
-    assert "不限车次" in main_window.cart_summary.text()
+    main_window._refresh_confirmation()
+    assert "不限车次" in main_window.confirm_cart.text()
     assert "only_preferred_trains" not in main_window._collect_mapping()
     assert "priority_strategy" not in main_window._collect_mapping()
 
@@ -476,53 +469,32 @@ def test_cart_order_is_confirmed_and_config_round_trips(main_window, tmp_path):
     main_window.cart_items[1], main_window.cart_items[2] = main_window.cart_items[2], main_window.cart_items[1]
     main_window._cart_changed()
     expected = list(main_window.cart_items)
-    summary = main_window._cart_confirmation_text()
+    main_window._refresh_confirmation()
+    summary = main_window.confirm_cart.text()
     assert summary.index("G123 · 二等座") < summary.index("G123 · 一等座") < summary.index("G125 · 二等座")
     target = tmp_path / "cart.json"
-    main_window.config_store.save_file(target, main_window._collect_mapping())
+    save_gui_settings(target, main_window._collect_mapping())
     assert json.loads(target.read_text(encoding="utf-8"))["version"] == 5
     main_window.cart_items.reverse()
-    errors, _ = main_window._apply_mapping(main_window.config_store.import_file(target))
+    errors = main_window._apply_mapping(load_gui_settings(target))
     assert not errors
     assert main_window._validate_all() == {}
     assert main_window.cart_items == expected
     assert [item.to_mapping() for item in main_window._build_current_config().cart_items] == expected
 
 
-def test_imported_empty_exact_scope_is_not_silently_broadened(main_window):
-    main_window._apply_mapping(_legacy_mapping(main_window, only_preferred_trains=True))
-    assert "cart_items" in main_window._validate_all()
-    assert main_window.cart_migration["issues"]
-    assert not main_window.resolve_cart_button.isHidden()
-    assert "待修正" in main_window.cart_migration_label.text()
-    assert "车次清单为空" in main_window.cart_migration_label.toolTip()
-
-
-@pytest.mark.parametrize("scope", [None, "high_speed", "conventional", "future"])
-@pytest.mark.parametrize("preferred", [[], ["G1"]])
-def test_old_scope_import_preserves_restrictions_until_explicit_correction(main_window, monkeypatch, tmp_path, scope, preferred):
-    path = tmp_path / "old-preview.json"
-    settings = _legacy_mapping(main_window, passenger_names=["张三"], seat_types=["硬卧", "二等座"],
-                               preferred_trains=preferred, empty_train_scope=scope)
-    path.write_text(json.dumps({"version": 3, "settings": settings}), encoding="utf-8")
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_old_config_import_is_rejected_without_changing_current_cart(main_window, monkeypatch, tmp_path, version):
+    _set_cart_seats(main_window, ["二等座"])
+    before = main_window._collect_mapping()
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps({"version": version, "settings": {"seat_types": ["硬卧"]}}), encoding="utf-8")
     monkeypatch.setattr(gui_app.QFileDialog, "getOpenFileName", lambda *_: (str(path), ""))
     notices = []
-    monkeypatch.setattr(gui_app.QMessageBox, "information", lambda _parent, _title, message: notices.append(message))
     monkeypatch.setattr(gui_app.QMessageBox, "warning", lambda _parent, _title, message: notices.append(message))
     main_window._import_settings()
-    assert len(notices) == 1
-    assert list(dict.fromkeys(item["seat_type"] for item in main_window.cart_items)) == ["硬卧", "二等座"]
-    if not preferred:
-        assert main_window.cart_migration["issues"]
-        assert "cart_items" in main_window._validate_all()
-        assert not main_window.cart_migration_label.isHidden()
-    else:
-        # Legacy type scope applied only when no preferred train was supplied.
-        assert not main_window.cart_migration["issues"]
-        assert main_window._validate_all() == {}
-    assert "empty_train_scope" not in main_window.field_widgets
-    main_window.config_store.save_file(path, main_window._collect_mapping())
-    assert json.loads(path.read_text(encoding="utf-8"))["settings"]["cart_migration"] == main_window.cart_migration
+    assert len(notices) == 1 and "5" in notices[0]
+    assert main_window._collect_mapping() == before
 
 
 def test_empty_cart_validation_focuses_add_action(main_window, qtbot):
@@ -532,7 +504,7 @@ def test_empty_cart_validation_focuses_add_action(main_window, qtbot):
     assert "cart_items" in main_window._validate_all(focus_first=True)
     target = main_window.add_cart_button
     qtbot.waitUntil(lambda: QApplication.focusWidget() is target)
-    main_window.cart_seat.setCurrentText("二等座")
+    main_window.cart_seat.set_selected_seats(["二等座"])
     qtbot.keyClick(target, Qt.Key.Key_Space)
     assert [item["seat_type"] for item in main_window.cart_items] == ["二等座"]
     assert main_window._validate_all() == {}
@@ -645,7 +617,7 @@ def test_high_frequency_query_events_are_rendered_once_per_batch(main_window: gu
 
     def track_flush() -> None:
         original_flush()
-        rendered_attempts.append(main_window.query_metric.value_label.text())  # type: ignore[attr-defined]
+        rendered_attempts.append(main_window.query_count.text())  # type: ignore[attr-defined]
 
     main_window.query_ui_timer.timeout.disconnect()
     main_window.query_ui_timer.timeout.connect(track_flush)
@@ -693,36 +665,40 @@ def test_worker_completion_is_quiet_and_shows_one_information_dialog(
     main_window._on_worker_completed(1)
 
     assert main_window._last_phase == "no_ticket"
-    assert "未确认出票" in main_window.phase_badge.text()
+    assert "结束未出票" in main_window.phase_badge.text()
     assert notifications == []
     assert dialogs == [
         (main_window, "任务结束，未出票", "已达停止时间或最大查询轮数，本次未出票。")
     ]
 
 
-def test_worker_passes_the_process_memory_session_to_the_runner(monkeypatch) -> None:
-    shared_session = object()
+def test_worker_passes_the_process_memory_session_and_clock_to_the_runner(monkeypatch) -> None:
+    shared_session, shared_clock, cfg = object(), object(), object()
     received = {}
 
     class FakeRunner:
-        def __init__(self, cfg, event_sink=None, cancel_token=None, session=None):
-            received.update(
-                cfg=cfg,
-                event_sink=event_sink,
-                cancel_token=cancel_token,
-                session=session,
-            )
+        def __init__(self, cfg, event_sink=None, cancel_token=None, session=None, clock=None):
+            received.update(cfg=cfg, event_sink=event_sink, cancel_token=cancel_token,
+                            session=session, clock=clock)
+
+        def run(self):
+            return 1
 
     monkeypatch.setattr("ticket_app.gui.worker.TicketRunner", FakeRunner)
-    relay = EventRelay()
     token = GuiCancelToken()
-    worker = TicketWorker(object(), relay, token, shared_session)
+    worker = OperationWorker()
+    completed = []
+    worker.finished.connect(lambda generation, outcome: completed.append((generation, outcome)))
+    worker.execute(OperationRequest(3, "task", cfg, token, shared_session, shared_clock))
 
-    worker._make_runner()
-
+    assert received["cfg"] is cfg
     assert received["session"] is shared_session
-    assert received["event_sink"] is relay
+    assert received["clock"] is shared_clock
+    assert callable(received["event_sink"])
     assert received["cancel_token"] is token
+    assert len(completed) == 1
+    assert completed[0][0] == 3 and completed[0][1].result == 1
+    assert not completed[0][1].error
 
 
 def test_closing_the_window_destroys_its_in_memory_cookies(main_window) -> None:
@@ -733,26 +709,29 @@ def test_closing_the_window_destroys_its_in_memory_cookies(main_window) -> None:
     assert not list(main_window.shared_session.cookies)
 
 
-def test_runtime_event_relay_preserves_message_data_and_timestamp(qtbot) -> None:
-    relay = EventRelay()
+def test_worker_runtime_event_preserves_generation_message_data_and_timestamp(qtbot, monkeypatch) -> None:
     event = RuntimeEvent(
-        kind="qr-status",
-        message="请在手机上确认",
-        data={"status": "scanned", "attempt": 2},
-        timestamp=1234.5,
+        kind="qr-status", message="请在手机上确认",
+        data={"status": "scanned", "attempt": 2}, timestamp=1234.5,
     )
 
-    with qtbot.waitSignal(relay.runtime_event, timeout=1000) as emitted:
-        relay(event)
+    class FakeRunner:
+        def __init__(self, cfg, event_sink=None, **_kwargs):
+            self.sink = event_sink
 
-    kind, payload = emitted.args
-    assert kind == "qr_status"
-    assert payload == {
-        "status": "scanned",
-        "attempt": 2,
-        "message": "请在手机上确认",
-        "timestamp": 1234.5,
-    }
+        def run(self):
+            self.sink(event)
+            return 1
+
+    monkeypatch.setattr("ticket_app.gui.worker.TicketRunner", FakeRunner)
+    worker = OperationWorker()
+    events = []
+    worker.runtime_event.connect(lambda generation, kind, payload: events.append((generation, kind, payload)))
+    worker.execute(OperationRequest(8, "task", object(), GuiCancelToken()))
+    assert events[-1] == (8, "qr_status", {
+        "status": "scanned", "attempt": 2,
+        "message": "请在手机上确认", "timestamp": 1234.5,
+    })
 
 
 def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
@@ -795,11 +774,11 @@ def test_qr_waiting_scanned_confirmed_expired_and_refresh_states(
     assert main_window.qr_countdown.text() == "已过期"
     assert main_window.refresh_qr_button.isEnabled()
 
-    restarts: list[tuple[str, bool]] = []
-    monkeypatch.setattr(main_window, "_start_connection_operation", lambda mode, **kw: restarts.append((mode, kw.get("force_login", False))))
+    restarts: list[str] = []
+    monkeypatch.setattr(main_window, "_start_connection_operation", lambda mode: restarts.append(mode))
     main_window._active_operation = None
     main_window._restart_for_qr()
-    assert restarts == [("login", True)]
+    assert restarts == ["login"]
 
 
 def test_reused_login_clears_old_qr_without_notifying_about_a_new_scan(
@@ -959,7 +938,7 @@ def test_refresh_while_waiting_queues_login_without_cancelling_task(main_window:
     main_window._restart_for_qr()
 
     assert main_window._pending_restart is False
-    assert token.cancelled is False
+    assert token.is_cancelled is False
     assert token.next_action(0) == "login"
 
 
@@ -972,18 +951,22 @@ def test_sale_countdown_uses_server_anchor_and_monotonic_elapsed_time(
         time=lambda: 9_999_999_999.0,
     )
     monkeypatch.setattr(gui_app, "time", fake_time)
+    main_window._go_to_step(3)
+    main_window._set_phase("waiting", "等待开售")
     main_window._server_anchor = (1_700_000_000.0, 50.0)
     main_window._target_timestamp = 1_700_000_005.0
 
     assert main_window._server_now_timestamp() == 1_700_000_002.0
     main_window._update_countdowns()
     assert main_window.sale_countdown.text() == "00:00:03.0"
-    assert main_window.sale_caption.text() == "距离开始时间"
+    assert main_window.sale_caption.text() == "距离开售"
 
     monotonic[0] = 56.0
     main_window._update_countdowns()
-    assert main_window.sale_countdown.text() == "00:00:00.0"
-    assert main_window.sale_caption.text() == "已到开始时间"
+    assert main_window.sale_countdown.text() == ""
+    assert main_window.sale_caption.text() == ""
+    assert main_window.sale_countdown.isHidden()
+    assert main_window.sale_caption.isHidden()
 
 
 def test_gui_smoke_mode_exits_offline_and_uses_temporary_local_appdata(tmp_path: Path) -> None:
@@ -1027,7 +1010,8 @@ def test_runtime_events_never_send_system_alerts_but_keep_dialogs(main_window, m
     monkeypatch.setattr(gui_app.QMessageBox, "critical", lambda *args: dialogs.append(args[1]))
     for _ in range(20):
         main_window._on_runtime_event("candidate", {"message": "发现二等卧票源"})
-    assert main_window.phase_badge.text() == "发现二等卧票源"
+    assert main_window.phase_badge.text() == "查询余票"
+    assert "发现二等卧票源" in main_window.phase_badge.toolTip()
     for status in ("waiting", "scanned", "confirmed", "logged_in", "expired"):
         main_window._on_runtime_event("qr_status", {"status": status})
     main_window._on_worker_failed("模拟失败", "测试")

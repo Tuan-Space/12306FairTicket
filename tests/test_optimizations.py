@@ -63,37 +63,6 @@ class OptimizationTests(unittest.TestCase):
         self.assertFalse(_is_terminal_order_failure("排队中，预计等待 -100 秒"))
         self.assertTrue(_is_terminal_order_failure("没有足够的票!"))
 
-    def test_candidate_order_respects_train_and_seat_priority(self):
-        cfg = SimpleNamespace(
-            preferred_trains=["G2", "G1"],
-            only_preferred_trains=True,
-        )
-        runner = object.__new__(TicketRunner)
-        runner.cfg = cfg
-        runner.preferred_order = {"G2": 0, "G1": 1}
-        runner.seat_sequence = [("二等座", configuration.SEAT_SPECS["二等座"]), ("一等座", configuration.SEAT_SPECS["一等座"])]
-        tickets = [
-            {
-                "station_train_code": "G1",
-                "can_buy": True,
-                "seats": {"edz": "有", "ydz": "有"},
-            },
-            {
-                "station_train_code": "G2",
-                "can_buy": True,
-                "seats": {"edz": "--", "ydz": "1"},
-            },
-            {
-                "station_train_code": "G3",
-                "can_buy": True,
-                "seats": {"edz": "有", "ydz": "有"},
-            },
-        ]
-
-        candidates = runner._find_candidates(tickets)
-
-        self.assertEqual([item["ticket"]["station_train_code"] for item in candidates], ["G2", "G1", "G1"])
-        self.assertEqual([item["seat_label"] for item in candidates], ["一等座", "二等座", "一等座"])
 
 
 if __name__ == "__main__":

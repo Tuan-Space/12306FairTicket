@@ -259,7 +259,7 @@ def test_new_runner_preserves_shared_successful_clock_but_uses_edited_settings()
         clock._base_server_timestamp = 1000
         clock._base_perf_counter = 500
         new_cfg = SimpleNamespace(request_timeout_seconds=7, time_sync_samples=2, time_sync_max_rtt_seconds=1,
-                                  persist_session=False, preferred_trains=[], seat_types=[])
+                                  persist_session=False, cart_items=[])
         runner = TicketRunner(new_cfg, session=session, clock=clock)
         assert runner.clock is clock
         assert clock.cfg is new_cfg

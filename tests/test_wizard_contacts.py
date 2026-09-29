@@ -16,7 +16,7 @@ from ticket_app.gui import app as gui_app
 from ticket_app.gui.passenger_widgets import (
     InlinePassengerSelector, PassengerTicketEditor, default_ticket_label,
 )
-from ticket_app.gui.worker import ConnectionWorker, EventRelay, GuiCancelToken
+from ticket_app.gui.worker import GuiCancelToken, OperationRequest, OperationWorker
 from ticket_app.runtime import RunCancelled
 
 
@@ -24,7 +24,6 @@ def run_connection(monkeypatch, mode, *, valid=True, contact_error=None, login_e
                    cancel_on_read=False):
     calls = []
     token = GuiCancelToken()
-    relay = EventRelay()
 
     class Client:
         def __init__(self, *_args):
@@ -51,12 +50,19 @@ def run_connection(monkeypatch, mode, *, valid=True, contact_error=None, login_e
 
     monkeypatch.setattr(worker_module, "RailwayClient", Client)
     monkeypatch.setattr(worker_module, "TicketRunner", lambda *_a, **_kw: pytest.fail("No ticket runner"))
-    worker = ConnectionWorker(mode, ConnectionConfig.from_mapping({"persist_session": False}), relay, token)
+    worker = OperationWorker()
     completed, failed, done = [], [], []
-    worker.completed.connect(lambda action, value: completed.append((action, value)))
-    worker.failed.connect(lambda message, detail: failed.append((message, detail)))
-    worker.done.connect(lambda: done.append(True))
-    worker.run()
+
+    def finished(generation, outcome):
+        assert generation == 1
+        done.append(True)
+        if outcome.error:
+            failed.append((outcome.error, outcome.details))
+        else:
+            completed.append((outcome.mode, outcome.result))
+
+    worker.finished.connect(finished)
+    worker.execute(OperationRequest(1, mode, ConnectionConfig.from_mapping({"persist_session": False}), token))
     assert done == [True]
     return calls, completed, failed
 
@@ -182,7 +188,8 @@ def test_inline_empty_contacts_and_replacements_clear_old_visible_selection(qtbo
     selector.set_contacts([])
     assert selector.selected_names() == []
     assert selector.checkboxes == []
-    assert "0 / 5" in selector.status.text()
+    assert selector.title.text() == "乘车人（0/5）"
+    assert selector.status.isHidden()
 
 
 def test_repeated_empty_contact_events_reuse_hint_and_controls(qtbot):
@@ -231,7 +238,8 @@ def test_reused_contact_rows_reset_ambiguity_and_use_current_name(qtbot):
     assert not first_box.isEnabled()
     selector.set_contacts([{"name": "新乘车人", "passenger_type": "3"}])
     assert selector.checkboxes[0] is first_box
-    assert first_box.isEnabled() and first_box.toolTip() == ""
+    assert first_box.isEnabled() and "新乘车人" in first_box.toolTip()
+    assert "同名" not in first_box.toolTip()
     assert "同名" not in first_box.text()
     first_box.click()
     assert selector.selected_names() == ["新乘车人"]
@@ -242,31 +250,31 @@ def test_ticket_type_defaults_explain_known_passenger_category_without_changing_
     editor = PassengerTicketEditor()
     qtbot.addWidget(editor)
     editor.set_names(["学生甲", "成人乙", "未知丙"])
-    assert editor.rows["学生甲"].itemText(0) == "默认（按12306乘客信息）"
+    assert editor.rows["学生甲"].itemText(0) == "12306默认"
     student_combo = editor.rows["学生甲"]
     student_combo.setCurrentIndex(student_combo.findData("adult"))
     changes = []
     editor.changed.connect(lambda: changes.append(editor.values()))
     editor.set_contact_types({"学生甲": "3", "成人乙": "1"})
     assert editor.rows["学生甲"] is student_combo
-    assert student_combo.itemText(0) == "默认（12306：学生票）"
-    assert editor.rows["成人乙"].currentText() == "默认（12306：成人票）"
-    assert editor.rows["未知丙"].currentText() == "默认（按12306乘客信息）"
+    assert student_combo.itemText(0) == "12306默认（学生）"
+    assert editor.rows["成人乙"].currentText() == "12306默认（成人）"
+    assert editor.rows["未知丙"].currentText() == "12306默认"
     assert "车票类型" in student_combo.accessibleName()
     assert editor.values() == {"学生甲": "adult"}
     editor.set_contact_types({})
-    assert student_combo.itemText(0) == "默认（按12306乘客信息）"
+    assert student_combo.itemText(0) == "12306默认"
     assert editor.values() == {"学生甲": "adult"}
     assert changes == []
     editor.set_contact_types({"学生甲": 3})
     editor.set_names(["未知丙", "学生甲"])
-    assert editor.rows["学生甲"].itemText(0) == "默认（12306：学生票）"
+    assert editor.rows["学生甲"].itemText(0) == "12306默认（学生）"
     assert editor.values() == {"学生甲": "adult"}
 
 
 @pytest.mark.parametrize("category, expected", [
-    ("1", "默认（12306：成人票）"), ("3", "默认（12306：学生票）"),
-    ("2", "默认（按12306乘客信息）"), ("", "默认（按12306乘客信息）"),
+    ("1", "12306默认（成人）"), ("3", "12306默认（学生）"),
+    ("2", "12306默认"), ("", "12306默认"),
 ])
 def test_ticket_type_default_label_shared_by_editor_and_confirmation(category, expected):
     assert default_ticket_label("乘车人", {"乘车人": category}) == expected
@@ -290,8 +298,11 @@ def test_confirmation_summary_fits_all_lines_and_last_line_can_be_scrolled_into_
         main_window._go_to_step(2)
         qtbot.wait(100)
         label = main_window.confirm_summary
-        assert "停止时间" in label.text()
-        assert label.text().count("\n") >= 10
+        assert "停止：" in label.text()
+        assert label.text().count("\n") == 2
+        assert main_window.confirm_cart.items() == main_window.cart_items
+        for entry in main_window.cart_items:
+            assert entry["seat_type"] in main_window.confirm_cart.text()
         required_height = label.heightForWidth(label.width())
         assert label.height() >= required_height, (
             f"summary is clipped: {label.width()}x{label.height()}, needs {required_height}"

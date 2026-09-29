@@ -13,17 +13,12 @@ def test_cli_validate_config_keeps_the_original_entry_point(tmp_path, monkeypatc
     config_path.write_text(
         "\n".join(
             (
-                'FROM_STATION = "北京南"',
-                'TO_STATION = "上海虹桥"',
                 f'TRAIN_DATE = "{future_date}"',
                 'PASSENGER_NAMES = ["张三"]',
-                f'SEAT_TYPES = ["{seat}"]',
-                'PREFERRED_TRAINS = []',
-                'ONLY_PREFERRED_TRAINS = False',
+                f'CART_ITEMS = [{{"from_station": "北京南", "to_station": "上海虹桥", "train_scope": "all", "train_code": "", "seat_type": "{seat}"}}]',
                 'START_AT = ""',
                 'STOP_AT = ""',
                 'AUTO_SUBMIT = False',
-                'CHOOSE_SEATS = ""',
             )
         ),
         encoding="utf-8",
@@ -39,13 +34,9 @@ def test_cli_keeps_passenger_redaction_terms_when_runner_raises(tmp_path, monkey
     config_path.write_text(
         "\n".join(
             (
-                'FROM_STATION = "北京南"',
-                'TO_STATION = "上海虹桥"',
                 f'TRAIN_DATE = "{future_date}"',
                 'PASSENGER_NAMES = ["张三"]',
-                'SEAT_TYPES = ["二等座"]',
-                'PREFERRED_TRAINS = []',
-                'ONLY_PREFERRED_TRAINS = False',
+                'CART_ITEMS = [{"from_station": "北京南", "to_station": "上海虹桥", "train_scope": "all", "train_code": "", "seat_type": "二等座"}]',
                 'START_AT = ""',
                 'STOP_AT = ""',
                 'AUTO_SUBMIT = False',
@@ -72,7 +63,7 @@ def test_cli_keeps_passenger_redaction_terms_when_runner_raises(tmp_path, monkey
     assert configured[-1] == ("INFO", ("张三",))
 
 
-def test_cli_rejects_empty_exact_train_list_before_initializing_runner(tmp_path, monkeypatch):
+def test_cli_rejects_removed_single_route_configuration_before_initializing_runner(tmp_path, monkeypatch):
     future_date = (date.today() + timedelta(days=1)).isoformat()
     config_path = tmp_path / "config.py"
     config_path.write_text(

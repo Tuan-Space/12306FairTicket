@@ -1,3 +1,4 @@
+from ticket_app.cart import CartItem
 import logging
 from types import SimpleNamespace
 
@@ -70,7 +71,7 @@ def make_runner(client, *, seat=None, berth=None, attempts=2):
 def candidate(label="二等座", code="O"):
     return {
         "ticket": {
-            "station_train_code": "G1",
+            "station_train_code": "G1", "query_date": "2030-01-02",
             "left_ticket": "left",
         },
         "seat_label": label,
@@ -226,16 +227,14 @@ def test_run_stops_after_first_candidate_init_dc_format_error_without_trying_sec
         max_retries=1,
         auto_submit=True,
         perf_log=False,
-        from_station="北京西",
-        to_station="郑州东",
+        cart_items=[CartItem("北京西", "郑州东", "all", "", "二等座")],
         train_date="2026-09-09",
-        seat_types=["二等座"],
     )
     runner.cancel_token = CancellationToken()
     runner.event_sink = None
     runner.clock = SimpleNamespace(sync=lambda *_args: None)
     runner.stations = SimpleNamespace(load=lambda *_args: None, code=lambda name: name)
-    runner.client = SimpleNamespace(ensure_login=lambda: None, query_tickets=lambda *_args: [])
+    runner.client = SimpleNamespace(ensure_login=lambda: None)
     runner._phase = lambda *_args, **_kwargs: None
     runner._select_passengers = lambda: []
     runner._prepare_passengers_by_seat_code = lambda _passengers: {}
@@ -244,9 +243,9 @@ def test_run_stops_after_first_candidate_init_dc_format_error_without_trying_sec
     runner._should_stop = lambda: False
     runner._current_query_interval = lambda _target: 0
     runner._sleep = lambda _seconds: None
-    first = {"ticket": {"station_train_code": "G1", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
-    second = {"ticket": {"station_train_code": "G2", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
-    runner._find_candidates = lambda _tickets: [first, second]
+    first = {"ticket": {"station_train_code": "G1", "query_date": "2030-01-02", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
+    second = {"ticket": {"station_train_code": "G2", "query_date": "2030-01-02", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"}, "seat_label": "二等座", "stock": "1"}
+    runner._round_candidates = lambda _target: iter([first, second])
     attempted: list[str] = []
 
     def fail_init_format(candidate, _prepared):
@@ -281,16 +280,13 @@ def test_check_order_format_error_does_not_queue_or_try_a_second_candidate():
 
     client = MalformedCheckClient()
     client.ensure_login = lambda: None
-    client.query_tickets = lambda *_args: []
     runner = object.__new__(TicketRunner)
     runner.cfg = SimpleNamespace(
         max_retries=1,
         auto_submit=True,
         perf_log=False,
-        from_station="北京西",
-        to_station="郑州东",
+        cart_items=[CartItem("北京西", "郑州东", "all", "", "二等座")],
         train_date="2026-09-09",
-        seat_types=["二等座"],
         seat_relation_preference=SeatRelationPreference(),
         berth_preference=BerthPreference(),
         order_wait_attempts=1,
@@ -310,18 +306,18 @@ def test_check_order_format_error_does_not_queue_or_try_a_second_candidate():
     runner._current_query_interval = lambda _target: 0
     runner._sleep = lambda _seconds: None
     first = {
-        "ticket": {"station_train_code": "G1", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"},
+        "ticket": {"station_train_code": "G1", "query_date": "2030-01-02", "start_time": "08:00", "arrive_time": "09:00", "duration": "01:00"},
         "seat_label": "二等座",
         "seat_type": "O",
         "stock": "1",
     }
     second = {
-        "ticket": {"station_train_code": "G2", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"},
+        "ticket": {"station_train_code": "G2", "query_date": "2030-01-02", "start_time": "10:00", "arrive_time": "11:00", "duration": "01:00"},
         "seat_label": "二等座",
         "seat_type": "O",
         "stock": "1",
     }
-    runner._find_candidates = lambda _tickets: [first, second]
+    runner._round_candidates = lambda _target: iter([first, second])
 
     with pytest.raises(ResponseFormatError, match="submitStatus"):
         runner._run()

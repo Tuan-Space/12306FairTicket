@@ -33,7 +33,8 @@ $requiredPaths = @(
     $specPath,
     (Join-Path $projectRoot "README.md"),
     (Join-Path $projectRoot "docs\四步订票流程操作说明.md"),
-    (Join-Path $projectRoot "docs\THIRD_PARTY_NOTICES.md")
+    (Join-Path $projectRoot "docs\THIRD_PARTY_NOTICES.md"),
+    (Join-Path $projectRoot "scripts\collect_licenses.py")
 )
 
 foreach ($requiredPath in $requiredPaths) {
@@ -92,8 +93,27 @@ try {
         throw "Frozen application smoke test failed with exit code $($smokeProcess.ExitCode)."
     }
 
-    Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $distDir -Force
-    Copy-Item -LiteralPath (Join-Path $projectRoot "docs") -Destination $distDir -Recurse -Force
+    # The executable needs only user help, its four screenshots and license notices.
+    # Developer reports, source and old preview documentation are never bundled.
+    $portableFiles = @(
+        "README.md",
+        "docs\四步订票流程操作说明.md",
+        "docs\THIRD_PARTY_NOTICES.md",
+        "docs\images\cart-trip.png",
+        "docs\images\cart-login.png",
+        "docs\images\cart-confirm.png",
+        "docs\images\cart-waiting.png"
+    )
+    foreach ($relativePath in $portableFiles) {
+        $destination = Join-Path $distDir $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $projectRoot $relativePath) -Destination $destination -Force
+    }
+
+    & $Python (Join-Path $projectRoot "scripts\collect_licenses.py") --output (Join-Path $distDir "licenses")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Runtime license collection failed."
+    }
 
     Write-Host "Windows onedir build ready: $exePath"
 }

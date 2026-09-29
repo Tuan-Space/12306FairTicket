@@ -345,7 +345,8 @@ def test_overnight_intermediate_stop_submits_query_day_and_preserves_origin_day(
     candidate = next(runner._round_candidates(None))
     ticket = candidate["ticket"]
     assert ticket["query_date"] == boarding_day.isoformat()
-    assert ticket["date"] == ticket["start_train_date"] == date.today().isoformat()
+    assert ticket["start_train_date"] == date.today().isoformat()
+    assert "date" not in ticket
     captured = []
     def post(url, *, data, timeout):
         captured.append((url.rsplit("/", 1)[-1], data))
@@ -361,7 +362,7 @@ def test_overnight_intermediate_stop_submits_query_day_and_preserves_origin_day(
     assert runner._candidate_context(candidate)["train_date"] == boarding_day.isoformat()
 
 
-def test_queue_without_server_date_uses_query_date_and_old_direct_ticket_keeps_compatibility(monkeypatch):
+def test_queue_without_server_date_uses_current_query_date(monkeypatch):
     runner, session, _clock, _events = runner_for(monkeypatch, [item()], {PAIR_A: [row()]})
     ticket = next(runner._round_candidates(None))["ticket"]
     captured = []
@@ -369,13 +370,24 @@ def test_queue_without_server_date_uses_query_date_and_old_direct_ticket_keeps_c
         captured.append(data) or SimpleNamespace(status_code=200, json=lambda: {"status": True, "data": {}}))
     assert runner.client.get_queue_count(ticket, {}, "O", "fixture-token")[0]
     assert captured[-1]["train_date"] == _format_queue_date(runner.cfg.train_date)
-    # Existing integrations construct tickets directly without query_date.
-    # Those callers' explicit date remains authoritative for compatibility.
-    ticket.pop("query_date")
-    assert runner.client.submit_order_request(ticket)[0]
-    assert captured[-1]["train_date"] == ticket["date"]
-    assert runner.client.get_queue_count(ticket, {}, "O", "fixture-token")[0]
-    assert captured[-1]["train_date"] == _format_queue_date(ticket["date"])
+
+
+@pytest.mark.parametrize("query_date", [None, "", "2030-02-30", "20300102", True, 123])
+def test_missing_or_invalid_query_date_never_uses_origin_day_or_sends_an_order(monkeypatch, query_date):
+    runner, session, _clock, _events = runner_for(monkeypatch, [item()], {PAIR_A: [row()]})
+    candidate = next(runner._round_candidates(None))
+    ticket = candidate["ticket"]
+    if query_date is None:
+        ticket.pop("query_date")
+    else:
+        ticket["query_date"] = query_date
+    ticket["date"] = "2030-01-01"  # A removed alias must never restore the origin-date fallback.
+    session.post = lambda *_args, **_kwargs: pytest.fail("Invalid query date must stop before HTTP")
+    for action in (lambda: runner.client.submit_order_request(ticket),
+                   lambda: runner.client.get_queue_count(ticket, {}, "O", "fixture-token"),
+                   lambda: runner._candidate_context(candidate)):
+        with pytest.raises(ResponseFormatError, match="乘车日期"):
+            action()
 
 
 @pytest.mark.parametrize("server_date", [None, {}, {"time": True}, {"time": "123"},

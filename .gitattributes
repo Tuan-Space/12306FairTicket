@@ -1,0 +1,3 @@
+# Keep source, packaged resources and license hashes identical after cloning.
+* text=auto eol=lf
+*.png binary

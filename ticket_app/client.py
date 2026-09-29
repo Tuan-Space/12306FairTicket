@@ -279,11 +279,6 @@ class RailwayClient:
             return True, str(payload.get("username") or "Success")
         return False, str(payload.get("result_message") or payload)
 
-    def query_tickets(self, from_code: str, to_code: str) -> List[Dict[str, Any]]:
-        # Keep the public list API for legacy callers; cart rounds need the
-        # explicit outcome so a failed route can be retried next round.
-        return self.query_tickets_result(from_code, to_code).tickets
-
     def query_tickets_result(
         self, from_code: str, to_code: str,
         before_request: Optional[Callable[[], None]] = None,
@@ -387,7 +382,6 @@ class RailwayClient:
                     "arrive_time": item(9),
                     "duration": item(10),
                     "can_buy": item(11) == "Y" or item(1) == "预订",
-                    "date": train_date,
                     "start_train_date": train_date,
                     "from_station": station_map.get(item(6), item(6)),
                     "to_station": station_map.get(item(7), item(7)),
@@ -482,8 +476,20 @@ class RailwayClient:
             raise ResponseFormatError(f"{stage} 返回的 JSON 顶层不是对象，任务已停止")
         return payload
 
+    @staticmethod
+    def _query_boarding_date(ticket: Dict[str, Any]) -> str:
+        """Require the boarding date carried by the current query result."""
+        boarding_date = ticket.get("query_date")
+        if not isinstance(boarding_date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", boarding_date):
+            raise ResponseFormatError("本次余票缺少有效查询乘车日期，任务已安全停止，请重新查询")
+        try:
+            datetime.strptime(boarding_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ResponseFormatError("本次余票查询乘车日期无效，任务已安全停止，请重新查询") from exc
+        return boarding_date
+
     def submit_order_request(self, ticket: Dict[str, Any]) -> Tuple[bool, str]:
-        boarding_date = ticket.get("query_date") or ticket["date"]
+        boarding_date = self._query_boarding_date(ticket)
         data = {
             "secretStr": ticket["secret_str"],
             "train_date": boarding_date,
@@ -595,6 +601,16 @@ class RailwayClient:
 
     def get_queue_count(self, ticket: Dict[str, Any], ticket_info: Dict[str, Any], seat_type: str, token: str) -> Tuple[bool, Any]:
         query_dto = ticket_info.get("queryLeftTicketRequestDTO") or {}
+        # A stale confirmation page must not redirect a cart candidate to a
+        # different train or boarding segment. Optional missing DTO fields still
+        # fall back to this round's query result below.
+        for key, label in (("train_no", "车次编号"), ("station_train_code", "车次"),
+                           ("from_station_telecode", "出发站"), ("to_station_telecode", "到达站")):
+            actual, expected = query_dto.get(key), ticket.get(key)
+            if actual not in (None, "") and expected not in (None, "") and actual != expected:
+                raise ResponseFormatError(
+                    f"订单页{label}与本次候选不一致，任务已安全停止；请核对 12306 订单"
+                )
         data = {
             "train_date": _format_queue_date(self._queue_boarding_date(ticket, ticket_info)),
             "train_no": query_dto.get("train_no") or ticket.get("train_no", ""),
@@ -626,7 +642,7 @@ class RailwayClient:
         start_train_date from the query row is a different field. Contexts
         without an order-date DTO retain the already submitted boarding date.
         """
-        boarding_date = ticket.get("query_date") or ticket["date"]
+        boarding_date = RailwayClient._query_boarding_date(ticket)
         order = ticket_info.get("orderRequestDTO") or {}
         if "train_date" not in order:
             return boarding_date
@@ -651,7 +667,7 @@ class RailwayClient:
         preference_payload: Optional[OrderPreferencePayload] = None,
     ) -> Tuple[bool, str]:
         if preference_payload is None:
-            # Never send an unverified legacy string without the capabilities
+            # Never send seat preferences without the capabilities
             # returned by checkOrderInfo. The runner passes an explicit payload.
             preference_payload = OrderPreferencePayload()
         data = {

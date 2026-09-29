@@ -10,7 +10,7 @@ import requests
 
 from ticket_app.client import RailwayClient
 from ticket_app.configuration import AppConfig, preference_capabilities
-from ticket_app.gui.compat import DEFAULT_VALUES, build_app_config, load_gui_settings, save_gui_settings
+from ticket_app.gui.settings import DEFAULT_VALUES, build_app_config, load_gui_settings, save_gui_settings
 from ticket_app.runner import TicketRunner
 
 
@@ -21,13 +21,17 @@ def reject_network(monkeypatch):
     monkeypatch.setattr(requests.Session, "request", reject)
 
 
-def settings(**updates):
-    values = {**DEFAULT_VALUES, "from_station": "北京西", "to_station": "郑州东",
-              "train_date": (date.today() + timedelta(days=1)).isoformat(),
-              "passenger_names": ["测试甲"], "seat_types": ["软卧", "一等卧", "硬卧", "二等卧"],
-              "preferred_trains": [], "only_preferred_trains": False, "persist_session": False}
-    values.update(updates)
-    return values
+def settings(*, seats=("软卧", "一等卧", "硬卧", "二等卧"), **updates):
+    return {**DEFAULT_VALUES,
+            "cart_items": [{"from_station": "北京西", "to_station": "郑州东", "train_scope": "all",
+                            "train_code": "", "seat_type": seat} for seat in seats],
+            "train_date": (date.today() + timedelta(days=1)).isoformat(),
+            "passenger_names": ["测试甲"], "persist_session": False, **updates}
+
+
+def seat_candidates(runner, parsed):
+    return [candidate for seat in runner.cfg.seat_types
+            if (candidate := runner._candidate_for_seat(parsed, seat)) is not None]
 
 
 def ticket(codes, train="D1", rw="有", yw="2", edz="无"):
@@ -51,17 +55,17 @@ def test_actual_codes_distinguish_shared_stock_without_prefix_guessing(codes, ex
     runner = TicketRunner(AppConfig.from_mapping(settings()))
     parsed = ticket(codes, train)
     assert parsed["seat_types"] == codes
-    candidates = runner._find_candidates([parsed])
+    candidates = seat_candidates(runner, parsed)
     assert [(item["seat_label"], item["seat_type"]) for item in candidates] == expected
 
 
 @pytest.mark.parametrize("codes,warnings", [("", 2), ("4I3J", 2), ("4I", 1), ("3J", 1)])
 def test_ambiguous_shared_columns_are_skipped_with_deduplicated_logs(codes, warnings, caplog):
-    runner = TicketRunner(AppConfig.from_mapping(settings(seat_types=["软卧", "一等卧", "硬卧", "二等卧", "二等座"])))
+    runner = TicketRunner(AppConfig.from_mapping(settings(seats=["软卧", "一等卧", "硬卧", "二等卧", "二等座"])))
     parsed = ticket(codes, edz="有")
     with caplog.at_level(logging.WARNING):
         for _ in range(3):
-            candidates = runner._find_candidates([parsed])
+            candidates = seat_candidates(runner, parsed)
             assert [item["seat_label"] for item in candidates] == ["二等座"]
     assert len(caplog.records) == warnings
     assert "无法区分实际席别" in caplog.text
@@ -72,18 +76,8 @@ def test_short_query_row_and_empty_stock_do_not_create_sleeper_candidates(caplog
     parsed = RailwayClient._parse_tickets(["|".join([""] * 35)], {})[0]
     assert parsed["seat_types"] == ""
     runner = TicketRunner(AppConfig.from_mapping(settings()))
-    assert runner._find_candidates([ticket("IJ", rw="0", yw="无")]) == []
+    assert seat_candidates(runner, ticket("IJ", rw="0", yw="无")) == []
     assert not caplog.records
-
-
-@pytest.mark.parametrize("strategy,expected", [
-    ("train_first", [("D2", "J"), ("D2", "I"), ("D1", "J"), ("D1", "I")]),
-    ("seat_first", [("D2", "J"), ("D1", "J"), ("D2", "I"), ("D1", "I")]),
-])
-def test_new_sleeper_candidates_preserve_both_priority_strategies(strategy, expected):
-    cfg = AppConfig.from_mapping(settings(seat_types=["二等卧", "一等卧"], preferred_trains=["D2", "D1"], priority_strategy=strategy))
-    candidates = TicketRunner(cfg)._find_candidates([ticket("IJ", "D1"), ticket("IJ", "D2")])
-    assert [(item["ticket"]["station_train_code"], item["seat_type"]) for item in candidates] == expected
 
 
 @pytest.mark.parametrize("label,code", [("一等卧", "I"), ("二等卧", "J")])
@@ -94,7 +88,7 @@ def test_new_sleeper_candidates_preserve_both_priority_strategies(strategy, expe
 def test_parse_to_order_sends_exact_code_and_capability_checked_berths(
     monkeypatch, label, code, beds, middle, requested_middle, detail
 ):
-    cfg = AppConfig.from_mapping(settings(seat_types=[label], stop_at="", berth_preference={"lower": 1-requested_middle, "middle": requested_middle}))
+    cfg = AppConfig.from_mapping(settings(seats=[label], stop_at="", berth_preference={"lower": 1-requested_middle, "middle": requested_middle}))
     runner = TicketRunner(cfg)
     calls = {}
     def post(url, data, **kwargs):
@@ -112,7 +106,9 @@ def test_parse_to_order_sends_exact_code_and_capability_checked_berths(
     monkeypatch.setattr(runner.client, "query_order_wait_time", lambda _token: (True, {"orderId": "test-order"}))
     passenger = {"passenger_name": "测试甲", "passenger_id_no": "test-id", "passenger_id_type_code": "1"}
     prepared = runner._prepare_passengers_by_seat_code([passenger])
-    selected = runner._find_candidates([ticket(code)])[0]
+    parsed = ticket(code)
+    parsed["query_date"] = cfg.train_date
+    selected = seat_candidates(runner, parsed)[0]
     assert runner._book_ticket(selected, prepared)
     assert calls["getQueueCount"]["seatType"] == code
     for endpoint in ("checkOrderInfo", "confirmSingleForQueue"):
@@ -124,14 +120,13 @@ def test_parse_to_order_sends_exact_code_and_capability_checked_berths(
 
 @pytest.mark.parametrize("seats", [["一等卧"], ["二等卧"], ["二等卧", "软卧", "一等卧", "硬卧"]])
 def test_gui_json_and_cli_config_accept_exact_new_labels(tmp_path, seats):
-    values = settings(seat_types=seats, berth_preference={"lower": 1})
+    values = settings(seats=seats, berth_preference={"lower": 1})
     path = tmp_path / "settings.json"
     save_gui_settings(path, values)
     assert json.loads(path.read_text(encoding="utf-8"))["version"] == 5
     loaded = load_gui_settings(path)
-    assert loaded["seat_types"] == seats
     assert build_app_config(loaded).seat_types == seats
-    assert AppConfig.from_mapping({**values, "SEAT_TYPES": seats}).seat_types == seats
+    assert AppConfig.from_mapping(values).seat_types == seats
     assert preference_capabilities(seats) == (False, True)
     inactive = {**loaded, "cart_items": [{**loaded["cart_items"][0], "seat_type": "硬座"}],
                 "passenger_names": ["甲", "乙"]}

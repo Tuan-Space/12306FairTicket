@@ -9,12 +9,12 @@ models retry-by-cancelling/rebooking behaviour.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, FrozenSet, Iterable, Mapping, Optional, Tuple
+from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
 
 SEAT_LETTER_ORDER = "ABCDF"
 SEAT_POSITION_PATTERN = re.compile(r"[12][ABCDF]")
-CHOOSE_SEATS_PATTERN = re.compile(r"(?:[12][ABCDF])+")
+ORDER_SEAT_POSITIONS_PATTERN = re.compile(r"(?:[12][ABCDF])+")
 
 # Current passengerInfo_js layout branches.  Q/M/D share the first-class
 # template, O uses the second-class template, and P uses the special-class
@@ -78,35 +78,23 @@ def _position_sort_key(position: str) -> Tuple[int, int]:
 
 def _normalize_position(value: Any) -> str:
     text = str(value or "").strip().upper()
-    if len(text) == 1 and text in SEAT_LETTER_ORDER:
-        text = "1" + text
     if not SEAT_POSITION_PATTERN.fullmatch(text):
         raise ValueError("无效座位关系格子 %r；应为 1A..1F 或 2A..2F" % text)
     return text
 
 
 def _parse_positions(value: Any) -> Tuple[str, ...]:
-    if value is None or value == "":
+    if value is None:
         return ()
     if isinstance(value, SeatRelationPreference):
         return value.positions
     if isinstance(value, Mapping):
-        for key in ("positions", "seat_positions", "selected_positions"):
-            if key in value:
-                return _parse_positions(value[key])
-        raise ValueError("座位偏好对象必须包含 positions")
-    if isinstance(value, str):
-        compact = re.sub(r"[\s,;|]+", "", value).upper()
-        if not compact:
-            return ()
-        if CHOOSE_SEATS_PATTERN.fullmatch(compact):
-            return tuple(_normalize_position(item) for item in re.findall(r"[12][ABCDF]", compact))
-        if re.fullmatch(r"[ABCDF]+", compact):
-            return tuple("1" + letter for letter in compact)
-        raise ValueError("无效 CHOOSE_SEATS/座位关系偏好: %r" % value)
-    if isinstance(value, Iterable):
+        if "positions" not in value:
+            raise ValueError("座位偏好对象必须包含 positions")
+        return _parse_positions(value["positions"])
+    if isinstance(value, (list, tuple)):
         return tuple(_normalize_position(item) for item in value)
-    return (_normalize_position(value),)
+    raise ValueError("座位偏好必须是位置列表，例如 ['1A', '1F']")
 
 
 @dataclass(frozen=True)
@@ -279,14 +267,6 @@ class OrderCapabilities:
             middle_status=middle_status,
         )
 
-    @property
-    def choose_seats(self) -> str:
-        return "".join(sorted(self.allowed_seat_types))
-
-    @property
-    def can_choose_mid(self) -> bool:
-        return self.can_choose_middle
-
     def berth_unavailable_message(self) -> str:
         if self.bed_status == "Z":
             return "选铺服务需先在铁路12306 App完成人证核验或注册常旅客会员"
@@ -301,15 +281,6 @@ class OrderCheckResult:
     message: str
     capabilities: OrderCapabilities = field(default_factory=OrderCapabilities)
 
-    @property
-    def ok(self) -> bool:
-        return self.success
-
-    def __iter__(self):
-        """Keep existing ``ok, message = check_order_info(...)`` callers working."""
-
-        yield self.success
-        yield self.message
 
 
 @dataclass(frozen=True)
@@ -322,7 +293,7 @@ class OrderPreferencePayload:
     def __post_init__(self) -> None:
         choose_seats = str(self.choose_seats or "").strip().upper()
         seat_detail_type = str(self.seat_detail_type or "000").strip()
-        if choose_seats and not CHOOSE_SEATS_PATTERN.fullmatch(choose_seats):
+        if choose_seats and not ORDER_SEAT_POSITIONS_PATTERN.fullmatch(choose_seats):
             raise ValueError("choose_seats 必须由 1A/2F 形式的关系格子连接组成")
         if not re.fullmatch(r"[0-5]{3}", seat_detail_type):
             raise ValueError("seatDetailType 必须是下/中/上三个 0-5 数字")
@@ -331,10 +302,6 @@ class OrderPreferencePayload:
         object.__setattr__(self, "choose_seats", choose_seats)
         object.__setattr__(self, "seat_detail_type", seat_detail_type)
         object.__setattr__(self, "warnings", tuple(str(item) for item in self.warnings if str(item)))
-
-    @property
-    def seatDetailType(self) -> str:  # noqa: N802 - mirrors the upstream field
-        return self.seat_detail_type
 
     def to_form_fields(self) -> Mapping[str, str]:
         return {"choose_seats": self.choose_seats, "seatDetailType": self.seat_detail_type, "is_jy": self.is_jy}

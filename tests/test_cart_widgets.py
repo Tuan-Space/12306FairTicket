@@ -59,17 +59,20 @@ def test_items_are_isolated_settings_and_reject_is_non_destructive(qtbot):
     assert "secret_str" not in other.items()[0]
 
 
-def test_mouse_moves_all_rows_without_dropping_or_copying(cart_dialog, qtbot):
+def test_mouse_selection_then_keyboard_moves_all_rows_without_dropping_or_copying(cart_dialog, qtbot):
     expected = cart_dialog.items()
+    cart_dialog.activateWindow()
+    qtbot.wait(10)
     for offset in range(2):
         rect = cart_dialog.list.visualItemRect(cart_dialog.list.item(offset))
         assert rect.width() > 200
         qtbot.mouseClick(cart_dialog.list.viewport(), Qt.MouseButton.LeftButton, pos=rect.center())
-        qtbot.mouseClick(cart_dialog.down_button, Qt.MouseButton.LeftButton)
+        qtbot.keyClick(cart_dialog.list, Qt.Key.Key_Down, Qt.KeyboardModifier.AltModifier)
     assert cart_dialog.items() == [expected[1], expected[2], expected[0]]
     assert [cart_dialog.list.item(i).text()[0] for i in range(3)] == ["1", "2", "3"]
-    assert not cart_dialog.down_button.isEnabled()
-    qtbot.mouseClick(cart_dialog.up_button, Qt.MouseButton.LeftButton)
+    qtbot.keyClick(cart_dialog.list, Qt.Key.Key_Down, Qt.KeyboardModifier.AltModifier)
+    assert cart_dialog.items() == [expected[1], expected[2], expected[0]]
+    qtbot.keyClick(cart_dialog.list, Qt.Key.Key_Up, Qt.KeyboardModifier.AltModifier)
     assert cart_dialog.items() == [expected[1], expected[0], expected[2]]
 
 
@@ -140,7 +143,7 @@ def test_mouse_drag_preserves_rows_and_priority_numbers(
 def test_edit_only_selected_item_and_explicit_any_train(cart_dialog, qtbot):
     before = cart_dialog.items()
     cart_dialog.list.setCurrentRow(1)
-    qtbot.mouseClick(cart_dialog.edit_button, Qt.MouseButton.LeftButton)
+    qtbot.mouseClick(cart_dialog.list.action_button(1, "edit"), Qt.MouseButton.LeftButton)
     cart_dialog.from_station.setText("北京")
     cart_dialog.to_station.setText("上海")
     cart_dialog.seat_type.setCurrentText("一等卧")
@@ -197,7 +200,7 @@ def test_unfinished_editor_requires_save_or_discard(cart_dialog):
 
 def test_readonly_blocks_all_mutation_paths(qtbot):
     original = [_entry(), _entry("G102", "一等座")]
-    dialog = CartDialog(original, read_only=True, migration_warnings=["请检查旧配置的尝试顺序。"])
+    dialog = CartDialog(original, read_only=True)
     qtbot.addWidget(dialog)
     dialog.show()
     dialog.move_current(1)
@@ -207,8 +210,8 @@ def test_readonly_blocks_all_mutation_paths(qtbot):
     qtbot.keyClick(dialog.list, Qt.Key.Key_Enter)
     assert dialog.items() == original
     assert not dialog.editor.isVisible()
-    assert not dialog.edit_button.isVisible()
-    assert "旧配置" in dialog.migration_notice.text()
+    assert dialog.list.action_button(0, "edit") is None
+    assert not hasattr(dialog, "migration_notice")
 
 
 def test_can_remove_last_item_then_return_to_add(qtbot):
@@ -217,6 +220,6 @@ def test_can_remove_last_item_then_return_to_add(qtbot):
     dialog.remove_current()
     assert not dialog.items()
     assert "购物车为空" in dialog.summary.text()
-    assert not dialog.edit_button.isEnabled()
+    assert dialog.list.action_button(0, "edit") is None
     dialog.accept()
     assert dialog.result() == QDialog.DialogCode.Accepted

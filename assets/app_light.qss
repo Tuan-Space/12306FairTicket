@@ -18,6 +18,10 @@ QLabel#privacyBadge, QLabel#phaseBadge {
     color: #1769c2;
 }
 
+QLabel#phaseBadge[phaseState="success"] { color: #14764d; border-color: #a6d5ba; background: #eef9f2; }
+QLabel#phaseBadge[phaseState="unknown"] { color: #925d00; border-color: #dfc587; background: #fff8e6; }
+QLabel#phaseBadge[phaseState="failed"] { color: #b82e41; border-color: #ecc0c7; background: #fff0f2; }
+
 QFrame#profileBar, QFrame#card {
     background: #ffffff;
     border-color: #dce4f0;
@@ -204,7 +208,7 @@ QTabBar::tab { color: #687792; }
 QTabBar::tab:selected { color: #1d3352; border-bottom-color: #317fdc; }
 QTabBar::tab:hover:!selected { color: #344a67; }
 
-QListWidget#timeline, QListWidget#cartPriorityList {
+QListWidget#cartPriorityList {
     color: #34435d;
     background: #f8fafd;
     border-color: #d4deea;
@@ -214,21 +218,6 @@ QListWidget#cartPriorityList::item:selected {
     color: #194f8e;
     background: #dcecff;
 }
-
-QListWidget#timeline::item { border-left-color: #d6dfeb; }
-
-QFrame#currentPhase {
-    background: #f8fafd;
-    border-color: #d4deea;
-}
-
-QLabel#currentPhaseIcon { color: #78879b; }
-QLabel#currentPhaseIcon[phaseState="active"] { color: #2878d2; }
-QLabel#currentPhaseIcon[phaseState="success"] { color: #19895f; }
-QLabel#currentPhaseIcon[phaseState="failed"] { color: #ca3a50; }
-QLabel#currentPhaseIcon[phaseState="stopped"] { color: #b57925; }
-QLabel#currentPhaseTitle { color: #2b3c56; }
-QLabel#currentPhaseMessage { color: #697992; }
 
 QTextEdit#logView {
     color: #273852;
@@ -245,3 +234,17 @@ QToolTip {
     background: #ffffff;
     border-color: #bcc9da;
 }
+
+QLineEdit > QToolButton, QLineEdit > QToolButton:hover,
+QLineEdit > QToolButton:pressed, QLineEdit > QToolButton:disabled {
+    background: transparent;
+    border: 0;
+}
+
+QToolButton#seatGroupToggle { color: #26344d; background: transparent; }
+QToolButton#seatGroupToggle:hover { background: #edf3fc; }
+QCheckBox#seatChoice { background: #ffffff; border-color: #c9d6e8; }
+QCheckBox#seatChoice:hover { border-color: #97b1d5; }
+QCheckBox#seatChoice:checked { background: #edf5ff; border-color: #347ff0; color: #175dad; }
+QCheckBox#seatChoice:focus { border-color: #347ff0; }
+QCheckBox#seatChoice:disabled { color: #8793a7; }

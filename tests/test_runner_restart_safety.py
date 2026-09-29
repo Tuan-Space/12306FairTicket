@@ -1,3 +1,4 @@
+from ticket_app.cart import CartItem
 """Offline cancellation, order disposition, and fixed deadline regressions."""
 
 from datetime import datetime, timedelta
@@ -106,7 +107,7 @@ def booking_runner():
 
 def book(runner):
     return runner._book_ticket({
-        "ticket": {"station_train_code": "G1", "left_ticket": "mock-left"},
+        "ticket": {"station_train_code": "G1", "query_date": "2030-01-02", "left_ticket": "mock-left"},
         "seat_label": "二等座", "seat_type": "O", "found_perf": None,
     }, {"O": PreparedPassengerSet([{}], "mock-passenger", "mock-old")})
 
@@ -259,20 +260,19 @@ def full_runner(*, now=NOW, stop_at="", start_at=""):
     runner.cfg = SimpleNamespace(
         stop_at=stop_at, start_at=start_at, auto_submit=False, pre_query_seconds=2,
         query_interval_seconds=1, hot_query_interval_seconds=1, hot_window_seconds=5,
-        max_retries=2, from_station="北京西", to_station="郑州东", train_date="2030-01-03",
-        seat_types=["二等座"], preferred_trains=[], perf_log=False,
+        max_retries=2, cart_items=[CartItem("北京西", "郑州东", "all", "", "二等座")],
+        train_date="2030-01-03", perf_log=False,
     )
-    runner.seat_sequence = []
-    runner.preferred_order = {}
     runner.client.ensure_login = lambda **_kwargs: None
     runner.client.check_session = lambda: True
     runner.client.query_calls = 0
 
-    def query(*_args):
+    def query(*_args, before_request):
+        before_request()
         runner.client.query_calls += 1
-        return []
+        return SimpleNamespace(success=True, tickets=[])
 
-    runner.client.query_tickets = query
+    runner.client.query_tickets_result = query
     runner.stations = SimpleNamespace(load=lambda *_args: None, code=lambda name: name)
     return runner
 

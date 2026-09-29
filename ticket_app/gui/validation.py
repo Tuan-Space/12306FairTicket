@@ -11,7 +11,7 @@ import re
 from datetime import date, datetime
 from typing import Any, Iterable, Mapping
 
-from ticket_app.cart import cart_migration_messages, cart_seat_types, normalize_cart_items, validate_cart_items
+from ticket_app.cart import cart_seat_types, normalize_cart_items, validate_cart_items
 from ticket_app.configuration import SEAT_SPECS, preference_capabilities
 from ticket_app.input_parsing import split_multi_value_text
 from ticket_app.passengers import normalize_passenger_ticket_types
@@ -21,20 +21,18 @@ from ticket_app.preferences import (
     seat_layout_positions,
 )
 
-from .compat import DEFAULT_VALUES
-from ticket_app.train_policy import TRAIN_CODE_PATTERN, validate_train_policy
+from .settings import DEFAULT_VALUES
 
 
 VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
 def _field_value(values: Mapping[str, Any], key: str) -> Any:
-    """Read canonical or legacy uppercase names without accepting unknowns."""
+    """Read current snake-case or uppercase setting names."""
 
     if key in values:
         return values[key]
-    legacy_key = key.upper()
-    return values.get(legacy_key, DEFAULT_VALUES[key])
+    return values.get(key.upper(), DEFAULT_VALUES[key])
 
 
 def _string_list(value: Any) -> list[str]:
@@ -95,32 +93,14 @@ def validate_gui_mapping(
     today = today or date.today()
     known_stations = {str(name).strip() for name in station_names if str(name).strip()}
 
-    raw_cart = _field_value(values, "cart_items")
-    cart_mode = raw_cart is not None
     cart_items = []
-    if cart_mode:
-        try:
-            cart_items = normalize_cart_items(raw_cart)
-            cart_errors = validate_cart_items(cart_items, SEAT_SPECS, known_stations)
-            _, migration_issues = cart_migration_messages(_field_value(values, "cart_migration"))
-            cart_errors.extend(migration_issues)
-            if cart_errors:
-                errors["cart_items"] = "\n".join(cart_errors)
-        except ValueError as exc:
-            errors["cart_items"] = str(exc)
-    else:
-        from_station = str(_field_value(values, "from_station") or "").strip()
-        to_station = str(_field_value(values, "to_station") or "").strip()
-        if not from_station:
-            errors["from_station"] = "请输入出发站"
-        elif from_station not in known_stations:
-            errors["from_station"] = "出发站不在当前站点列表中，请选择标准站名"
-        if not to_station:
-            errors["to_station"] = "请输入到达站"
-        elif to_station not in known_stations:
-            errors["to_station"] = "到达站不在当前站点列表中，请选择标准站名"
-        if from_station and to_station and from_station == to_station:
-            errors["to_station"] = "到达站不能与出发站相同"
+    try:
+        cart_items = normalize_cart_items(_field_value(values, "cart_items"))
+        cart_errors = validate_cart_items(cart_items, SEAT_SPECS, known_stations)
+        if cart_errors:
+            errors["cart_items"] = "\n".join(cart_errors)
+    except ValueError as exc:
+        errors["cart_items"] = str(exc)
 
     raw_date = str(_field_value(values, "train_date") or "").strip()
     try:
@@ -163,28 +143,9 @@ def validate_gui_mapping(
     if not isinstance(_field_value(values, "quiet_carriage_preference"), bool):
         errors["quiet_carriage_preference"] = "静音车厢偏好必须是开关值"
 
-    if cart_mode:
-        seat_types = cart_seat_types(cart_items)
-    else:
-        preferred = _string_list(_field_value(values, "preferred_trains"))
-        errors.update(validate_train_policy(
-            preferred, bool(_field_value(values, "only_preferred_trains")),
-            "all", _field_value(values, "priority_strategy"),
-        ))
-        seat_types = _string_list(_field_value(values, "seat_types"))
-        invalid_seats = [seat for seat in seat_types if seat not in SEAT_SPECS]
-        if not seat_types:
-            errors["seat_types"] = "请至少选择一种席别"
-        elif invalid_seats:
-            errors["seat_types"] = f"不支持的席别：{'、'.join(invalid_seats)}"
+    seat_types = cart_seat_types(cart_items)
     has_seats, has_berths = preference_capabilities(seat_types)
-
-    if "seat_position_preferences" in values:
-        raw_positions = values["seat_position_preferences"]
-    elif "SEAT_POSITION_PREFERENCES" in values:
-        raw_positions = values["SEAT_POSITION_PREFERENCES"]
-    else:
-        raw_positions = _field_value(values, "choose_seats")
+    raw_positions = _field_value(values, "seat_position_preferences")
     try:
         positions = SeatRelationPreference.from_value(raw_positions)
     except ValueError as exc:

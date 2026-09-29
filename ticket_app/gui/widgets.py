@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
-from PySide6.QtCore import QDate, Qt, Signal
-from PySide6.QtGui import QTextCursor, QWheelEvent
+from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QSize, Qt, Signal
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,6 +27,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QStyle,
+    QStyleOptionSpinBox,
     QTabBar,
     QTabWidget,
     QTextEdit,
@@ -102,17 +105,8 @@ class CleanSpinBox(QSpinBox):
         set_validation_state(self, state, message)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
-        """Do not let a passing mouse wheel silently change a number.
-
-        Ignoring an unfocused wheel event lets the containing scroll area use
-        it for page scrolling.  Once a user has explicitly focused a field,
-        Qt's normal keyboard-and-wheel adjustment remains available.
-        """
-
-        if self.hasFocus():
-            super().wheelEvent(event)
-        else:
-            event.ignore()
+        """Keep scrolling the page even when the number currently has focus."""
+        event.ignore()
 
 
 class CleanDoubleSpinBox(QDoubleSpinBox):
@@ -126,10 +120,7 @@ class CleanDoubleSpinBox(QDoubleSpinBox):
         set_validation_state(self, state, message)
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt API
-        if self.hasFocus():
-            super().wheelEvent(event)
-        else:
-            event.ignore()
+        event.ignore()
 
 
 class HelpLabel(QWidget):
@@ -162,6 +153,50 @@ class HelpLabel(QWidget):
         self.label.setText(text)
 
 
+class HelpDetails(QWidget):
+    """A brief heading with keyboard-accessible, initially folded details."""
+
+    def __init__(self, title: str, details: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        self.heading = QLabel(title)
+        self.heading.setObjectName("muted")
+        self.heading.setTextFormat(Qt.TextFormat.PlainText)
+        self.heading.setWordWrap(False)
+        row.addWidget(self.heading)
+        self.button = QToolButton()
+        self.button.setObjectName("helpButton")
+        self.button.setText("?")
+        self.button.setCheckable(True)
+        self.button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.button.setFixedSize(20, 20)
+        self.button.setAccessibleName(f"{title}说明")
+        self.button.setToolTip("展开说明")
+        row.addWidget(self.button)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.details_label = QLabel()
+        self.details_label.setObjectName("muted")
+        self.details_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.details_label.setWordWrap(True)
+        layout.addWidget(self.details_label)
+        self.set_details(details)
+        self.details_label.hide()
+        self.button.toggled.connect(self._set_expanded)
+
+    def set_details(self, details: str) -> None:
+        self.details_label.setText(str(details))
+        self.button.setAccessibleDescription(str(details))
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.details_label.setVisible(expanded)
+        self.button.setToolTip("收起说明" if expanded else "展开说明")
+
+
 class DatePickerWidget(QDateEdit):
     """Read-only date text with a calendar popup and no past dates."""
 
@@ -174,10 +209,11 @@ class DatePickerWidget(QDateEdit):
         self.setCalendarPopup(True)
         self.setMinimumDate(QDate.currentDate())
         self.setDate(QDate.currentDate())
-        self.setToolTip("点击右侧日历按钮选择乘车日期；不能选择过去的日期")
+        self.setToolTip("点击日期框选择乘车日期；不能选择过去的日期")
         if self.lineEdit() is not None:
             # Keep the popup active while preventing ambiguous hand-typed dates.
             self.lineEdit().setReadOnly(True)
+            self.lineEdit().installEventFilter(self)
         # A dedicated object name keeps the calendar navigation neutral in
         # both application palettes instead of inheriting the platform blue.
         self.calendarWidget().setObjectName("dateCalendar")
@@ -189,8 +225,58 @@ class DatePickerWidget(QDateEdit):
         )
         self.dateChanged.connect(lambda _date: self.changed.emit())
 
+    def _open_calendar(self) -> None:
+        if self.isEnabled() and not self.calendarWidget().isVisible():
+            # QDateEdit has no public showPopup method. Delegate to its real
+            # arrow hit target so Qt still owns positioning, Escape and dates.
+            option = QStyleOptionSpinBox()
+            self.initStyleOption(option)
+            arrow = self.style().subControlRect(
+                QStyle.ComplexControl.CC_SpinBox, option,
+                QStyle.SubControl.SC_SpinBoxDown, self,
+            )
+            point = arrow.center()
+            event = QMouseEvent(
+                QEvent.Type.MouseButtonPress, QPointF(point), QPointF(self.mapToGlobal(point)),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+            )
+            super().mousePressEvent(event)
+            release = QMouseEvent(
+                QEvent.Type.MouseButtonRelease, QPointF(point), QPointF(self.mapToGlobal(point)),
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+            )
+            super().mouseReleaseEvent(release)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
+        if watched is self.lineEdit() and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._open_calendar()
+                return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt API
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_calendar()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt API
+        if event.key() == Qt.Key.Key_F4 or (
+            event.key() == Qt.Key.Key_Down and event.modifiers() & Qt.KeyboardModifier.AltModifier
+        ):
+            self._open_calendar()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def set_validation(self, state: str = "", message: str = "") -> None:
         set_validation_state(self, state, message)
+
+
+class _TimePartSpinBox(CleanSpinBox):
+    def textFromValue(self, value: int) -> str:  # noqa: N802 - Qt API
+        return f"{value:02d}"
 
 
 class TimeFieldsWidget(QWidget):
@@ -208,19 +294,20 @@ class TimeFieldsWidget(QWidget):
         super().__init__(parent)
         self.setObjectName("timeFields")
         self.optional = bool(optional)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(4, 3, 4, 3)
-        row.setSpacing(6)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(8)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        column.addLayout(row)
 
         self.hour = self._part(0, 23, "时")
         self.minute = self._part(0, 59, "分")
         self.second = self._part(0, 59, "秒")
         self.parts = (self.hour, self.minute, self.second)
-        for index, (part, suffix) in enumerate(zip(self.parts, ("时", "分", "秒"))):
+        for index, part in enumerate(self.parts):
             row.addWidget(part)
-            label = QLabel(suffix)
-            label.setObjectName("timeUnit")
-            row.addWidget(label)
             if index < 2:
                 separator = QLabel(":")
                 separator.setObjectName("timeSeparator")
@@ -231,17 +318,17 @@ class TimeFieldsWidget(QWidget):
             self.optional_checkbox = QCheckBox(disabled_label)
             self.optional_checkbox.setObjectName("timeDisabledToggle")
             self.optional_checkbox.toggled.connect(self._on_disabled_toggled)
-            row.addSpacing(5)
-            row.addWidget(self.optional_checkbox)
+            column.addWidget(self.optional_checkbox, 0, Qt.AlignmentFlag.AlignLeft)
         row.addStretch(1)
 
     def _part(self, minimum: int, maximum: int, accessible_name: str) -> CleanSpinBox:
-        part = CleanSpinBox()
+        part = _TimePartSpinBox()
         part.setObjectName("timePart")
         part.setRange(minimum, maximum)
         part.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        part.setFixedWidth(48)
+        part.setFixedWidth(44)
         part.setMinimumHeight(34)
+        part.setStyleSheet("QSpinBox#timePart { padding-left: 2px; padding-right: 2px; }")
         part.setAccessibleName(accessible_name)
         part.setWrapping(False)
         part.valueChanged.connect(lambda _value: self.changed.emit())
@@ -336,6 +423,101 @@ class Card(QFrame):
             self.body.addWidget(subtitle_label)
 
 
+class _SeatChoiceBox(QCheckBox):
+    """The whole seat cell is one checkbox hit target, including whitespace."""
+
+    def hitButton(self, position: QPoint) -> bool:  # noqa: N802 - Qt API
+        return self.rect().contains(position)
+
+
+class OrderedSeatSelector(QWidget):
+    """Grouped choices whose selection order is the order of user clicks."""
+
+    changed = Signal()
+    SEAT_GROUPS = (
+        ("坐席", ("商务座", "特等座", "一等座", "二等座", "软座", "硬座", "无座")),
+        ("卧铺", ("高级软卧", "软卧", "硬卧", "一等卧", "二等卧")),
+    )
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("orderedSeatSelector")
+        self._selected: List[str] = []
+        self.checkboxes: Dict[str, QCheckBox] = {}
+        self.groups: Dict[str, QWidget] = {}
+        self.group_toggles: Dict[str, QToolButton] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        for name, labels in self.SEAT_GROUPS:
+            toggle = QToolButton()
+            toggle.setObjectName("seatGroupToggle")
+            toggle.setText(name)
+            toggle.setCheckable(True)
+            toggle.setChecked(True)
+            toggle.setArrowType(Qt.ArrowType.DownArrow)
+            toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            toggle.setAccessibleName(f"展开或收起{name}")
+            layout.addWidget(toggle)
+            group = QWidget()
+            grid = QGridLayout(group)
+            grid.setContentsMargins(0, 0, 0, 4)
+            grid.setHorizontalSpacing(8)
+            grid.setVerticalSpacing(8)
+            for index, label in enumerate(labels):
+                checkbox = _SeatChoiceBox(label)
+                checkbox.setObjectName("seatChoice")
+                checkbox.setAccessibleName(label)
+                checkbox.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                checkbox.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                checkbox.toggled.connect(lambda checked, seat=label: self._toggle(seat, checked))
+                self.checkboxes[label] = checkbox
+                grid.addWidget(checkbox, index // 3, index % 3)
+            for column in range(3):
+                grid.setColumnStretch(column, 1)
+            toggle.toggled.connect(lambda expanded, content=group, button=toggle: self._expand_group(content, button, expanded))
+            self.groups[name] = group
+            self.group_toggles[name] = toggle
+            layout.addWidget(group)
+
+    @staticmethod
+    def _expand_group(group: QWidget, button: QToolButton, expanded: bool) -> None:
+        group.setVisible(expanded)
+        button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    def _toggle(self, seat: str, checked: bool) -> None:
+        if checked and seat not in self._selected:
+            self._selected.append(seat)
+        elif not checked and seat in self._selected:
+            self._selected.remove(seat)
+        self._refresh()
+        self.changed.emit()
+
+    def _refresh(self) -> None:
+        ranks = {seat: index for index, seat in enumerate(self._selected, 1)}
+        for seat, checkbox in self.checkboxes.items():
+            rank = ranks.get(seat)
+            checkbox.blockSignals(True)
+            checkbox.setChecked(rank is not None)
+            checkbox.setText(f"{rank} · {seat}" if rank else seat)
+            checkbox.setAccessibleDescription(f"第 {rank} 个加入" if rank else "未选择")
+            checkbox.blockSignals(False)
+
+    def selected_seats(self) -> List[str]:
+        return list(self._selected)
+
+    def set_selected_seats(self, seats: Iterable[str]) -> None:
+        selected: List[str] = []
+        for seat in seats:
+            if seat in self.checkboxes and seat not in selected:
+                selected.append(seat)
+        if self._selected != selected:
+            self._selected = selected
+            self._refresh()
+            self.changed.emit()
+
+
 
 
 
@@ -363,10 +545,11 @@ class SeatMapWidget(QWidget):
 
         self.guide = QLabel(
             "选中与乘车人数相同的格子。“前排/后排”仅表示同一订单的两排相对关系，"
-            "不代表行驶方向、车厢位置或真实排号。"
+            "不代表行驶方向、车厢位置或真实排号。无法满足时，接受 12306 在该席别内自动分配。"
         )
         self.guide.setObjectName("muted")
         self.guide.setWordWrap(True)
+        self.guide.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.guide)
 
         self.inactive_hint = QLabel("座位偏好未启用：请先选择商务座、特等座、一等座或二等座。")
@@ -403,25 +586,18 @@ class SeatMapWidget(QWidget):
             seat_row.addWidget(right_window)
             grid_layout.addLayout(seat_row)
 
-        self.availability_note = QLabel()
-        self.availability_note.setObjectName("muted")
-        self.availability_note.setWordWrap(True)
-        layout.addWidget(self.availability_note)
         self.saved_summary = QLabel()
         self.saved_summary.setObjectName("muted")
         self.saved_summary.setWordWrap(True)
-        layout.addWidget(self.saved_summary)
+        saved_row = QHBoxLayout()
+        saved_row.addWidget(self.saved_summary, 1)
         self.clear_button = QPushButton("清空座位偏好")
         self.clear_button.setEnabled(False)
         self.clear_button.clicked.connect(lambda: self.set_positions(()))
-        layout.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignRight)
+        saved_row.addWidget(self.clear_button, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(saved_row)
         self._available_positions = set(self.buttons)
 
-        self.fallback = QCheckBox("偏好无法满足时，接受 12306 自动分配")
-        self.fallback.setChecked(True)
-        self.fallback.setEnabled(False)
-        self.fallback.setToolTip("平台在确认前无法可靠判断具体座位，因此固定保留降级策略")
-        layout.addWidget(self.fallback)
         self._refresh()
 
     def _seat_button(self, token: str) -> QToolButton:
@@ -467,17 +643,17 @@ class SeatMapWidget(QWidget):
         self._available_positions = set(positions)
         active = bool(self._available_positions)
         self.guide.setVisible(active)
-        self.fallback.setVisible(active)
         self.grid.setVisible(active)
         self.inactive_hint.setVisible(not active)
         for token, button in self.buttons.items():
             button.setEnabled(token in self._available_positions)
             button.setVisible(token in self._available_positions)
-        self.availability_note.setText(
-            "仅显示所选席别可用的座位字母；商务座的 C 位是否提供，以实际车型为准。"
-            if business else "仅显示所选席别可用的座位字母；实际开放情况以下单时 12306 返回为准。"
+        self.guide.setText(
+            "选中与乘车人数相同的格子。“前排/后排”仅表示同一订单的两排相对关系，"
+            "不代表行驶方向、车厢位置或真实排号。无法满足时，接受 12306 在该席别内自动分配。\n"
+            + ("仅显示所选席别可用的座位字母；商务座的 C 位是否提供，以实际车型为准。"
+               if business else "仅显示所选席别可用的座位字母；实际开放情况以下单时 12306 返回为准。")
         )
-        self.availability_note.setVisible(active)
         self._refresh()
 
     def positions(self) -> List[str]:
@@ -508,16 +684,16 @@ class BerthCountWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        note = QLabel("设置各铺位期望数量；数量为 0 表示无此偏好。软卧等车型可能不提供中铺。")
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.help_details = HelpDetails("选择期望的铺位数量",
+            "数量为 0 表示无此偏好。软卧等车型可能不提供中铺，是否支持选铺以下单时 12306 返回为准。"
+            "移除卧铺备选后，已填写数量会保留但不提交。")
+        layout.addWidget(self.help_details)
 
         self.seat_type_hint = QWidget()
         hint_layout = QVBoxLayout(self.seat_type_hint)
         hint_layout.setContentsMargins(0, 0, 0, 0)
         hint_layout.setSpacing(6)
-        self.seat_type_message = QLabel("请先在上方‘席别优先级’勾选至少一种卧铺席别（含一等卧、二等卧）。")
+        self.seat_type_message = QLabel("请先在第一步勾选卧铺席别（含一等卧、二等卧），并加入购物车。")
         self.seat_type_message.setObjectName("muted")
         self.seat_type_message.setWordWrap(True)
         hint_layout.addWidget(self.seat_type_message)
@@ -580,7 +756,7 @@ class BerthCountWidget(QWidget):
     def set_sleeper_available(self, available: bool) -> None:
         self.seat_type_hint.setVisible(not available)
         self.seat_type_message.setText(
-            "铺位偏好未启用：请先在上方‘席别优先级’勾选至少一种卧铺席别（含一等卧、二等卧）。已填写数量会保留。"
+            "未启用：请先将卧铺备选加入购物车。"
         )
         for key, spin in self.spins.items():
             spin.setEnabled(available)
@@ -614,6 +790,56 @@ class _ActualTabWheelBar(QTabBar):
             event.ignore()
 
 
+class _CurrentPageTabs(QTabWidget):
+    """Let the visible page determine height, including wrapped descriptions."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+        self.currentChanged.connect(self._current_changed)
+
+    def _current_changed(self, _index: int) -> None:
+        for index in range(self.count()):
+            page = self.widget(index)
+            page.setSizePolicy(QSizePolicy.Policy.Preferred,
+                               QSizePolicy.Policy.Preferred if index == self.currentIndex() else QSizePolicy.Policy.Ignored)
+            page.installEventFilter(self)
+        self.updateGeometry()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self.currentWidget() and event.type() == QEvent.Type.LayoutRequest:
+            self.updateGeometry()
+        return super().eventFilter(watched, event)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        page = self.currentWidget()
+        if page is None:
+            return super().sizeHint().height()
+        frame = 2 * self.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, None, self)
+        page_width = max(1, width - frame)
+        height = page.layout().totalHeightForWidth(page_width) if page.layout().hasHeightForWidth() else page.sizeHint().height()
+        return max(page.minimumSizeHint().height(), height) + self.tabBar().sizeHint().height() + frame
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        preferred = super().sizeHint()
+        preferred.setHeight(self.heightForWidth(preferred.width()))
+        return preferred
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        page = self.currentWidget()
+        if page is None:
+            return super().minimumSizeHint()
+        preferred = page.minimumSizeHint()
+        frame = 2 * self.style().pixelMetric(QStyle.PixelMetric.PM_DefaultFrameWidth, None, self)
+        return QSize(max(preferred.width() + frame, self.tabBar().minimumSizeHint().width()),
+                     preferred.height() + self.tabBar().minimumSizeHint().height() + frame)
+
+
 class PositionPreferences(QWidget):
     changed = Signal()
 
@@ -621,13 +847,14 @@ class PositionPreferences(QWidget):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.tabs = QTabWidget()
+        self.tabs = _CurrentPageTabs()
         self.tabs.setTabBar(_ActualTabWheelBar(self.tabs))
         self.tabs.setDocumentMode(True)
         self.seats = SeatMapWidget()
         self.berths = BerthCountWidget()
         self.tabs.addTab(self.seats, "座位偏好")
         self.tabs.addTab(self.berths, "铺位偏好")
+        self.tabs._current_changed(0)
         self.seats.changed.connect(self.changed)
         self.berths.changed.connect(self.changed)
         layout.addWidget(self.tabs)
@@ -655,116 +882,6 @@ class PositionPreferences(QWidget):
             self.tabs.setCurrentIndex(0)
 
 
-class CurrentPhaseWidget(QFrame):
-    """Compact current-stage display; transitions may move forward or back."""
-
-    PHASES = [
-        ("preparing", "准备任务"),
-        ("syncing", "校准服务器时间"),
-        ("login", "登录 12306"),
-        ("waiting", "等待热身窗口"),
-        ("querying", "查询余票"),
-        ("submitting", "提交订单"),
-        ("queued", "排队出票"),
-        ("success", "任务完成"),
-    ]
-    ALIASES = {
-        "prepare": "preparing",
-        "prepared": "preparing",
-        "stations": "preparing",
-        "clock": "syncing",
-        "time_sync": "syncing",
-        "clock_sync": "syncing",
-        "logging_in": "login",
-        "qr": "login",
-        "wait": "waiting",
-        "warmup": "waiting",
-        "query": "querying",
-        "polling": "querying",
-        "candidate": "querying",
-        "submit": "submitting",
-        "order": "submitting",
-        "queue": "queued",
-        "queueing": "queued",
-        "completed": "success",
-        "finished": "success",
-    }
-
-    STATUS_LABELS = {
-        "failed": "任务失败",
-        "cancelled": "任务已停止",
-        "stopped": "任务已结束（未出票）",
-        "no_ticket": "任务已结束（未出票）",
-    }
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.setObjectName("currentPhase")
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMinimumHeight(52)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(12, 8, 12, 8)
-        row.setSpacing(9)
-        self.phase_icon = QLabel("○")
-        self.phase_icon.setObjectName("currentPhaseIcon")
-        self.phase_title = QLabel()
-        self.phase_title.setObjectName("currentPhaseTitle")
-        self.phase_message = QLabel()
-        self.phase_message.setObjectName("currentPhaseMessage")
-        self.phase_message.setWordWrap(False)
-        self.phase_message.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        row.addWidget(self.phase_icon)
-        row.addWidget(self.phase_title)
-        row.addWidget(self.phase_message, 1)
-        self.current_phase = ""
-        self.current_message = ""
-        self.reset_timeline()
-
-    def reset_timeline(self) -> None:
-        self.current_phase = ""
-        self.current_message = ""
-        self._render()
-
-    def set_phase(self, phase: str, message: str = "") -> None:
-        phase = self.ALIASES.get(str(phase).lower(), str(phase).lower())
-        if phase in {"failure", "error"}:
-            phase = "failed"
-        elif phase == "canceled":
-            phase = "cancelled"
-        # Deliberately assign rather than taking max(phase index): a retried
-        # login/query can legitimately return to an earlier displayed stage.
-        self.current_phase = phase
-        self.current_message = str(message or "")
-        self._render()
-
-    def _render(self) -> None:
-        phase_labels = dict(self.PHASES)
-        label = self.STATUS_LABELS.get(self.current_phase, phase_labels.get(self.current_phase, "当前阶段"))
-        if not self.current_phase:
-            label, symbol, state = "等待开始", "○", "idle"
-        elif self.current_phase == "success":
-            symbol, state = "✓", "success"
-        elif self.current_phase == "failed":
-            symbol, state = "!", "failed"
-        elif self.current_phase in {"cancelled", "stopped", "no_ticket"}:
-            symbol, state = "■", "stopped"
-        else:
-            symbol, state = "●", "active"
-        self.phase_icon.setText(symbol)
-        self.phase_icon.setProperty("phaseState", state)
-        self.phase_title.setText(label)
-        self.phase_message.setText(self.current_message)
-        self.phase_message.setToolTip(self.current_message)
-        self.setToolTip(f"{label}{'：' + self.current_message if self.current_message else ''}")
-        _repolish(self.phase_icon)
-
-
-class TimelineWidget(CurrentPhaseWidget):
-    """Backward-compatible name for code that still imports TimelineWidget."""
-
-    pass
-
-
 class LogView(QWidget):
     MAX_LINES = 3000
 
@@ -786,49 +903,76 @@ class LogView(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self._lines: List[tuple[str, str]] = []
         self._paused = False
         self._level_colors = self.LEVEL_COLOR
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        controls = QHBoxLayout()
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("搜索日志…")
-        self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self.refresh)
+        self.toolbar = QWidget()
+        self.toolbar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        controls = QHBoxLayout(self.toolbar)
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText("详细日志")
+        self.toggle_button.setToolTip("详细日志（已脱敏）")
+        self.toggle_button.setAccessibleName("展开或收起详细日志")
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(True)
+        self.toggle_button.setArrowType(Qt.ArrowType.DownArrow)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle_button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.level = QComboBox()
         self.level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
         self.level.setCurrentText("INFO")
         self.level.currentTextChanged.connect(self.refresh)
+        self.level.setAccessibleName("日志级别筛选")
         self.pause = QPushButton("暂停滚动")
         self.pause.setCheckable(True)
         self.pause.toggled.connect(self._toggle_pause)
-        clear = QPushButton("清空")
-        clear.clicked.connect(self.clear)
-        copy = QPushButton("复制")
-        copy.clicked.connect(self.copy_all)
-        export = QPushButton("导出")
-        export.clicked.connect(self.export)
-        controls.addWidget(self.search, 1)
-        controls.addWidget(self.level)
-        controls.addWidget(self.pause)
-        controls.addWidget(clear)
-        controls.addWidget(copy)
-        controls.addWidget(export)
-        layout.addLayout(controls)
+        self.clear_button = QPushButton("清空")
+        self.clear_button.clicked.connect(self.clear)
+        self.copy_button = QPushButton("复制")
+        self.copy_button.clicked.connect(self.copy_all)
+        self.export_button = QPushButton("导出")
+        self.export_button.clicked.connect(self.export)
+        controls.addWidget(self.toggle_button)
+        controls.addWidget(self.level, 1)
+        for button in (self.pause, self.clear_button, self.copy_button, self.export_button):
+            controls.addWidget(button)
+        layout.addWidget(self.toolbar)
 
         self.text = QTextEdit()
         self.text.setObjectName("logView")
         self.text.setReadOnly(True)
         self.text.setAcceptRichText(True)
         self.text.document().setMaximumBlockCount(self.MAX_LINES)
-        self.text.setMinimumHeight(80)
         layout.addWidget(self.text)
+        self.toggle_button.toggled.connect(self._set_expanded)
+        self._compact_rows = 3
+        self.set_compact_rows(3)
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self.text.setVisible(expanded)
+        self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+
+    def set_compact_rows(self, rows: int) -> None:
+        self._compact_rows = max(1, int(rows))
+        self.text.ensurePolished()
+        # Account for the QSS padding, document margin and native frame around
+        # actual font line spacing, instead of fixing the whole log panel.
+        height = self.text.fontMetrics().lineSpacing() * self._compact_rows
+        height += 2 * int(self.text.document().documentMargin()) + 20
+        self.text.setFixedHeight(height)
+        self.updateGeometry()
 
     def set_light_palette(self, enabled: bool) -> None:
         self._level_colors = self.LIGHT_LEVEL_COLOR if enabled else self.LEVEL_COLOR
+        self.set_compact_rows(self._compact_rows)
         self.refresh()
 
     def _toggle_pause(self, value: bool) -> None:
@@ -873,8 +1017,7 @@ class LogView(QWidget):
 
     def _matches(self, line: str, level: str) -> bool:
         minimum = self.LEVEL_VALUE.get(self.level.currentText(), 20)
-        needle = self.search.text().strip().casefold()
-        return self.LEVEL_VALUE[level] >= minimum and (not needle or needle in line.casefold())
+        return self.LEVEL_VALUE[level] >= minimum
 
     def refresh(self) -> None:
         self.text.clear()

@@ -1,19 +1,21 @@
 """Cart presentation and draft handling for the four-step window (offline)."""
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QToolButton,
 )
 
 from ticket_app.cart import (
-    cart_migration_messages, cart_seat_types, normalize_cart_items,
+    cart_seat_types, normalize_cart_items,
     serialize_cart_items, validate_cart_items,
 )
 from ticket_app.configuration import SEAT_SPECS
+from ticket_app.preferences import BERTH_SEAT_TYPES, SEATED_SEAT_TYPES
 from ticket_app.train_policy import normalize_train_codes
 from .cart_widgets import CartDialog
-from .widgets import Card
+from .widgets import Card, OrderedSeatSelector
+from .floating_cart import FloatingCartButton
 
 
 def cart_row_text(item, index):
@@ -22,37 +24,24 @@ def cart_row_text(item, index):
 
 
 class CartFlow:
-    def _build_cart_bar(self):
-        """Pinned above the scrolling first page; the actual cart stays visible."""
-        self.cart_bar = QWidget()
-        layout = QVBoxLayout(self.cart_bar)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        row = QHBoxLayout()
-        self.cart_button = QPushButton("购物车（0） · 查看 / 排序")
+    def _build_cart_shortcut(self):
+        self.cart_button = FloatingCartButton(self.steps)
         self.cart_button.clicked.connect(self._open_cart)
-        row.addWidget(self.cart_button)
-        self.cart_summary = QLabel("请添加至少一个备选")
-        self.cart_summary.setWordWrap(True)
-        self.cart_summary.setObjectName("muted")
-        row.addWidget(self.cart_summary, 1)
-        layout.addLayout(row)
-        self.cart_migration_label = QLabel()
-        self.cart_migration_label.setWordWrap(True)
-        self.cart_migration_label.setObjectName("validationMessage")
-        layout.addWidget(self.cart_migration_label)
-        self.resolve_cart_button = QPushButton("确认按当前购物车范围执行")
-        self.resolve_cart_button.clicked.connect(self._resolve_cart_migration)
-        layout.addWidget(self.resolve_cart_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        self.cart_migration_label.hide()
-        self.resolve_cart_button.hide()
-        return self.cart_bar
+        self.steps.installEventFilter(self)
+        self._position_cart_shortcut()
+
+    def _position_cart_shortcut(self):
+        if not hasattr(self, "cart_button"):
+            return
+        self.cart_button.move(max(0, self.steps.width() - 88), max(0, self.steps.height() - 76))
+        self.cart_button.raise_()
 
     def _build_cart_entry(self):
         self.cart_items = []
-        self.cart_migration = {"notes": [], "issues": []}
         self._cart_draft_baseline = None
-        card = Card("添加备选", "一次选一种席别。多个车次会拆成多项；任意一项成功，全车停止。")
+        card = Card("添加备选")
+        self._cart_feedback_generation = 0
+        self._cart_draft_error_shown = False
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
@@ -72,57 +61,91 @@ class CartFlow:
         grid.addWidget(self._field_block("to_station", "到达站", self.to_station), 0, 2)
         self.update_stations_button = QPushButton("更新站点")
         self.update_stations_button.clicked.connect(self._refresh_stations)
-        grid.addWidget(self.update_stations_button, 1, 2, alignment=Qt.AlignmentFlag.AlignRight)
+        grid.addWidget(self.update_stations_button, 0, 3, alignment=Qt.AlignmentFlag.AlignBottom)
         self.train_scope = QComboBox()
         self.train_scope.addItem("指定车次", "specific")
-        self.train_scope.addItem("不限车次（该站对所有车次）", "all")
-        grid.addWidget(self._field_block("cart_train_scope", "车次范围", self.train_scope), 2, 0, 1, 3)
+        self.train_scope.addItem("不限车次", "all")
+        self.train_scope.setToolTip("不限车次：接受这一站对的所有列车，但仅购买已加入购物车的席别。")
+        train_row = QHBoxLayout()
+        train_row.setSpacing(8)
+        scope_block = self._field_block("cart_train_scope", "车次范围", self.train_scope)
+        scope_block.setMaximumWidth(170)
+        train_row.addWidget(scope_block, 1)
         self.preferred_trains = QLineEdit()
-        self.preferred_trains.setPlaceholderText("例如：G103，G105；支持逗号、顿号、分号")
+        self.preferred_trains.setPlaceholderText("例如：G103，G105")
         self.preferred_trains.setClearButtonEnabled(True)
         self.preferred_trains.setToolTip("多个车次按填写顺序分别加入；支持中英文逗号、分号、顿号、换行和制表符。")
-        grid.addWidget(self._field_block("preferred_trains", "指定车次", self.preferred_trains), 3, 0, 1, 3)
-        self.cart_seat = QComboBox()
-        self.cart_seat.addItem("请选择一种席别", "")
-        for seat in SEAT_SPECS:
-            self.cart_seat.addItem(seat, seat)
-        grid.addWidget(self._field_block("cart_seat", "席别", self.cart_seat), 4, 0, 1, 3)
+        train_row.addWidget(self._field_block("preferred_trains", "指定车次", self.preferred_trains), 3)
         card.body.addLayout(grid)
+        card.body.addLayout(train_row)
+        self.cart_seat = OrderedSeatSelector()
+        card.body.addWidget(self._field_block("cart_seat", "席别", self.cart_seat))
+        self.cart_preview = QLabel()
+        self.cart_preview.setTextFormat(Qt.TextFormat.PlainText)
+        self.cart_preview.setWordWrap(True)
+        self.cart_preview.setObjectName("muted")
+        self.cart_preview.hide()
+        self.cart_preview_toggle = QPushButton("预览")
+        self.cart_preview_toggle.setCheckable(True)
+        self.cart_preview_toggle.toggled.connect(self.cart_preview.setVisible)
         self.add_cart_button = QPushButton("加入购物车")
         self.add_cart_button.setObjectName("primaryButton")
         self.add_cart_button.clicked.connect(self._add_cart_items)
-        card.body.addWidget(self._field_block("cart_items", "", self.add_cart_button, show_label=False))
-        self.cart_draft_status = QLabel("填写后请点击“加入购物车”，只有购物车中的项目参与任务。")
+        add_row = QHBoxLayout()
+        add_row.addWidget(self._field_block("cart_items", "", self.add_cart_button, show_label=False), 1)
+        add_row.addWidget(self.cart_preview_toggle, alignment=Qt.AlignmentFlag.AlignTop)
+        card.body.addLayout(add_row)
+        card.body.addWidget(self.cart_preview)
+        self.cart_draft_status = QLabel()
         self.cart_draft_status.setWordWrap(True)
-        self.cart_draft_status.setObjectName("muted")
+        self.cart_draft_status.setObjectName("validationMessage")
+        self.cart_draft_status.hide()
         card.body.addWidget(self.cart_draft_status)
         for editor in (self.from_station, self.to_station, self.preferred_trains):
             editor.textChanged.connect(self._cart_draft_changed)
         self.train_scope.currentIndexChanged.connect(self._cart_draft_changed)
-        self.cart_seat.currentIndexChanged.connect(self._cart_draft_changed)
+        self.cart_seat.changed.connect(self._cart_draft_changed)
         return card
 
     def _cart_draft_signature(self):
         return (self.from_station.text().strip(), self.to_station.text().strip(),
                 self.train_scope.currentData(), tuple(normalize_train_codes(self.preferred_trains.text())),
-                self.cart_seat.currentData())
+                tuple(self.cart_seat.selected_seats()))
 
     def _cart_draft_changed(self, *_args):
+        self._cart_feedback_generation += 1
         specific = self.train_scope.currentData() == "specific"
         self.preferred_trains.setEnabled(specific and self._active_operation is None)
-        self.field_blocks["preferred_trains"].setVisible(specific)
-        if not self._applying_values and self._cart_draft_baseline is not None:
-            dirty = self._cart_draft_signature() != self._cart_draft_baseline
-            self.cart_draft_status.setText("有尚未加入的更改，当前任务仍仅使用购物车。" if dirty else "填写内容已处理，可修改席别或站点继续添加。")
+        try:
+            items = self._draft_cart_items()
+        except ValueError as exc:
+            self.add_cart_button.setText("加入购物车")
+            self.cart_preview.clear()
+            self.cart_preview_toggle.setEnabled(False)
+            if self._cart_draft_error_shown and not self._applying_values:
+                self.cart_draft_status.setText(str(exc))
+                self.cart_draft_status.show()
+            return
+        duplicates = sum(item in self.cart_items for item in items)
+        count = len(items) - duplicates
+        self.add_cart_button.setText(f"加入购物车（{count}项）" if count else "加入购物车")
+        self.cart_preview_toggle.setEnabled(True)
+        self.cart_preview.setText("\n".join(cart_row_text(item, i) for i, item in enumerate(items, 1)))
+        self.cart_draft_status.clear()
+        self.cart_draft_status.hide()
+        self._cart_draft_error_shown = False
 
     def _draft_cart_items(self):
         scope = self.train_scope.currentData()
         trains = normalize_train_codes(self.preferred_trains.text()) if scope == "specific" else [""]
         if not trains:
             raise ValueError("请填写指定车次，或明确选择“不限车次”。")
+        seats = self.cart_seat.selected_seats()
+        if not seats:
+            raise ValueError("请至少勾选一种席别。")
         items = [{"from_station": self.from_station.text().strip(), "to_station": self.to_station.text().strip(),
-                  "train_scope": scope, "train_code": train, "seat_type": self.cart_seat.currentData() or ""}
-                 for train in dict.fromkeys(trains)]
+                  "train_scope": scope, "train_code": train, "seat_type": seat}
+                 for seat in seats for train in dict.fromkeys(trains)]
         errors = validate_cart_items(normalize_cart_items(items), SEAT_SPECS, self.station_names)
         if errors:
             raise ValueError(errors[0])
@@ -134,8 +157,9 @@ class CartFlow:
         try:
             items = self._draft_cart_items()
         except ValueError as exc:
+            self._cart_draft_error_shown = True
             self.cart_draft_status.setText(str(exc))
-            self._show_flow_error(str(exc))
+            self.cart_draft_status.show()
             return False
         added = 0
         for item in items:
@@ -144,8 +168,12 @@ class CartFlow:
                 added += 1
         self._cart_draft_baseline = self._cart_draft_signature()
         self._cart_changed()
-        duplicate = len(items) - added
-        self.cart_draft_status.setText(f"已加入 {added} 项" + (f"；{duplicate} 项已存在，原顺序保持不变。" if duplicate else "，可修改后继续添加。"))
+        self.add_cart_button.setText("已加入" if added else "已在购物车")
+        generation = self._cart_feedback_generation
+        def restore_button():
+            if generation == self._cart_feedback_generation:
+                self._cart_draft_changed()
+        QTimer.singleShot(1200, self, restore_button)
         self.flow_error.hide()
         return True
 
@@ -154,10 +182,21 @@ class CartFlow:
             return True
         box = QMessageBox(self)
         box.setWindowTitle("还有未加入的备选")
-        box.setText("添加区域有尚未处理的更改。此次任务只会使用购物车中的项目。")
+        try:
+            items = self._draft_cart_items()
+            trains = "、".join(dict.fromkeys(item["train_code"] for item in items)) if self.train_scope.currentData() == "specific" else "不限车次"
+            seats = "、".join(self.cart_seat.selected_seats())
+            box.setText(f"是否将{self.from_station.text().strip()} → {self.to_station.text().strip()}的"
+                        f" {trains}，{seats}，共 {len(items)} 个备选加入购物车？")
+            duplicates = sum(item in self.cart_items for item in items)
+            if duplicates:
+                box.setInformativeText(f"其中 {duplicates} 项已存在，会保留原位置，不重复加入。")
+        except ValueError as exc:
+            box.setText(f"这组备选还不能加入购物车：{exc}")
+            box.setInformativeText("可以返回修改，或不加入，继续使用购物车中已有的备选。")
         add = box.addButton("加入并继续", QMessageBox.ButtonRole.AcceptRole)
-        use = box.addButton("仅使用购物车", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton("返回编辑", QMessageBox.ButtonRole.RejectRole)
+        use = box.addButton("不加入，继续下一步", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("返回修改", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(add)
         box.exec()
         if box.clickedButton() is add:
@@ -169,63 +208,57 @@ class CartFlow:
 
     def _cart_changed(self):
         count = len(self.cart_items)
-        self.cart_button.setText(f"购物车（{count}） · 查看 / 排序")
-        pairs = {(row.get("from_station"), row.get("to_station")) for row in self.cart_items}
-        text = f"{len(pairs)} 个站对 · 从上到下尝试，成功一项即停止" if count else "请添加至少一个备选"
-        if count:
-            text += "\n" + cart_row_text(self.cart_items[0], 1)
-            if count > 1:
-                text += f" · 另 {count - 1} 项"
-        self.cart_summary.setText(text)
-        notes, issues = cart_migration_messages(self.cart_migration)
-        self.cart_migration_label.setText(
-            "旧配置有待修正的限制，请在购物车中核对后确认范围。" if issues else
-            "旧配置部分尝试顺序已调整，详情见购物车与确认页。" if notes else "")
-        self.cart_migration_label.setToolTip("\n".join(issues + notes))
-        self.cart_migration_label.setVisible(bool(notes or issues))
-        self.resolve_cart_button.setVisible(bool(issues))
+        self.cart_button.set_count(count)
         if hasattr(self, "position_preferences"):
             self.position_preferences.adapt_to_seats(cart_seat_types(normalize_cart_items(self.cart_items)))
+            self._refresh_preference_scope()
+        self._cart_draft_changed()
         if not self._applying_values:
             self._schedule_validation("cart_items", "seat_position_preferences", "berth_preference")
+            if self.current_step == 2:
+                self._refresh_confirmation()
+            self._render_workflow()
+            if not count and self.current_step in (1, 2):
+                self._show_flow_error("购物车为空，请返回第一步添加备选。")
+            elif self.flow_error.text() == "购物车为空，请返回第一步添加备选。":
+                self.flow_error.clear()
+                self.flow_error.hide()
+
+    def _refresh_preference_scope(self):
+        if not hasattr(self, "position_preferences"):
+            return
+        counts = []
+        for allowed in (SEATED_SEAT_TYPES, BERTH_SEAT_TYPES):
+            count = 0
+            for item in self.cart_items:
+                seat = item.get("seat_type", "")
+                code = SEAT_SPECS[seat].submit_code if seat in SEAT_SPECS else None
+                if seat != "无座" and code in allowed:
+                    count += 1
+            counts.append(count)
+        for index, title in enumerate(("座位偏好", "铺位偏好")):
+            self.position_preferences.tabs.setTabText(index, f"{title}（{counts[index]}项）")
 
     def _open_cart(self, *_args):
         read_only = self._active_operation is not None or self.current_step == 3
         items = self.cart_items
         if (self.current_step == 3 or self._operation_mode == "task") and self._last_run_config is not None:
             items = serialize_cart_items(self._last_run_config.cart_items or [])
-        notes, issues = cart_migration_messages(self.cart_migration)
-        dialog = CartDialog(items, self, station_names=self.station_names,
-                            migration_warnings=issues + notes, read_only=read_only)
+        dialog = CartDialog(items, self, station_names=self.station_names, read_only=read_only)
         if dialog.exec() == QDialog.DialogCode.Accepted and not read_only:
             self.cart_items = dialog.items()
             self._cart_changed()
-
-    def _resolve_cart_migration(self):
-        notes, issues = cart_migration_messages(self.cart_migration)
-        if not issues or self._active_operation is not None:
-            return
-        # The former restriction is never silently discarded by editing a row.
-        text = "\n".join(issues) + "\n\n请先在购物车中核对或编辑每一项。确认后仅按当前可见车次范围执行；“不限车次”会接受该站对所有列车。"
-        answer = QMessageBox.question(self, "确认旧配置的范围调整", text,
-                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                                      QMessageBox.StandardButton.Cancel)
-        if answer == QMessageBox.StandardButton.Yes:
-            self.cart_migration["issues"] = []
-            self._cart_changed()
-
-    def _cart_confirmation_text(self):
-        rows = [cart_row_text(item, i) for i, item in enumerate(self.cart_items, 1)]
-        notes, issues = cart_migration_messages(self.cart_migration)
-        return "购物车（按此顺序尝试）\n" + ("\n".join(rows) or "尚未添加") + ("\n\n" + "\n".join(issues + notes) if notes or issues else "")
 
     def _update_cart_runtime(self, payload):
         index = payload.get("cart_index")
         if not index:
             return
-        prefix = f"备选 {index} / {payload.get('cart_total', len(self.cart_items))}"
+        self._last_candidate_context = dict(payload)
+        terminal = self._task_state in {"success", "cancelled", "failed", "no_ticket", "unknown"}
+        title = "已购" if self._order_succeeded else "最后尝试" if terminal else "当前"
+        prefix = f"{title} {index}/{payload.get('cart_total', len(self.cart_items))}"
         route = f"{payload.get('from_station', '')} → {payload.get('to_station', '')}"
         train = payload.get("train_code") or payload.get("train") or "不限车次"
         seat = payload.get("seat_label") or payload.get("seat") or ""
-        date = payload.get("train_date", "")
-        self.current_cart_item.setText(f"{prefix}  {date}\n{route} · {train} · {seat}")
+        self.current_cart_item.setText(f"{prefix} · {route} · {train} · {seat}")
+        self.current_cart_item.show()

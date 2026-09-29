@@ -41,15 +41,13 @@ class InvalidJsonResponse:
         raise json.JSONDecodeError("Invalid \\escape", "{bad: \\d}", 7)
 
 
-def base_config_mapping(**updates):
+def base_config_mapping(*, seats=("二等座",), **updates):
     mapping = {
-        "FROM_STATION": "北京南",
-        "TO_STATION": "上海虹桥",
+        "CART_ITEMS": [{"from_station": "北京南", "to_station": "上海虹桥", "train_scope": "all",
+                        "train_code": "", "seat_type": seat} for seat in seats],
         "TRAIN_DATE": (date.today() + timedelta(days=1)).isoformat(),
         "PASSENGER_NAMES": ["甲"],
-        "SEAT_TYPES": ["二等座"],
         "AUTO_SUBMIT": True,
-        "ONLY_PREFERRED_TRAINS": False,
     }
     mapping.update(updates)
     return mapping
@@ -66,8 +64,8 @@ class PreferenceModelTests(unittest.TestCase):
         self.assertEqual(seat_layout_letters("9", "a,b,c"), ("A", "F"))
         self.assertEqual(seat_layout_letters("9", "a,b,c,"), ("A", "F"))
 
-    def test_legacy_choose_seats_parses_and_sorts(self):
-        preference = SeatRelationPreference.from_value("2F 1A")
+    def test_structured_seat_positions_sort_for_submission(self):
+        preference = SeatRelationPreference.from_value(["2F", "1A"])
         self.assertEqual(preference.positions, ("1A", "2F"))
         self.assertEqual(preference.to_choose_seats(2, "O"), "1A2F")
 
@@ -187,39 +185,23 @@ class PreferenceModelTests(unittest.TestCase):
 
 
 class AppConfigPreferenceTests(unittest.TestCase):
-    def test_mapping_round_trip_and_new_key_precedes_legacy_key(self):
+    def test_mapping_round_trip_preserves_structured_preferences(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "config.py"
-            with self.assertLogs(level="WARNING") as captured:
-                cfg = AppConfig.from_mapping(
-                    base_config_mapping(
-                        PASSENGER_NAMES=["甲", "乙"],
-                        SEAT_POSITION_PREFERENCES=["1A", "1F"],
-                        CHOOSE_SEATS="1B2B",
-                        PERSIST_SESSION=False,
-                    ),
-                    path,
-                )
+            cfg = AppConfig.from_mapping(base_config_mapping(
+                PASSENGER_NAMES=["甲", "乙"], SEAT_POSITION_PREFERENCES=["1A", "1F"],
+                PERSIST_SESSION=False), path)
             self.assertEqual(cfg.seat_relation_preference.positions, ("1A", "1F"))
-            self.assertEqual(cfg.choose_seats, "1A1F")
             self.assertFalse(cfg.persist_session)
-            self.assertIn("忽略 CHOOSE_SEATS", "\n".join(captured.output))
-
             round_tripped = AppConfig.from_mapping(cfg.to_mapping(), path)
             self.assertEqual(round_tripped.seat_relation_preference, cfg.seat_relation_preference)
             self.assertEqual(round_tripped.berth_preference, cfg.berth_preference)
             self.assertEqual(round_tripped.persist_session, cfg.persist_session)
 
-    def test_legacy_choose_seats_is_supported(self):
-        with self.assertLogs(level="INFO") as captured:
-            cfg = AppConfig.from_mapping(base_config_mapping(CHOOSE_SEATS="1A"))
-        self.assertEqual(cfg.seat_relation_preference.positions, ("1A",))
-        self.assertIn("转换为结构化", "\n".join(captured.output))
-
     def test_invalid_layout_and_more_than_five_passengers_are_rejected(self):
         with self.assertRaisesRegex(AppError, "布局"):
             AppConfig.from_mapping(
-                base_config_mapping(SEAT_TYPES=["一等座"], CHOOSE_SEATS="1B")
+                base_config_mapping(seats=["一等座"], SEAT_POSITION_PREFERENCES=["1B"])
             )
         with self.assertRaisesRegex(AppError, "最多支持 5"):
             AppConfig.from_mapping(
@@ -231,7 +213,7 @@ class AppConfigPreferenceTests(unittest.TestCase):
             AppConfig.from_mapping(
                 base_config_mapping(
                     PASSENGER_NAMES=["甲", "乙"],
-                    SEAT_TYPES=["硬卧"],
+                    seats=["硬卧"],
                     BERTH_PREFERENCE={"lower": 1, "middle": 0, "upper": 0},
                 )
             )
@@ -243,12 +225,12 @@ class RailwayClientPreferenceTests(unittest.TestCase):
     @staticmethod
     def make_client(response):
         client = object.__new__(RailwayClient)
-        client.cfg = SimpleNamespace(request_timeout_seconds=5, choose_seats="", purpose_codes="ADULT")
+        client.cfg = SimpleNamespace(request_timeout_seconds=5, purpose_codes="ADULT")
         client.session = Mock()
         client.session.post.return_value = response
         return client
 
-    def test_check_order_parses_capabilities_and_keeps_legacy_unpacking(self):
+    def test_check_order_parses_capabilities(self):
         response = FakeResponse(
             {
                 "status": True,
@@ -269,7 +251,7 @@ class RailwayClientPreferenceTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(result.capabilities.can_choose_seats)
         self.assertIn("O", result.capabilities.allowed_seat_types)
-        self.assertEqual(tuple(result), (True, "OK"))
+        self.assertEqual(result.message, "OK")
         sent = client.session.post.call_args.kwargs["data"]
         self.assertEqual(sent["bed_level_order_num"], "0" * 30)
 
@@ -342,7 +324,7 @@ class RailwayClientPreferenceTests(unittest.TestCase):
         client = self.make_client(InvalidJsonResponse())
         ticket = {
             "secret_str": "secret",
-            "date": "2026-09-09",
+            "query_date": "2026-09-09",
             "from_station": "北京西",
             "to_station": "郑州东",
         }

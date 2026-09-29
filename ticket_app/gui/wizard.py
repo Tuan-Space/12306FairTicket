@@ -11,7 +11,9 @@ from PySide6.QtWidgets import (
 
 from .validation import validate_gui_mapping
 from .widgets import Card, LogView
-from .passenger_widgets import InlinePassengerSelector, default_ticket_label
+from .cart_widgets import CompactCartSummary
+from .scroll_state import preserve_reading_position
+from .passenger_widgets import InlinePassengerSelector
 
 
 class WizardFlow:
@@ -38,16 +40,16 @@ class WizardFlow:
             navigation.addWidget(button, 1)
             self.step_buttons.append(button)
         root.addLayout(navigation)
-        self.workflow_status = QLabel("任务未开始")
+        self.workflow_status = QLabel()
         self.workflow_status.setObjectName("workflowStatus")
         self.workflow_status.setWordWrap(True)
+        self.workflow_status.hide()
         root.addWidget(self.workflow_status)
         self.flow_error = QLabel()
         self.flow_error.setObjectName("validationMessage")
         self.flow_error.setWordWrap(True)
         self.flow_error.hide()
         root.addWidget(self.flow_error)
-        root.addWidget(self._build_cart_bar())
 
         self.steps = QStackedWidget()
         self.passenger_scroll, _, self.passenger_layout = _scroll_page()
@@ -60,7 +62,7 @@ class WizardFlow:
         self.account_actions = QHBoxLayout()
         self.account_card.body.addLayout(self.account_actions)
 
-        self.passenger_card = Card("选择乘车人", "")
+        self.passenger_card = Card()
         self.contact_selector = InlinePassengerSelector()
         self.contact_selector.changed.connect(self._contacts_selected)
         self.passenger_card.body.addWidget(self.contact_selector)
@@ -68,12 +70,14 @@ class WizardFlow:
         self.contacts_status.setWordWrap(True)
         self.contacts_status.setObjectName("muted")
         self.passenger_card.body.addWidget(self.contacts_status)
-        self.refresh_contacts_button = QPushButton("重新读取联系人")
+        self.refresh_contacts_button = QPushButton("刷新联系人")
         self.refresh_contacts_button.clicked.connect(lambda: self._start_connection_operation("contacts"))
-        self.passenger_card.body.addWidget(self.refresh_contacts_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        self.manual_toggle = QPushButton("手动填写姓名 ▾")
-        self.manual_toggle.setCheckable(True)
-        self.passenger_card.body.addWidget(self.manual_toggle, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.contact_selector.set_refresh_button(self.refresh_contacts_button)
+        self.passenger_name_label = QLabel("乘车人")
+        self.passenger_name_label.setObjectName("fieldLabel")
+        self.manual_row = QHBoxLayout()
+        self.manual_row.addWidget(self.passenger_name_label, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.passenger_card.body.addLayout(self.manual_row)
         self.passenger_layout.addWidget(self.passenger_card)
         self.summary_card = Card("确认本次任务", "")
         self.confirm_summary = QLabel()
@@ -81,6 +85,8 @@ class WizardFlow:
         self.confirm_summary.setWordWrap(True)
         self.confirm_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.summary_card.body.addWidget(self.confirm_summary)
+        self.confirm_cart = CompactCartSummary()
+        self.summary_card.body.addWidget(self.confirm_cart)
         self.confirm_layout.addWidget(self.summary_card)
 
         self.steps.addWidget(self._build_basic_page())
@@ -89,6 +95,7 @@ class WizardFlow:
         self.run_scroll, _, self.run_layout = _scroll_page()
         self.run_layout.addWidget(self._build_status_panel())
         self.steps.addWidget(self.run_scroll)
+        self._build_cart_shortcut()
         self.passenger_layout.addStretch(1)
         self.confirm_layout.addStretch(1)
 
@@ -97,30 +104,31 @@ class WizardFlow:
         self.advanced_toggle.setCheckable(True)
         advanced_scroll = self._build_advanced_page()
         self.advanced_content = advanced_scroll.takeWidget()
+        self.advanced_content.setAutoFillBackground(False)
         advanced_scroll.deleteLater()
         self.advanced_content.hide()
         self.advanced_toggle.toggled.connect(self.advanced_content.setVisible)
         layout = self.basic_scroll.widget().layout()
         layout.insertWidget(layout.count() - 1, self.advanced_toggle)
         layout.insertWidget(layout.count() - 1, self.advanced_content)
+        # Keep the full viewport usable. End padding scrolls with the content,
+        # so the final field can still be brought above the floating button.
+        for scroll in (self.basic_scroll, self.passenger_scroll, self.confirm_scroll):
+            content_layout = scroll.widget().layout()
+            margins = content_layout.contentsMargins()
+            content_layout.setContentsMargins(margins.left(), margins.top(), margins.right(), margins.bottom() + 80)
         for key in self.advanced:
             self.field_pages[key] = 0
         self.advanced_scroll = self.basic_scroll
 
-        self.logs_toggle = QPushButton("详细日志（已脱敏） ▾")
-        self.logs_toggle.setCheckable(True)
-        self.logs_toggle.setChecked(True)
         self.log_view = LogView()
-        self.log_view.text.setMinimumHeight(44)
-        self.log_view.setFixedHeight(160)
-        self.logs_toggle.toggled.connect(self.log_view.setVisible)
+        self.logs_toggle = self.log_view.toggle_button
         self.run_layout.addStretch(1)
         root.addWidget(self.steps, 1)
         self.logs_panel = QWidget()
         logs_layout = QVBoxLayout(self.logs_panel)
         logs_layout.setContentsMargins(0, 0, 0, 0)
         logs_layout.setSpacing(4)
-        logs_layout.addWidget(self.logs_toggle)
         logs_layout.addWidget(self.log_view)
         root.addWidget(self.logs_panel)
 
@@ -151,9 +159,13 @@ class WizardFlow:
                     self._focus_first_error(errors)
                     self._show_flow_error(next(iter(errors.values())))
                     return
+            if step > 0 and not self.cart_items:
+                self._show_flow_error("购物车为空，请返回第一步添加备选。")
+                return
             self._go_to_step(step)
 
     def _go_to_step(self, step):
+        self._scroll_update = getattr(self, "_scroll_update", 0) + 1
         self.current_step = max(0, min(3, step))
         self._visited_step = max(self._visited_step, self.current_step)
         self.steps.setCurrentIndex(self.current_step)
@@ -161,6 +173,8 @@ class WizardFlow:
         self.flow_error.hide()
         if self.current_step == 2:
             self._refresh_confirmation()
+        if self.current_step in (1, 2) and not self.cart_items:
+            self._show_flow_error("购物车为空，请返回第一步添加备选。")
         # One QR view follows the current operation, never creating a second login path.
         host = self.recovery_layout if self.current_step == 3 else self.account_card.body
         host.addWidget(self.authentication_panel)
@@ -168,6 +182,9 @@ class WizardFlow:
 
     def _next_step(self):
         if self._active_operation is not None or self.current_step not in (0, 1):
+            return
+        if self.current_step == 1 and not self.cart_items:
+            self._show_flow_error("购物车为空，请返回第一步添加备选。")
             return
         if self.current_step == 1 and self.account_state != "valid":
             self._show_flow_error("请先扫码登录 12306，再选择乘车人。")
@@ -239,20 +256,21 @@ class WizardFlow:
     def _refresh_confirmation(self):
         from .app import _split_names
         values = self._collect_mapping()
-        labels = {"adult": "成人票", "student": "学生票"}
+        labels = {"adult": "成人", "student": "学生"}
         contact_types = {row["name"]: row.get("passenger_type", "") for row in self._contacts}
-        people = "、".join(f"{name}（{labels.get(values['passenger_ticket_types'].get(name), default_ticket_label(name, contact_types))}）"
-                          for name in _split_names(self.passengers.text())) or "未选择（仅监控）"
+        def ticket_label(name):
+            override = values['passenger_ticket_types'].get(name)
+            return labels.get(override) or {"1": "成人", "3": "学生"}.get(contact_types.get(name), "12306默认")
+        people = "、".join(f"{name}（{ticket_label(name)}）"
+                          for name in _split_names(self.passengers.text())) or "未选择"
         self.confirm_summary.setText(
-            f"乘车日期：{values['train_date']}\n乘车人：{people}\n\n"
-            f"{self._cart_confirmation_text()}\n\n"
-            "各项是同一次出行的备选，成功一项即停止。\n"
-            "同站对每轮共用一次查询；站对越多，一轮查询可能越久。\n\n"
-            f"任务模式：{'自动提交订单，之后手动支付' if values['auto_submit'] else '仅监控，不提交订单'}\n"
-            f"开始 / 开售时间：{values['start_at'] or '点击开始后立即查询'}\n"
-            f"停止时间：{values['stop_at'] or '不设停止时间（仍受最大查询轮数限制）'}"
+            f"{values['train_date']} · {'自动提交订单' if values['auto_submit'] else '仅监控'}\n"
+            f"开售：{values['start_at'] or '立即开始'}　停止：{values['stop_at'] or '不限'}\n"
+            f"乘车人：{people}"
         )
+        self.confirm_cart.set_items(self.cart_items)
 
+    @preserve_reading_position
     def _render_workflow(self):
         if not hasattr(self, "next_button"):
             return
@@ -263,7 +281,8 @@ class WizardFlow:
         step = self.current_step
         count = len(_split_names(self.passengers.text()))
         self.steps.setCurrentIndex(step)
-        self.cart_bar.setVisible(step == 0)
+        self.cart_button.setVisible(step < 3)
+        self._position_cart_shortcut()
         for index, button in enumerate(self.step_buttons):
             state = "current" if index == step else "complete" if index < step else "pending"
             button.setProperty("stepState", state)
@@ -279,7 +298,8 @@ class WizardFlow:
         self.login_button.setEnabled(not active)
         self.refresh_qr_button.setVisible(self._login_required and self._qr_deadline <= 0)
         self.start_button.setVisible(step == 2)
-        self.start_button.setEnabled(not active and step == 2 and self.account_state == "valid" and self._order_state == "safe")
+        self.start_button.setEnabled(not active and step == 2 and self.account_state == "valid"
+                                     and self._order_state == "safe" and bool(self.cart_items))
         can_continue = step == 3 and not active and self._restart_allowed and self._order_state == "safe"
         self.stop_button.setVisible(active or can_continue)
         self.stop_button.setText("继续任务" if can_continue else "正在停止…" if cancelling else "停止任务" if running else "取消当前操作")
@@ -290,21 +310,19 @@ class WizardFlow:
         self.order_button.setObjectName("primaryButton" if self._order_succeeded else "")
         self.refresh_contacts_button.setEnabled(not active and self.account_state == "valid")
         self.contact_selector.setEnabled(not active and self.account_state == "valid")
-        self.contact_selector.empty_hint.setText("登录后显示乘车人。" if self.account_state != "valid" else "没有可选择的联系人，可重新读取或手动填写姓名。")
-        self.manual_toggle.setEnabled(not active)
+        self.contact_selector.title.setText(f"乘车人（{count}/5）")
+        self.contact_selector.empty_hint.setText("暂无联系人" if self.account_state == "valid" else "")
+        self.contact_selector.empty_hint.setVisible(self.account_state == "valid" and not self.contact_selector.checkboxes)
+        self.field_blocks["passenger_ticket_types"].setVisible(count > 0)
         self.contacts_status.setText(self._contacts_error)
         self.contacts_status.setVisible(bool(self._contacts_error))
         account_text = "已登录" if self.account_state == "valid" else "正在登录…" if active and self._operation_mode == "login" else "未登录"
         self.account_heading.setText(account_text)
         self.authentication_panel.setVisible((self._login_required or (active and self._operation_mode == "login")) and self.account_state != "valid")
-        self.recovery_card.setVisible(step == 3 and self._login_required)
+        self.recovery_card.setVisible(step == 3 and running and self._login_required)
         self.logs_panel.setVisible(step == 3)
-        if step < 3:
-            self.workflow_status.setText("正在停止上一轮任务" if self._return_after_stop and active else "任务未开始")
-        else:
-            self.workflow_status.setText("任务已启动 · " + self.phase_badge.text() if running else self.phase_badge.text())
-        self.prep_clock_status.setText(self.clock_check_status.text() + " · RTT " + self.rtt_metric.value_label.text()
-                                       + " · 偏移 " + self.offset_metric.value_label.text())
-        self.prep_sync_clock_button.setEnabled(self.sync_clock_button.isEnabled())
+        stopping_previous = step < 3 and self._return_after_stop and active
+        self.workflow_status.setText("正在停止上一轮任务" if stopping_previous else "")
+        self.workflow_status.setVisible(stopping_previous)
         self.run_check_login_button.setEnabled(self.check_login_button.isEnabled())
-        self.run_session_status.setText(self.session_check_status.text())
+        self._refresh_run_presentation()

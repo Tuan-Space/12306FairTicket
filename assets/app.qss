@@ -50,6 +50,10 @@ QLabel#privacyBadge, QLabel#phaseBadge {
     font-weight: 600;
 }
 
+QLabel#phaseBadge[phaseState="success"] { color: #70cca7; border-color: #285844; background: #10261f; }
+QLabel#phaseBadge[phaseState="unknown"] { color: #f0bf75; border-color: #725733; background: #2a2115; }
+QLabel#phaseBadge[phaseState="failed"] { color: #ff9aa5; border-color: #773e49; background: #271721; }
+
 QFrame#profileBar, QFrame#card {
     background: #11182a;
     border: 1px solid #202b43;
@@ -265,6 +269,44 @@ QPushButton:disabled, QToolButton:disabled {
     border-color: #1e283b;
 }
 
+/* Keep Qt's native clear action small enough for the line edit's center. */
+QLineEdit > QToolButton, QLineEdit > QToolButton:hover,
+QLineEdit > QToolButton:pressed, QLineEdit > QToolButton:disabled {
+    min-width: 0;
+    min-height: 0;
+    padding: 0;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+
+QToolButton#seatGroupToggle {
+    padding: 4px 8px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: #c8d3e8;
+    text-align: left;
+}
+
+QToolButton#seatGroupToggle:hover { background: #182238; }
+QCheckBox#seatChoice {
+    min-height: 26px;
+    padding: 8px;
+    border: 1px solid #2a3751;
+    border-radius: 8px;
+    background: #0c1425;
+}
+QCheckBox#seatChoice:hover { border-color: #43577b; }
+QCheckBox#seatChoice:checked {
+    border-color: #438cf5;
+    background: #12243d;
+    color: #7fbdff;
+}
+QCheckBox#seatChoice:focus { border: 2px solid #438cf5; padding: 7px; }
+QCheckBox#seatChoice:disabled { color: #6e7a91; }
+
 QPushButton#primaryButton {
     background: #347ff0;
     border-color: #4d91f5;
@@ -368,7 +410,7 @@ QTabBar::tab:hover:!selected {
     color: #b9c6dc;
 }
 
-QListWidget#timeline, QListWidget#cartPriorityList {
+QListWidget#cartPriorityList {
     background: #0c1424;
     border: 1px solid #253149;
     border-radius: 9px;
@@ -376,7 +418,7 @@ QListWidget#timeline, QListWidget#cartPriorityList {
     padding: 4px;
 }
 
-QListWidget#timeline::item, QListWidget#cartPriorityList::item {
+QListWidget#cartPriorityList::item {
     min-height: 27px;
     border-radius: 6px;
     padding: 3px 7px;
@@ -385,31 +427,6 @@ QListWidget#timeline::item, QListWidget#cartPriorityList::item {
 QListWidget#cartPriorityList::item:selected {
     background: #233b62;
 }
-
-QListWidget#timeline::item {
-    border-left: 1px solid #28354e;
-    margin-left: 8px;
-}
-
-QFrame#currentPhase {
-    background: #0c1424;
-    border: 1px solid #253149;
-    border-radius: 9px;
-}
-
-QLabel#currentPhaseIcon {
-    min-width: 20px;
-    font-size: 18px;
-    font-weight: 700;
-    color: #5d7090;
-}
-
-QLabel#currentPhaseIcon[phaseState="active"] { color: #4b98f6; }
-QLabel#currentPhaseIcon[phaseState="success"] { color: #57c78c; }
-QLabel#currentPhaseIcon[phaseState="failed"] { color: #ef7180; }
-QLabel#currentPhaseIcon[phaseState="stopped"] { color: #eca652; }
-QLabel#currentPhaseTitle { color: #e6eefb; font-weight: 700; }
-QLabel#currentPhaseMessage { color: #99a8c0; }
 
 QTextEdit#logView {
     color: #cbd7eb;

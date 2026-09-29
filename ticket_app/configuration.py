@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .cart import (
-    CartItem, cart_migration_messages, cart_seat_types, normalize_cart_items,
+    CartItem, reject_unresolved_cart_migration, cart_seat_types, normalize_cart_items,
     serialize_cart_items, validate_cart_items,
 )
 from .input_parsing import split_multi_value_text
@@ -20,7 +20,6 @@ from .preferences import (
     SeatRelationPreference,
     seat_layout_positions,
 )
-from .train_policy import normalize_train_codes, validate_train_policy
 
 
 BASE_URL = "https://kyfw.12306.cn"
@@ -152,13 +151,9 @@ MONTH_NAMES = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep"
 
 @dataclass
 class AppConfig:
-    from_station: str
-    to_station: str
+    cart_items: List[CartItem]
     train_date: str
     passenger_names: List[str]
-    seat_types: List[str]
-    preferred_trains: List[str]
-    only_preferred_trains: bool
     start_at: str
     stop_at: str
     pre_query_seconds: float
@@ -185,25 +180,13 @@ class AppConfig:
     log_level: str
     perf_log: bool
     config_path: Path
-    priority_strategy: str = "train_first"
-    empty_train_scope: str | None = "all"
     passenger_ticket_types: Dict[str, str] = field(default_factory=dict)
     quiet_carriage_preference: bool = False
-    # None preserves the established CLI policy; an explicit empty cart is an
-    # unfinished cart and must never fall back to the legacy route silently.
-    cart_items: List[CartItem] | None = None
 
     @property
-    def seat_position_preferences(self) -> SeatRelationPreference:
-        """Compatibility-friendly alias used by the GUI layer."""
-
-        return self.seat_relation_preference
-
-    @property
-    def choose_seats(self) -> str:
-        """Legacy raw value, retained for older callers during migration."""
-
-        return "".join(self.seat_relation_preference.positions)
+    def seat_types(self) -> List[str]:
+        """Seat capabilities are derived only from the ordered cart."""
+        return cart_seat_types(self.cart_items)
 
     @classmethod
     def from_module(cls, module: Any, config_path: Path) -> "AppConfig":
@@ -220,57 +203,33 @@ class AppConfig:
         config_path = Path(config_path).resolve()
         base_dir = config_path.parent
 
-        def has_value(*names: str) -> bool:
-            return any(name in mapping or name.lower() in mapping for name in names)
+        def value(name: str, default: Any) -> Any:
+            return mapping.get(name, mapping.get(name.lower(), default))
 
-        def value(name: str, default: Any, *aliases: str) -> Any:
-            for candidate in (name,) + aliases:
-                if candidate in mapping:
-                    return mapping[candidate]
-                snake_name = candidate.lower()
-                if snake_name in mapping:
-                    return mapping[snake_name]
-            return default
-
-        has_structured_seat_preference = has_value(
-            "SEAT_POSITION_PREFERENCES", "SEAT_RELATION_PREFERENCE"
-        )
-        has_legacy_seat_preference = has_value("CHOOSE_SEATS")
-        legacy_seat_preference = value("CHOOSE_SEATS", "")
-        if has_structured_seat_preference:
-            raw_seat_preference = value(
-                "SEAT_POSITION_PREFERENCES", [], "SEAT_RELATION_PREFERENCE"
-            )
-            if has_legacy_seat_preference and str(legacy_seat_preference or "").strip():
-                logging.warning(
-                    "同时配置了结构化座位偏好和旧 CHOOSE_SEATS；已忽略 CHOOSE_SEATS"
-                )
-        else:
-            raw_seat_preference = legacy_seat_preference
-            if str(raw_seat_preference or "").strip():
-                logging.info("已将旧 CHOOSE_SEATS 转换为结构化座位位置偏好")
+        if value("CART_ITEMS", None) is None:
+            raise AppError("必须提供 CART_ITEMS 购物车；不再支持旧单站配置，请重新建立购物车")
+        removed_keys = {
+            "FROM_STATION", "TO_STATION", "SEAT_TYPES", "PREFERRED_TRAINS",
+            "ONLY_PREFERRED_TRAINS", "PRIORITY_STRATEGY", "EMPTY_TRAIN_SCOPE",
+            "CHOOSE_SEATS", "SEAT_RELATION_PREFERENCE",
+        }
+        obsolete = sorted(str(key) for key in mapping if str(key).upper() in removed_keys)
+        if obsolete:
+            raise AppError("已移除旧配置项 " + "、".join(obsolete) + "；请仅使用 CART_ITEMS 和 SEAT_POSITION_PREFERENCES")
+        raw_seat_preference = value("SEAT_POSITION_PREFERENCES", [])
 
         try:
             seat_preference = SeatRelationPreference.from_value(raw_seat_preference)
             berth_preference = BerthPreference.from_value(value("BERTH_PREFERENCE", {}))
             passenger_ticket_types = normalize_passenger_ticket_types(value("PASSENGER_TICKET_TYPES", {}))
-            raw_cart = value("CART_ITEMS", None)
-            cart_items = normalize_cart_items(raw_cart) if raw_cart is not None else None
-            if cart_items is not None:
-                _, cart_issues = cart_migration_messages(value("CART_MIGRATION", None))
-                if cart_issues:
-                    raise ValueError("；".join(cart_issues))
+            cart_items = normalize_cart_items(value("CART_ITEMS", None))
+            reject_unresolved_cart_migration(value("CART_MIGRATION", None))
         except ValueError as exc:
             raise AppError(str(exc)) from exc
 
         cfg = cls(
-            from_station=str(value("FROM_STATION", "")).strip(),
-            to_station=str(value("TO_STATION", "")).strip(),
             train_date=str(value("TRAIN_DATE", "")).strip(),
             passenger_names=_as_list(value("PASSENGER_NAMES", [])),
-            seat_types=_as_list(value("SEAT_TYPES", [])),
-            preferred_trains=normalize_train_codes(value("PREFERRED_TRAINS", [])),
-            only_preferred_trains=_as_bool(value("ONLY_PREFERRED_TRAINS", True), "ONLY_PREFERRED_TRAINS"),
             start_at=str(value("START_AT", "")).strip(),
             stop_at=str(value("STOP_AT", "")).strip(),
             pre_query_seconds=float(value("PRE_QUERY_SECONDS", 3.0)),
@@ -297,8 +256,6 @@ class AppConfig:
             log_level=str(value("LOG_LEVEL", "INFO")).upper(),
             perf_log=_as_bool(value("PERF_LOG", True), "PERF_LOG"),
             config_path=config_path,
-            priority_strategy=str(value("PRIORITY_STRATEGY", "train_first")),
-            empty_train_scope=value("EMPTY_TRAIN_SCOPE", "all"),
             passenger_ticket_types=passenger_ticket_types,
             quiet_carriage_preference=_as_bool(value("QUIET_CARRIAGE_PREFERENCE", False), "QUIET_CARRIAGE_PREFERENCE"),
             cart_items=cart_items,
@@ -310,17 +267,11 @@ class AppConfig:
         """Return a serializable mapping suitable for GUI persistence."""
 
         mapping = {
-            "FROM_STATION": self.from_station,
-            "TO_STATION": self.to_station,
+            "CART_ITEMS": serialize_cart_items(self.cart_items),
             "TRAIN_DATE": self.train_date,
             "PASSENGER_NAMES": list(self.passenger_names),
             "PASSENGER_TICKET_TYPES": dict(self.passenger_ticket_types),
             "QUIET_CARRIAGE_PREFERENCE": self.quiet_carriage_preference,
-            "SEAT_TYPES": list(self.seat_types),
-            "PREFERRED_TRAINS": list(self.preferred_trains),
-            "ONLY_PREFERRED_TRAINS": self.only_preferred_trains,
-            "PRIORITY_STRATEGY": self.priority_strategy,
-            "EMPTY_TRAIN_SCOPE": self.empty_train_scope,
             "START_AT": self.start_at,
             "STOP_AT": self.stop_at,
             "PRE_QUERY_SECONDS": self.pre_query_seconds,
@@ -347,29 +298,16 @@ class AppConfig:
             "SESSION_FILE": str(self.session_file),
             "STATION_CACHE_FILE": str(self.station_cache_file),
         }
-        if self.cart_items is not None:
-            mapping["CART_ITEMS"] = serialize_cart_items(self.cart_items)
         return mapping
 
     def validate(self) -> None:
-        if self.cart_items is not None:
-            try:
-                self.cart_items = normalize_cart_items(self.cart_items)
-                cart_errors = validate_cart_items(self.cart_items, SEAT_SPECS)
-            except ValueError as exc:
-                raise AppError(str(exc)) from exc
-            if cart_errors:
-                raise AppError("；".join(cart_errors))
-            self.seat_types = cart_seat_types(self.cart_items)
-            self.from_station = self.cart_items[0].from_station
-            self.to_station = self.cart_items[0].to_station
-        else:
-            if not self.from_station:
-                raise AppError("FROM_STATION 不能为空")
-            if not self.to_station:
-                raise AppError("TO_STATION 不能为空")
-            if self.from_station == self.to_station:
-                raise AppError("FROM_STATION 和 TO_STATION 不能相同")
+        try:
+            self.cart_items = normalize_cart_items(self.cart_items)
+            cart_errors = validate_cart_items(self.cart_items, SEAT_SPECS)
+        except ValueError as exc:
+            raise AppError(str(exc)) from exc
+        if cart_errors:
+            raise AppError("；".join(cart_errors))
         if not self.train_date:
             raise AppError("TRAIN_DATE 不能为空，格式为 YYYY-MM-DD")
         try:
@@ -393,18 +331,6 @@ class AppConfig:
             raise AppError("PASSENGER_TICKET_TYPES 包含未选择的乘车人")
         if not isinstance(self.quiet_carriage_preference, bool):
             raise AppError("QUIET_CARRIAGE_PREFERENCE 必须是布尔值")
-        if not self.seat_types:
-            raise AppError("SEAT_TYPES 至少需要填写一种座席")
-        unsupported = [seat for seat in self.seat_types if seat not in SEAT_SPECS]
-        if unsupported:
-            supported = "、".join(SEAT_SPECS.keys())
-            raise AppError(f"不支持的座席: {unsupported}；支持: {supported}")
-        policy_errors = validate_train_policy(
-            self.preferred_trains, self.only_preferred_trains,
-            self.empty_train_scope, self.priority_strategy,
-        ) if self.cart_items is None else {}
-        if policy_errors:
-            raise AppError(next(iter(policy_errors.values())))
         has_seats, has_berths = preference_capabilities(self.seat_types)
         if self.seat_relation_preference.enabled and has_seats:
             if not passenger_count:
@@ -421,7 +347,7 @@ class AppConfig:
                 for code in seated_codes
                 if seat_layout_positions(code, None)
             ):
-                raise AppError("座位位置偏好与所选 SEAT_TYPES 的 ABCDF 布局均不兼容")
+                raise AppError("座位位置偏好与购物车席别的 ABCDF 布局均不兼容")
         if self.berth_preference.enabled and has_berths:
             if not passenger_count:
                 raise AppError("设置铺位偏好时必须填写 PASSENGER_NAMES")

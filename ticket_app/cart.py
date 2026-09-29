@@ -1,4 +1,4 @@
-"""Offline cart settings, validation and explicit legacy migration.
+"""Offline cart settings and validation.
 
 Only user choices belong in a cart item. Query tokens, returned tickets and
 account details are deliberately absent from this module's serialization.
@@ -9,8 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
-from .input_parsing import split_multi_value_text
-from .train_policy import TRAIN_CODE_PATTERN, normalize_train_codes
+from .train_policy import TRAIN_CODE_PATTERN
 
 
 @dataclass(frozen=True)
@@ -26,20 +25,6 @@ class CartItem:
 
 
 CART_ITEM_FIELDS = ("from_station", "to_station", "train_scope", "train_code", "seat_type")
-MIGRATION_NOTES = {
-    "train_first_any_multi_seat": (
-        "旧配置按车次优先尝试多个席别；购物车先保留指定车次顺序，再按原席别顺序添加不限车次备选。"
-        "未指定车次的尝试顺序已变化，请检查购物车顺序。"
-    ),
-}
-MIGRATION_ISSUES = {
-    "legacy_scope_high_speed": "旧配置仅允许高铁/动车。请改为明确车次，或明确确认接受不限车次后再开始。",
-    "legacy_scope_conventional": "旧配置仅允许普通列车。请改为明确车次，或明确确认接受不限车次后再开始。",
-    "legacy_scope_unset": "旧配置未选择有效车次范围，请编辑购物车并明确选择车次范围。",
-    "legacy_only_empty": "旧配置要求只尝试指定车次，但车次清单为空。请为购物车项目指定车次或明确选择不限车次。",
-    "legacy_invalid_strategy": "旧配置的尝试策略无效，请检查并确认购物车顺序。",
-    "legacy_invalid_restriction": "旧配置的指定车次开关无效，请检查并明确选择购物车车次范围。",
-}
 
 
 def normalize_cart_items(value: Any) -> list[CartItem]:
@@ -115,87 +100,19 @@ def validate_cart_items(
     return errors
 
 
-def normalize_cart_migration(value: Any) -> dict[str, list[str]]:
-    if value is None:
-        return {"notes": [], "issues": []}
-    if not isinstance(value, Mapping):
-        raise ValueError("购物车转换说明必须是对象")
-    result: dict[str, list[str]] = {}
-    for key, allowed in (("notes", MIGRATION_NOTES), ("issues", MIGRATION_ISSUES)):
-        raw = value.get(key, [])
-        if not isinstance(raw, (list, tuple)) or any(not isinstance(code, str) or code not in allowed for code in raw):
-            raise ValueError("购物车转换说明含未知类型，请检查原配置")
-        result[key] = list(dict.fromkeys(raw))
-    return result
+def reject_unresolved_cart_migration(value: Any) -> None:
+    """Reject restricted preview drafts rather than silently widening a trip.
 
-
-def cart_migration_messages(value: Any) -> tuple[list[str], list[str]]:
-    metadata = normalize_cart_migration(value)
-    return ([MIGRATION_NOTES[code] for code in metadata["notes"]],
-            [MIGRATION_ISSUES[code] for code in metadata["issues"]])
-
-
-def migrate_legacy_cart(values: Mapping[str, Any]) -> dict[str, Any]:
-    """Expand old train/seat priorities without silently broadening a scope.
-
-    Blocking metadata is part of the draft and must only be removed after the
-    user explicitly corrects the restriction or accepts an unrestricted cart.
+    Version 5 preview files may carry migration metadata. Resolved notes do not
+    affect current cart semantics and are deliberately not persisted again.
     """
-
-    def value(key: str, default: Any) -> Any:
-        return values.get(key, values.get(key.upper(), default))
-
-    existing = value("cart_items", None)
-    if existing is not None:
-        return {"cart_items": serialize_cart_items(existing),
-                "cart_migration": normalize_cart_migration(value("cart_migration", None))}
-    trains = list(dict.fromkeys(normalize_train_codes(value("preferred_trains", []))))
-    raw_seats = value("seat_types", [])
-    if isinstance(raw_seats, str):
-        raw_seats = split_multi_value_text(raw_seats)
-    if not isinstance(raw_seats, (list, tuple)) or any(not isinstance(seat, str) for seat in raw_seats):
-        raise ValueError("旧配置席别必须是文字列表")
-    seats = list(dict.fromkeys(seat.strip() for seat in raw_seats))
-    origin, destination = value("from_station", ""), value("to_station", "")
-    if not isinstance(origin, str) or not isinstance(destination, str):
-        raise ValueError("旧配置站名必须是文字")
-    strategy = value("priority_strategy", "train_first")
-    only = value("only_preferred_trains", True)
-    scope = value("empty_train_scope", "all")
-    metadata: dict[str, list[str]] = {"notes": [], "issues": []}
-    if strategy not in ("train_first", "seat_first"):
-        metadata["issues"].append("legacy_invalid_strategy")
-        strategy = "train_first"
-    if not isinstance(only, bool):
-        metadata["issues"].append("legacy_invalid_restriction")
-        only = True
-    if not trains:
-        if only:
-            metadata["issues"].append("legacy_only_empty")
-        if scope in ("high_speed", "conventional"):
-            metadata["issues"].append(f"legacy_scope_{scope}")
-        elif scope != "all":
-            metadata["issues"].append("legacy_scope_unset")
-    any_trains = not only
-    if strategy == "train_first" and any_trains and len(seats) > 1:
-        metadata["notes"].append("train_first_any_multi_seat")
-    rows: list[CartItem] = []
-
-    def add(train: str, seat: str) -> None:
-        rows.append(CartItem(origin.strip(), destination.strip(),
-                             "specific" if train else "all", train, seat))
-
-    if strategy == "seat_first":
-        for seat in seats:
-            for train in trains:
-                add(train, seat)
-            if any_trains or not trains:
-                add("", seat)
-    else:
-        for train in trains:
-            for seat in seats:
-                add(train, seat)
-        if any_trains or not trains:
-            for seat in seats:
-                add("", seat)
-    return {"cart_items": serialize_cart_items(rows), "cart_migration": metadata}
+    if value is None:
+        return
+    if not isinstance(value, Mapping) or set(value) - {"notes", "issues"}:
+        raise ValueError("购物车历史范围信息无效，请重新建立购物车")
+    for key in ("notes", "issues"):
+        codes = value.get(key, [])
+        if not isinstance(codes, (list, tuple)) or any(not isinstance(code, str) for code in codes):
+            raise ValueError("购物车历史范围信息无效，请重新建立购物车")
+    if value.get("issues"):
+        raise ValueError("此配置仍有未解决的历史车次范围限制，请重新建立购物车")

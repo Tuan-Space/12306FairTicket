@@ -35,12 +35,12 @@ def dispatched_jobs(main_window, monkeypatch):
     """Hold simulated requests until the test supplies their terminal result."""
     jobs = []
 
-    def dispatch(mode, cfg, *, force_login=False):
+    def dispatch(mode, cfg):
         if main_window._active_operation is not None:
             return
         token = GuiCancelToken()
         request = OperationRequest(main_window._operation_generation, mode, cfg, token,
-                                   main_window.shared_session, main_window.shared_clock, force_login)
+                                   main_window.shared_session, main_window.shared_clock)
         main_window.cancel_token = token
         main_window._active_operation = request
         jobs.append(request)
@@ -101,7 +101,9 @@ def test_page2_login_is_in_account_area_and_footer_only_navigates(main_window, q
     assert [request.mode for request in dispatched_jobs] == ["login"]
     assert main_window.current_step == 1
     assert main_window._task_state == "idle"
-    assert "任务未开始" in main_window.workflow_status.text()
+    assert main_window.workflow_status.text() == ""
+    assert main_window.workflow_status.isHidden()
+    assert main_window._task_state == "idle"
     main_window._receive_operation_outcome(main_window._operation_generation, OperationOutcome(
         "login", {"authenticated": True, "contacts": []},
     ))
@@ -128,9 +130,10 @@ def test_default_750_by_880_window_has_logs_outside_scrolling_pages(main_window,
             body_bottom = main_window.steps.mapTo(main_window, QPoint(0, main_window.steps.height())).y()
             assert top >= body_bottom
     main_window.logs_toggle.click()
-    assert main_window.log_view.isHidden()
-    main_window.logs_toggle.click()
+    assert main_window.log_view.text.isHidden()
     assert main_window.log_view.isVisible()
+    main_window.logs_toggle.click()
+    assert main_window.log_view.text.isVisible()
 
 
 def test_back_from_running_step_cancels_immediately_and_holds_forms_readonly(
@@ -171,7 +174,7 @@ def test_stop_button_becomes_continue_and_restarts_original_configuration_from_z
     prepare_confirmation(main_window)
     main_window._start_task()
     first = dispatched_jobs[0]
-    main_window.query_metric.value_label.setText("57")
+    main_window.query_count.setText("57")
     main_window.stop_button.click()
     assert first.cancel_token.is_cancelled
     assert not main_window.stop_button.isEnabled()
@@ -180,7 +183,7 @@ def test_stop_button_becomes_continue_and_restarts_original_configuration_from_z
     assert main_window.stop_button.text() == "继续任务"
     assert main_window.stop_button.isEnabled()
     assert not main_window.stop_button.isHidden()
-    assert main_window.query_metric.value_label.text() == "57"
+    assert main_window.query_count.text() == "57"
     # The original confirmed snapshot controls Continue, not later widget edits.
     main_window.preferred_trains.setText("G123")
     main_window.stop_button.click()
@@ -193,7 +196,7 @@ def test_stop_button_becomes_continue_and_restarts_original_configuration_from_z
     assert restarted.cfg.passenger_names == ["学生甲", "成人乙"]
     assert restarted.session is first.session
     assert restarted.clock is first.clock
-    assert main_window.query_metric.value_label.text() == "0"
+    assert main_window.query_count.text() == "0"
     assert main_window.current_step == 3
     assert main_window.stop_button.text() == "停止任务"
     main_window._continue_task()
@@ -239,7 +242,7 @@ def test_possible_or_confirmed_order_never_allows_continue(main_window, dispatch
     main_window._launch_task(dispatched_jobs[0].cfg)
     assert len(dispatched_jobs) == 1
     assert main_window._active_operation is None
-    assert main_window._order_state == order_state
+    assert main_window._order_state == ("success" if order_state == "success" else "unknown")
 
 
 def test_safety_outcome_overrides_back_navigation_and_keeps_order_review_visible(main_window, dispatched_jobs):
@@ -249,27 +252,32 @@ def test_safety_outcome_overrides_back_navigation_and_keeps_order_review_visible
     assert main_window.current_step == 2
     finish_cancelled(main_window, order_state="unknown")
     assert main_window.current_step == 3
-    assert "核对" in main_window.flow_error.text()
+    assert "结果待核对" in main_window.phase_badge.text()
+    assert "核对" in main_window.phase_badge.text()
+    assert not main_window.phase_badge.isHidden()
+    assert not main_window.order_button.isHidden()
     assert not main_window._restart_allowed
     assert main_window._active_operation is None
 
 
-def test_confirmation_uses_the_same_explicit_default_ticket_labels_as_editor(main_window):
+def test_confirmation_resolves_the_same_ticket_types_as_editor(main_window):
     prepare_confirmation(main_window)
     summary = main_window.confirm_summary.text()
-    assert "默认（12306：学生票）" in summary
-    assert "默认（12306：成人票）" in summary
+    assert "学生甲（学生）" in summary
+    assert "成人乙（成人）" in summary
+    assert main_window.passenger_ticket_types.rows["学生甲"].itemText(0) == "12306默认（学生）"
+    assert main_window.passenger_ticket_types.rows["成人乙"].itemText(0) == "12306默认（成人）"
     assert "跟随联系人" not in summary
     student = main_window.passenger_ticket_types.rows["学生甲"]
     student.setCurrentIndex(student.findData("adult"))
     main_window._refresh_confirmation()
-    assert "学生甲（成人票）" in main_window.confirm_summary.text()
+    assert "学生甲（成人）" in main_window.confirm_summary.text()
     assert main_window.passenger_ticket_types.values() == {"学生甲": "adult"}
     main_window._on_connection_completed("contacts", {
         "authenticated": True, "contacts": None, "contacts_error": "读取失败，可手动填写姓名",
     })
     main_window._refresh_confirmation()
-    assert "默认（按12306乘客信息）" in main_window.confirm_summary.text()
+    assert "成人乙（12306默认）" in main_window.confirm_summary.text()
 
 
 def test_continue_checks_a_past_stop_time_instead_of_silently_rolling_to_next_day(
@@ -415,8 +423,9 @@ def test_idle_maintenance_on_results_does_not_claim_booking_started(main_window,
     assert main_window._task_state == 'cancelled'
 
 
-def test_hidden_login_control_and_log_bridge_have_window_lifetime(main_window):
-    # Hidden compatibility controls must not become Python-owned QObject cycles:
+def test_login_control_and_log_bridge_have_window_lifetime(main_window):
+    # Window-owned controls must not become Python-owned QObject cycles:
     # a worker's cyclic collection must never choose their destruction thread.
-    assert main_window.check_login_button.parent() is main_window
+    assert main_window.isAncestorOf(main_window.check_login_button)
+    assert main_window.check_login_button.thread() is main_window.thread()
     assert main_window.log_bridge.parent() is main_window

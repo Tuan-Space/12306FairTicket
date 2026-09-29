@@ -21,7 +21,7 @@ import requests
 from ticket_app.configuration import AppError, STATION_URL
 from ticket_app.stations import StationStore
 
-from .compat import STATION_CACHE_FILE
+from .settings import STATION_CACHE_FILE
 
 
 StationFetcher = Callable[[str, float], str]

@@ -1,0 +1,41 @@
+{
+  "qt_version": "6.8.3",
+  "python_fallback_version": "3.12.12",
+  "files": [
+    {
+      "file": "QT-LGPL-3.0.txt",
+      "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+      "sources": [
+        "https://raw.githubusercontent.com/qt/qtbase/v6.8.3/LICENSES/LGPL-3.0-only.txt"
+      ]
+    },
+    {
+      "file": "QT-GPL-2.0.txt",
+      "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+      "sources": [
+        "https://raw.githubusercontent.com/qt/qtbase/v6.8.3/LICENSES/GPL-2.0-only.txt"
+      ]
+    },
+    {
+      "file": "QT-GPL-3.0.txt",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "sources": [
+        "https://raw.githubusercontent.com/qt/qtbase/v6.8.3/LICENSES/GPL-3.0-only.txt"
+      ]
+    },
+    {
+      "file": "PYTHON-3.12.12.txt",
+      "sha256": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf",
+      "sources": [
+        "https://raw.githubusercontent.com/python/cpython/v3.12.12/LICENSE"
+      ]
+    },
+    {
+      "file": "OPENSSL-3-APACHE-2.0.txt",
+      "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+      "sources": [
+        "https://raw.githubusercontent.com/openssl/openssl/openssl-3.6.1/LICENSE.txt"
+      ]
+    }
+  ]
+}

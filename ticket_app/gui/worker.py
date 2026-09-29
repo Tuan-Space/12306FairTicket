@@ -2,35 +2,23 @@
 
 from __future__ import annotations
 
-import inspect
 import logging
 import traceback
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from ticket_app.configuration import AppConfig
 from ticket_app.client import RailwayClient
 from ticket_app.clock import ServerClock
-from ticket_app.logging_utils import RedactingFormatter, redact_text
 from ticket_app.runner import TicketRunner
 from ticket_app.runtime import CancellationToken, RunCancelled
 
-from .async_logging import AsyncLogPipeline, AsyncQueueLogHandler, GuiLogLine
+from .async_logging import AsyncLogPipeline, GuiLogLine
 from .passenger_widgets import contact_display_rows
 
 
-def redact_log_text(text: str) -> str:
-    return redact_text(text)
-
-
 class LogBridge(QObject):
-    message = Signal(str, str)
-    # The asynchronous listener emits one tuple of ``(line, level)`` values at
-    # most every 100 ms.  Keeping the original single-line signal preserves a
-    # compatibility path for tests and third-party integrations.
     messages = Signal(object)
 
     def publish_batch(self, lines: object) -> None:
@@ -54,9 +42,7 @@ def create_async_log_pipeline(
     """Create the GUI's non-blocking log transport.
 
     The application attaches ``pipeline.handler`` to the root logger and
-    connects :attr:`LogBridge.messages` to a batch-aware log view.  The old
-    ``QtLogHandler`` remains available for integrations that have not moved
-    to the asynchronous transport yet.
+    connects :attr:`LogBridge.messages` to a batch-aware log view.
     """
 
     def publish(lines: tuple[GuiLogLine, ...]) -> None:
@@ -65,30 +51,8 @@ def create_async_log_pipeline(
     return AsyncLogPipeline(gui_batch_sink=publish, level=level, batch_interval=batch_interval)
 
 
-class QtLogHandler(logging.Handler):
-    def __init__(self, bridge: LogBridge) -> None:
-        super().__init__()
-        self.bridge = bridge
-        self.set_sensitive_terms(())
-
-    def set_sensitive_terms(self, terms: Any) -> None:
-        self.setFormatter(
-            RedactingFormatter(
-                "%(asctime)s  %(levelname)s  %(message)s",
-                "%H:%M:%S",
-                sensitive_terms=terms or (),
-            )
-        )
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            self.bridge.message.emit(redact_log_text(self.format(record)), record.levelname)
-        except Exception:
-            self.handleError(record)
-
-
 class _EventMethods:
-    """Plain-Python normalization shared by Qt and persistent-job relays."""
+    """Normalize runtime events for the persistent worker's signal."""
 
     def _send(self, kind: Any, payload: Any = None, **kwargs: Any) -> None:
         event_name = str(kind or "status").strip().lower().replace("-", "_").replace(" ", "_")
@@ -104,9 +68,7 @@ class _EventMethods:
             data = payload
         self._publish_event(event_name, data)
 
-    # Runtime's emit_event() prefers callable sinks. Do not define a method
-    # named ``emit`` on a QObject: PySide uses that name internally when a
-    # bound Signal is emitted, and overriding it breaks every signal here.
+    # Runtime events arrive through the callable sink protocol.
     def __call__(self, kind: Any, payload: Any = None, **kwargs: Any) -> None:
         if not isinstance(kind, str):
             event_kind = getattr(kind, "kind", None) or getattr(kind, "type", None) or kind.__class__.__name__
@@ -124,142 +86,18 @@ class _EventMethods:
             return
         self._send(kind, payload, **kwargs)
 
-    def publish(self, kind: Any, payload: Any = None, **kwargs: Any) -> None:
-        self._send(kind, payload, **kwargs)
-
-    def on_event(self, kind: Any, payload: Any = None, **kwargs: Any) -> None:
-        self._send(kind, payload, **kwargs)
-
-    def handle(self, event: Any, payload: Any = None, **kwargs: Any) -> None:
-        if payload is None and not isinstance(event, str):
-            kind = getattr(event, "kind", None) or getattr(event, "type", None) or event.__class__.__name__
-            if hasattr(event, "to_mapping"):
-                payload = event.to_mapping()
-            elif hasattr(event, "__dict__"):
-                payload = vars(event)
-            else:
-                payload = event
-            self._send(kind, payload, **kwargs)
-            return
-        self._send(event, payload, **kwargs)
-
-    # Named variants keep the GUI useful when the core uses a tiny observer
-    # protocol instead of a generic event bus.
     def phase(self, phase: str, message: str = "", **kwargs: Any) -> None:
         self._send("phase", {"phase": phase, "message": message, **kwargs})
 
-    on_phase = phase
-    emit_phase = phase
-    stage = phase
-    on_stage = phase
-
-    def qr_code(self, image: Any, **kwargs: Any) -> None:
-        self._send("qr_code", {"image": image, **kwargs})
-
-    on_qr_code = qr_code
-    qr_ready = qr_code
-    on_qr_ready = qr_code
-
-    def qr_status(self, status: str, message: str = "", **kwargs: Any) -> None:
-        self._send("qr_status", {"status": status, "message": message, **kwargs})
-
-    on_qr_status = qr_status
-
-    def countdown(self, name: str, remaining: float, **kwargs: Any) -> None:
-        self._send("countdown", {"name": name, "remaining": remaining, **kwargs})
-
-    on_countdown = countdown
-
-    def query(self, payload: Any = None, **kwargs: Any) -> None:
-        self._send("query", payload, **kwargs)
-
-    on_query = query
-
-    def candidate(self, payload: Any = None, **kwargs: Any) -> None:
-        self._send("candidate", payload, **kwargs)
-
-    on_candidate = candidate
-
-    def order(self, payload: Any = None, **kwargs: Any) -> None:
-        self._send("order", payload, **kwargs)
-
-    on_order = order
-    order_result = order
-    on_order_result = order
-
-    def warning(self, message: str, **kwargs: Any) -> None:
-        self._send("warning", {"message": message, **kwargs})
-
-    on_warning = warning
-
-
-class EventRelay(QObject, _EventMethods):
-    """Compatibility relay for standalone workers and integrations."""
-
-    # ``QObject`` already owns event(QEvent); keep the signal name distinct.
-    runtime_event = Signal(str, object)
-
-    def _publish_event(self, kind: str, payload: Any) -> None:
-        self.runtime_event.emit(kind, payload)
-
-
 class GuiCancelToken(CancellationToken):
-    """Cooperative token exposing common cancellation protocol spellings."""
+    """Cancellation token with maintenance actions enabled for GUI jobs."""
 
     def __init__(self) -> None:
         super().__init__()
         self.supports_actions = True
 
-    def request_cancel(self) -> None:
-        self.cancel()
-
-    def set(self) -> None:
-        self.cancel()
-
-    @property
-    def cancelled(self) -> bool:
-        return self.is_cancelled
-
-    @property
-    def cancellation_requested(self) -> bool:
-        return self.is_cancelled
-
-    def is_set(self) -> bool:
-        return self.is_cancelled
-
-    def check(self) -> bool:
-        return self.is_cancelled
-
-    def throw_if_cancelled(self) -> None:
-        self.checkpoint()
-
-    raise_if_cancelled = throw_if_cancelled
-
 
 CONNECTION_MODES = frozenset({"login", "contacts", "check_login", "sync_clock"})
-
-
-def _make_ticket_runner(cfg: Any, relay: Any, cancel_token: GuiCancelToken,
-                        session: Any, clock: Optional[ServerClock]) -> TicketRunner:
-    """Keep constructor compatibility without creating a per-job QObject."""
-    signature = inspect.signature(TicketRunner)
-    kwargs: Dict[str, Any] = {}
-    if "event_sink" in signature.parameters:
-        kwargs["event_sink"] = relay
-    if "cancel_token" in signature.parameters:
-        kwargs["cancel_token"] = cancel_token
-    if "session" in signature.parameters:
-        kwargs["session"] = session
-    elif "shared_session" in signature.parameters:
-        kwargs["shared_session"] = session
-    if "clock" in signature.parameters:
-        kwargs["clock"] = clock
-    runner = TicketRunner(cfg, **kwargs)
-    if "event_sink" not in kwargs:
-        setattr(runner, "event_sink", relay)
-    if "cancel_token" not in kwargs:
-        setattr(runner, "cancel_token", cancel_token)
-    return runner
 
 
 def _run_connection_operation(mode: str, cfg: Any, relay: Any,
@@ -310,7 +148,6 @@ class OperationRequest:
     cancel_token: GuiCancelToken
     session: Any = None
     clock: Optional[ServerClock] = None
-    force_login: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in CONNECTION_MODES | {"task"}:
@@ -393,11 +230,12 @@ class OperationWorker(QObject):
             request.cancel_token.checkpoint()
             if request.mode == "task":
                 relay.phase("preparing", "正在准备任务")
-                self.runner = _make_ticket_runner(
-                    request.cfg, relay, request.cancel_token, request.session, request.clock,
+                self.runner = TicketRunner(
+                    request.cfg, event_sink=relay, cancel_token=request.cancel_token,
+                    session=request.session, clock=request.clock,
                 )
                 result = int(self.runner.run())
-                if request.cancel_token.cancelled and self._order_safety()[1]:
+                if request.cancel_token.is_cancelled and self._order_safety()[1]:
                     relay.phase("cancelled", "任务已停止")
             else:
                 result = _run_connection_operation(
@@ -415,123 +253,3 @@ class OperationWorker(QObject):
             outcome = OperationOutcome(request.mode, result, error, details, state, safe)
             self.current_request = None
             self.finished.emit(request.generation, outcome)
-
-
-class TicketWorker(QObject):
-    completed = Signal(int)
-    failed = Signal(str, str)
-    done = Signal()
-
-    def __init__(
-        self,
-        cfg: AppConfig,
-        relay: EventRelay,
-        cancel_token: GuiCancelToken,
-        session: Any = None,
-        *,
-        clock: Optional[ServerClock] = None,
-    ) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.relay = relay
-        self.cancel_token = cancel_token
-        self.session = session
-        self.clock = clock
-        self.runner: Optional[TicketRunner] = None
-
-    def _make_runner(self) -> TicketRunner:
-        return _make_ticket_runner(self.cfg, self.relay, self.cancel_token, self.session, self.clock)
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            self.relay.phase("preparing", "正在准备任务")
-            self.runner = self._make_runner()
-            code = int(self.runner.run())
-            if self.cancel_token.cancelled:
-                self.relay.phase("cancelled", "任务已停止")
-            self.completed.emit(code)
-        except (InterruptedError, RunCancelled):
-            self.relay.phase("cancelled", "任务已停止")
-            self.completed.emit(130)
-        except Exception as exc:
-            self.failed.emit(str(exc), traceback.format_exc())
-        finally:
-            self.done.emit()
-
-
-class ConnectionWorker(QObject):
-    """One idle connection operation, with no journey or order runner.
-
-    The window owns a single QThread slot shared with TicketWorker. During a
-    ticket run, maintenance is instead sent to that runner's action queue.
-    """
-
-    completed = Signal(str, object)
-    failed = Signal(str, str)
-    done = Signal()
-
-    def __init__(self, mode: str, cfg: Any, relay: EventRelay, cancel_token: GuiCancelToken,
-                 session: Any = None, *, force_login: bool = False,
-                 clock: Optional[ServerClock] = None) -> None:
-        super().__init__()
-        if mode not in CONNECTION_MODES:
-            raise ValueError("未知连接操作")
-        self.mode = mode
-        self.cfg = cfg
-        self.relay = relay
-        self.cancel_token = cancel_token
-        self.session = session
-        self.force_login = force_login
-        self.clock = clock
-
-    @Slot()
-    def run(self) -> None:
-        try:
-            result = _run_connection_operation(
-                self.mode, self.cfg, self.relay, self.cancel_token, self.session, self.clock,
-            )
-            self.completed.emit(self.mode, result)
-        except (InterruptedError, RunCancelled):
-            self.completed.emit(self.mode, None)
-        except Exception as exc:
-            self.failed.emit(str(exc), traceback.format_exc())
-        finally:
-            self.done.emit()
-
-
-def image_payload_to_bytes(value: Any) -> Optional[bytes]:
-    """Extract QR bytes from bytes, a path, or a mapping event payload."""
-
-    if value is None:
-        return None
-    if isinstance(value, bytes):
-        return value
-    if isinstance(value, bytearray):
-        return bytes(value)
-    if isinstance(value, Path):
-        try:
-            return value.read_bytes()
-        except OSError:
-            return None
-    if isinstance(value, str):
-        path = Path(value)
-        if path.exists():
-            try:
-                return path.read_bytes()
-            except OSError:
-                return None
-        # Some core implementations expose raw base64 in the event.
-        try:
-            import base64
-
-            return base64.b64decode(value, validate=True)
-        except Exception:
-            return None
-    if isinstance(value, Mapping):
-        for key in ("image", "image_bytes", "bytes", "data", "path", "file"):
-            if key in value:
-                result = image_payload_to_bytes(value[key])
-                if result:
-                    return result
-    return None

@@ -17,7 +17,6 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from ticket_app.gui.app import MainWindow, _load_stylesheet
 from ticket_app.gui.worker import GuiCancelToken
-from ticket_app.gui.cart_widgets import CartDialog
 
 
 def main() -> int:
@@ -53,45 +52,67 @@ def main() -> int:
 
         def capture():
             try:
+                window.station_names.update({"北京南", "上海虹桥", "北京", "上海"})
                 window.from_station.setText("北京南")
                 window.to_station.setText("上海虹桥")
-                window.preferred_trains.setText("G103")
-                window.cart_seat.setCurrentIndex(window.cart_seat.findData("二等座"))
+                window.preferred_trains.setText("G103，G105")
+                window.cart_seat.set_selected_seats(["二等座", "一等座"])
+                assert [(item["train_code"], item["seat_type"]) for item in window._draft_cart_items()] == [
+                    ("G103", "二等座"), ("G105", "二等座"),
+                    ("G103", "一等座"), ("G105", "一等座"),
+                ]
+                # Capture the actionable state: the add button shows the four
+                # pending alternatives; explanatory previews start folded.
+                window.basic_scroll.verticalScrollBar().setValue(0)
+                save("trip")
+                assert window._add_cart_items()
+
+                # Add sleeper alternatives separately. These are explicit cart
+                # items, not a train-prefix guess or a global seat replacement.
+                window.preferred_trains.setText("D17")
+                window.cart_seat.set_selected_seats(["二等卧"])
                 assert window._add_cart_items()
                 window.from_station.setText("北京")
                 window.to_station.setText("上海")
                 window.preferred_trains.setText("1461")
-                window.cart_seat.setCurrentIndex(window.cart_seat.findData("硬卧"))
+                window.cart_seat.set_selected_seats(["硬卧"])
                 assert window._add_cart_items()
-                window.from_station.setText("北京南")
-                window.to_station.setText("上海虹桥")
-                window.preferred_trains.setText("G103")
-                window.cart_seat.setCurrentIndex(window.cart_seat.findData("一等座"))
-                assert window._add_cart_items()
-                window.basic_scroll.ensureWidgetVisible(window.add_cart_button, 0, 12)
-                save("trip")
-                dialog = CartDialog(window.cart_items, window, station_names=window.station_names)
-                dialog.show()
-                QTest.qWait(150)
-                assert dialog.grab().save(str(output / f"{args.prefix}-list.png"))
-                dialog.close()
                 window._go_to_step(1)
-                save("login")
                 window._on_connection_completed("login", {"authenticated": True, "contacts": [
-                    {"name": "示例乘车人", "passenger_type": "1"},
+                    {"name": "示例乘客甲", "passenger_type": "1"},
+                    {"name": "示例乘客乙", "passenger_type": "3"},
+                    {"name": "示例乘客丙", "passenger_type": "1"},
+                    {"name": "示例乘客丁", "passenger_type": "1"},
                 ]})
-                window.contact_selector.checkboxes[0].click()
+                for checkbox in window.contact_selector.checkboxes[:3]:
+                    checkbox.click()
+                window.passenger_scroll.verticalScrollBar().setValue(0)
+                save("login")
                 window._go_to_step(2)
+                assert window.confirm_cart.items() == window.cart_items
+                window.confirm_scroll.verticalScrollBar().setValue(0)
                 save("confirm")
                 window._active_operation = SimpleNamespace(mode="task")
                 window._operation_mode = "task"
                 window.cancel_token = GuiCancelToken()
                 window._task_state = "running"
                 window._go_to_step(3)
+                window._on_runtime_event("clock_sync", {
+                    "source": "manual", "success": True, "rtt_ms": 42, "offset_seconds": 0.128,
+                    "server_timestamp": time.time() + 0.128, "monotonic_timestamp": time.monotonic(),
+                    "checked_at": time.time(),
+                })
+                window._on_runtime_event("session_checked", {"state": "valid", "checked_at": time.time()})
                 window._target_timestamp = time.time() + 180
-                window.current_cart_item.setText("购物车 3 项 · 等待开售后按顺序尝试")
+                window.current_cart_item.setText(f"购物车 {len(window.cart_items)} 项 · 等待开售后按顺序尝试")
                 window._set_phase("waiting", "等待开售，届时自动开始查询")
+                window._on_runtime_event("maintenance_availability", {"enabled": True, "busy": False})
+                assert window.sale_countdown.isVisible()
+                window.logs_toggle.setChecked(True)
+                window.log_view.clear()
                 window._on_log_message("离线演示：正在等待开售，未连接 12306。", "INFO")
+                window._on_log_message("离线演示：购物车按排列顺序尝试，任一成功即停止。", "INFO")
+                window._on_log_message("离线演示：只有确认页的开始任务才会启动订票。", "INFO")
                 save("waiting")
                 assert window.back_button.isVisible(), "Step 4 back button must be visible"
             except Exception as exc:
@@ -101,13 +122,17 @@ def main() -> int:
                 window.cancel_token = None
                 window._operation_mode = ""
                 window.close()
+                for _ in range(150):
+                    if window._background_thread is None:
+                        break
+                    QTest.qWait(20)
                 app.quit()
 
         QTimer.singleShot(250, capture)
         app.exec()
     if errors:
         raise errors[0]
-    print(f"Saved 5 offline GUI screenshots to {output}")
+    print(f"Saved 4 offline GUI screenshots to {output}")
     return 0
 
 

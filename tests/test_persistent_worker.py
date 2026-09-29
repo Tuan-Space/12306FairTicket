@@ -302,7 +302,7 @@ def test_order_success_event_cannot_be_relabelled_safe_or_cancelled(
     persistent_worker, qtbot, monkeypatch,
 ):
     class Runner:
-        def __init__(self, cfg, event_sink=None, cancel_token=None):
+        def __init__(self, cfg, event_sink=None, cancel_token=None, session=None, clock=None):
             self.relay, self.token = event_sink, cancel_token
 
         def run(self):
